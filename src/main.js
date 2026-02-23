@@ -39,6 +39,8 @@ const dbStatusText = document.getElementById("dbStatusText");
 const dbStatusTime = document.getElementById("dbStatusTime");
 const dbStatusSpinner = document.getElementById("dbStatusSpinner");
 const dbReloadBtn = document.getElementById("dbReloadBtn");
+const cacheSizeSlider = document.getElementById("cacheSizeSlider");
+const cacheSizeValue = document.getElementById("cacheSizeValue");
 
 function setDebugState(state) {
   if (!debugBadge) return;
@@ -65,6 +67,7 @@ let lastRenderedFilterText = "";
 
 const DEBUG_PREF_KEY = "showFrontendDebug";
 const TIMELINE_NAMES_PREF_KEY = "alwaysShowTimelineNames";
+const DEFAULT_CACHE_SIZE_GB = 5;
 const sidebarLayout = initSidebarLayout({
   appView,
   openBtn,
@@ -205,6 +208,18 @@ function initDebugVisibilitySetting() {
   if (showFrontendDebugToggle) showFrontendDebugToggle.checked = show;
 }
 
+function clampCacheSizeGb(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return DEFAULT_CACHE_SIZE_GB;
+  return Math.min(10, Math.max(1, Math.round(n)));
+}
+
+function setCacheSizeUi(valueGb) {
+  const cacheSizeGb = clampCacheSizeGb(valueGb);
+  if (cacheSizeSlider) cacheSizeSlider.value = String(cacheSizeGb);
+  if (cacheSizeValue) cacheSizeValue.textContent = `${cacheSizeGb} GB`;
+}
+
 function formatDateTime(date) {
   return date.toLocaleString();
 }
@@ -233,13 +248,14 @@ function setDbStatusIdle() {
 }
 
 function splitPatientName(folderName) {
+  const stripIdSuffix = (name) => name.replace(/\s+\([^()]+\)\s*$/, "").trim();
   const idx = folderName.indexOf(",");
   if (idx === -1) {
     return { lastName: folderName.trim(), firstName: "" };
   }
   return {
     lastName: folderName.slice(0, idx).trim(),
-    firstName: folderName.slice(idx + 1).trim(),
+    firstName: stripIdSuffix(folderName.slice(idx + 1).trim()),
   };
 }
 
@@ -263,7 +279,7 @@ function setWorkspacePathDisplay(workspaceDir) {
     workspacePathEl.title = "";
     return;
   }
-  workspacePathEl.textContent = `...${workspaceDir}`;
+  workspacePathEl.textContent = workspaceDir;
   workspacePathEl.title = workspaceDir;
 }
 
@@ -708,6 +724,11 @@ async function boot() {
       settings?.workspace_dir ??
       settings?.workspaceDir ??
       null;
+    const cacheSizeGb =
+      settings?.cache_size_gb ??
+      settings?.cacheSizeGb ??
+      DEFAULT_CACHE_SIZE_GB;
+    setCacheSizeUi(cacheSizeGb);
     console.log("workspaceDir:", workspaceDir);
 
     if (!workspaceDir) {
@@ -724,6 +745,7 @@ async function boot() {
 
   } catch (err) {
     console.error("load_settings failed:", err);
+    setCacheSizeUi(DEFAULT_CACHE_SIZE_GB);
     setDebugState("error: load settings");
   }
 }
@@ -777,6 +799,25 @@ dbReloadBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || isDbUpdating) return;
   await loadPatients(currentWorkspaceDir, { minStatusMs: 1500 });
 });
+cacheSizeSlider?.addEventListener("input", (e) => {
+  const value = clampCacheSizeGb(e.target?.value ?? DEFAULT_CACHE_SIZE_GB);
+  setCacheSizeUi(value);
+});
+cacheSizeSlider?.addEventListener("change", async (e) => {
+  const value = clampCacheSizeGb(e.target?.value ?? DEFAULT_CACHE_SIZE_GB);
+  setCacheSizeUi(value);
+  if (!cacheSizeSlider) return;
+  cacheSizeSlider.disabled = true;
+  try {
+    const saved = await invoke("set_cache_size_gb", { cacheSizeGb: value });
+    setCacheSizeUi(saved);
+  } catch (err) {
+    console.error("set_cache_size_gb failed:", err);
+    setCacheSizeUi(DEFAULT_CACHE_SIZE_GB);
+  } finally {
+    cacheSizeSlider.disabled = false;
+  }
+});
 addPatientBtn?.addEventListener("click", () => {
   if (sidebarLayout.isCompactPatientSidebarMode() && sidebarLayout.isPatientSidebarHidden()) {
     sidebarLayout.setPatientSidebarHidden(false);
@@ -799,7 +840,7 @@ confirmAddPatientBtn?.addEventListener("click", async () => {
 
   confirmAddPatientBtn.disabled = true;
   try {
-    await invoke("create_patient_with_metadata", {
+    const createdFolderName = await invoke("create_patient_with_metadata", {
       workspaceDir: currentWorkspaceDir,
       lastName,
       firstName,
@@ -812,7 +853,7 @@ confirmAddPatientBtn?.addEventListener("click", async () => {
       patientSearchDebounceId = null;
     }
     if (patientSearchInput) patientSearchInput.value = "";
-    selectedPatient = `${lastName}, ${firstName}`;
+    selectedPatient = (createdFolderName ?? `${lastName}, ${firstName}`).toString();
     selectedPatientId = patientId;
     mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
     await loadPatients(currentWorkspaceDir);

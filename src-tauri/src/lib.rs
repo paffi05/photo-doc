@@ -8,6 +8,7 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::UNIX_EPOCH;
 
 #[derive(Serialize, Deserialize, Default)]
 struct WindowState {
@@ -23,6 +24,7 @@ struct WindowState {
 struct Settings {
     workspace_dir: Option<String>,
     window_state: Option<WindowState>,
+    cache_size_gb: Option<u8>,
 }
 
 fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -151,10 +153,22 @@ fn open_db(app_handle: &tauri::AppHandle) -> Result<Connection, String> {
 fn split_patient_name(folder_name: &str) -> (String, String) {
     if let Some(idx) = folder_name.find(',') {
         let last = folder_name[..idx].trim().to_string();
-        let first = folder_name[idx + 1..].trim().to_string();
+        let first = strip_patient_id_suffix(folder_name[idx + 1..].trim());
         return (last, first);
     }
     (folder_name.trim().to_string(), String::new())
+}
+
+fn strip_patient_id_suffix(first_name: &str) -> String {
+    let trimmed = first_name.trim();
+    if trimmed.ends_with(')') {
+        if let Some(open_idx) = trimmed.rfind(" (") {
+            if open_idx + 2 < trimmed.len() - 1 {
+                return trimmed[..open_idx].trim().to_string();
+            }
+        }
+    }
+    trimmed.to_string()
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -176,6 +190,15 @@ struct PatientTreatmentRow {
     folder_name: String,
     folder_date: String,
     treatment_name: String,
+}
+
+#[derive(Serialize)]
+struct TreatmentFileRow {
+    path: String,
+    name: String,
+    size: u64,
+    modified_ms: u64,
+    is_image: bool,
 }
 
 #[derive(Serialize)]
@@ -450,7 +473,7 @@ fn create_patient_with_metadata(
     last_name: String,
     first_name: String,
     patient_id: String,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let workspace = PathBuf::from(&workspace_dir);
     if !workspace.exists() || !workspace.is_dir() {
         return Err("workspace directory does not exist".to_string());
@@ -468,10 +491,15 @@ fn create_patient_with_metadata(
         return Err("invalid characters in patient name".to_string());
     }
 
-    let folder_name = format!("{}, {}", last_name, first_name);
+    let base_folder_name = format!("{}, {}", last_name, first_name);
+    let folder_name = if workspace.join(&base_folder_name).exists() {
+        format!("{base_folder_name} ({patient_id})")
+    } else {
+        base_folder_name
+    };
     let patient_folder = workspace.join(&folder_name);
     if patient_folder.exists() {
-        return Err("patient folder already exists".to_string());
+        return Err("patient folder already exists for this name and ID".to_string());
     }
 
     fs::create_dir(&patient_folder).map_err(|e| e.to_string())?;
@@ -497,7 +525,7 @@ fn create_patient_with_metadata(
         &metadata_text,
     )?;
 
-    Ok(())
+    Ok(folder_name)
 }
 
 #[tauri::command]
@@ -620,6 +648,146 @@ fn save_patient_id(
 }
 
 #[tauri::command]
+fn load_patient_keywords(
+    workspace_dir: String,
+    folder_name: String,
+) -> Result<Vec<String>, String> {
+    let workspace = PathBuf::from(&workspace_dir);
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let folder_name = folder_name.trim();
+    if folder_name.is_empty() {
+        return Err("folder_name is required".to_string());
+    }
+
+    let folder_path = workspace.join(folder_name);
+    if !folder_path.exists() || !folder_path.is_dir() {
+        return Err("patient folder does not exist".to_string());
+    }
+
+    let metadata_value = read_patient_metadata_value(&folder_path);
+    let Some(value) = metadata_value else {
+        return Ok(vec![]);
+    };
+
+    let mut out = Vec::new();
+    if let Some(obj) = value.as_object() {
+        if let Some(raw_keywords) = obj.get("keywords") {
+            match raw_keywords {
+                Value::Array(items) => {
+                    for item in items {
+                        let text = item.as_str().unwrap_or("").trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        out.push(text.to_string());
+                    }
+                }
+                Value::String(s) => {
+                    let text = s.trim();
+                    if !text.is_empty() {
+                        out.push(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for keyword in out {
+        let key = keyword.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        deduped.push(keyword);
+    }
+
+    Ok(deduped)
+}
+
+#[tauri::command]
+fn save_patient_keywords(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    folder_name: String,
+    keywords: Vec<String>,
+) -> Result<(), String> {
+    let workspace = PathBuf::from(&workspace_dir);
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let folder_name = folder_name.trim();
+    if folder_name.is_empty() {
+        return Err("folder_name is required".to_string());
+    }
+
+    let folder_path = workspace.join(folder_name);
+    if !folder_path.exists() || !folder_path.is_dir() {
+        return Err("patient folder does not exist".to_string());
+    }
+
+    let mut cleaned_keywords = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for keyword in keywords {
+        let trimmed = keyword.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        cleaned_keywords.push(trimmed.to_string());
+    }
+
+    let metadata_path = patient_metadata_path(&folder_path);
+    let mut metadata_value = read_patient_metadata_value(&folder_path).unwrap_or_else(|| json!({}));
+    if !metadata_value.is_object() {
+        metadata_value = json!({});
+    }
+    if let Some(metadata_obj) = metadata_value.as_object_mut() {
+        metadata_obj.insert(
+            "keywords".to_string(),
+            Value::Array(cleaned_keywords.iter().cloned().map(Value::String).collect()),
+        );
+        if !metadata_obj.contains_key("id") {
+            metadata_obj.insert("id".to_string(), Value::String(String::new()));
+        }
+        if !metadata_obj.contains_key("searchterms") {
+            metadata_obj.insert("searchterms".to_string(), json!([]));
+        }
+    }
+    let metadata_json = serde_json::to_string_pretty(&metadata_value).map_err(|e| e.to_string())?;
+    fs::write(metadata_path, metadata_json).map_err(|e| e.to_string())?;
+
+    let mut metadata_tokens = Vec::new();
+    collect_metadata_tokens(&metadata_value, &mut metadata_tokens);
+    let metadata_text = metadata_tokens.join(" ");
+    let patient_id = metadata_id_from_value(&metadata_value);
+    let (last_name, first_name) = split_patient_name(folder_name);
+
+    let conn = open_db(&app_handle)?;
+    upsert_patient_index_row(
+        &conn,
+        &workspace.to_string_lossy(),
+        folder_name,
+        &last_name,
+        &first_name,
+        &patient_id,
+        &metadata_text,
+    )?;
+
+    Ok(())
+}
+
+#[tauri::command]
 fn is_patient_id_taken(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
@@ -717,6 +885,98 @@ fn open_workspace_dir(workspace_dir: String) -> Result<(), String> {
 
     cmd.spawn().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[tauri::command]
+fn open_path_with_default(path: String) -> Result<(), String> {
+    let target = path.trim().to_string();
+    if target.is_empty() {
+        return Err("path is required".to_string());
+    }
+
+    let path_buf = PathBuf::from(&target);
+    if !path_buf.exists() {
+        return Err("path does not exist".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(&target);
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("explorer");
+        c.arg(&target);
+        c
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(&target);
+        c
+    };
+
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_treatment_files(
+    workspace_dir: String,
+    patient_folder: String,
+    treatment_folder: String,
+) -> Result<Vec<TreatmentFileRow>, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+    let treatment_folder = treatment_folder.trim();
+    if treatment_folder.is_empty() {
+        return Err("treatment folder is required".to_string());
+    }
+
+    let treatment_path = workspace.join(patient_folder).join(treatment_folder);
+    if !treatment_path.exists() || !treatment_path.is_dir() {
+        return Err("treatment folder does not exist".to_string());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&treatment_path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if !file_type.is_file() {
+            continue;
+        }
+
+        let path_buf = entry.path();
+        let metadata = entry.metadata().map_err(|e| e.to_string())?;
+        let modified_ms = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        out.push(TreatmentFileRow {
+            path: path_buf.to_string_lossy().to_string(),
+            name: entry.file_name().to_string_lossy().to_string(),
+            size: metadata.len(),
+            modified_ms,
+            is_image: is_supported_preview_image(&path_buf),
+        });
+    }
+
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
 }
 
 #[tauri::command]
@@ -1174,6 +1434,18 @@ fn load_settings(app_handle: tauri::AppHandle) -> Result<Settings, String> {
     read_settings(&app_handle)
 }
 
+#[tauri::command]
+fn set_cache_size_gb(app_handle: tauri::AppHandle, cache_size_gb: u8) -> Result<u8, String> {
+    if !(1..=10).contains(&cache_size_gb) {
+        return Err("cache_size_gb must be between 1 and 10".to_string());
+    }
+
+    let mut settings = read_settings(&app_handle)?;
+    settings.cache_size_gb = Some(cache_size_gb);
+    write_settings(&app_handle, &settings)?;
+    Ok(cache_size_gb)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1197,17 +1469,22 @@ pub fn run() {
             save_workspace,
             clear_workspace,
             open_workspace_dir,
+            open_path_with_default,
             list_patient_treatment_folders,
             list_patient_timeline_entries,
+            list_treatment_files,
             create_patient_with_metadata,
             save_patient_metadata,
             save_patient_id,
+            load_patient_keywords,
+            save_patient_keywords,
             is_patient_id_taken,
             reindex_patient_folders,
             search_patients,
             get_image_preview_kinds,
             get_image_previews,
             start_import_files,
+            set_cache_size_gb,
             load_settings
         ])
         .run(tauri::generate_context!())

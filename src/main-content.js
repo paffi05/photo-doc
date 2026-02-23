@@ -3,6 +3,7 @@ import { TauriEvent } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { createMainHeaderTimeline } from "./main-content-header";
 import { createImportPanel } from "./main-content-import";
+import { createTreatmentFilesPanel } from "./main-content-treatment-files";
 
 export function initMainContent({
   appView,
@@ -86,6 +87,12 @@ export function initMainContent({
     importCancelBtn,
     importStartBtn,
   } = createImportPanel(contentScrollLayer);
+  const treatmentFilesPanel = createTreatmentFilesPanel({
+    container: contentScrollLayer,
+    onOpenPath: async (path) => {
+      await invoke("open_path_with_default", { path });
+    },
+  });
 
   const emptyState = document.createElement("div");
   emptyState.className = "main-empty-state";
@@ -736,6 +743,20 @@ export function initMainContent({
     return selectedTimelinePoint?.dataset?.folderName ?? "";
   }
 
+  function updateTreatmentFilesPanelForSelection() {
+    const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
+    const selectedFolder = getSelectedTimelineFolderName();
+    if (!context?.workspaceDir || !context?.patientFolder || !selectedFolder) {
+      treatmentFilesPanel.clear();
+      return;
+    }
+    void treatmentFilesPanel.setContext({
+      workspaceDir: context.workspaceDir,
+      patientFolder: context.patientFolder,
+      treatmentFolder: selectedFolder,
+    });
+  }
+
   function syncImportDateAvailability() {
     const hasExistingSelection = Boolean(getSelectedTimelineFolderName());
     if (importDate) importDate.disabled = hasExistingSelection;
@@ -771,6 +792,7 @@ export function initMainContent({
     syncImportDateAvailability();
     updateImportSelectionUi();
     updateImportStartEnabled();
+    updateTreatmentFilesPanelForSelection();
   }
 
   function animateTimelineScrollTo(targetScrollLeft, durationMs = 300) {
@@ -828,6 +850,7 @@ export function initMainContent({
     const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
     if (!context?.workspaceDir || !context?.patientFolder || !timelineTrack) {
       setTimelineVisible(false);
+      treatmentFilesPanel.clear();
       return;
     }
     if (timelineSelectionOwner !== context.patientFolder) {
@@ -879,6 +902,7 @@ export function initMainContent({
       if (timelineLine) timelineLine.style.width = "0px";
       if (timelinePrefixLine) timelinePrefixLine.hidden = true;
       setTimelineVisible(false);
+      treatmentFilesPanel.clear();
       return;
     }
 
@@ -1300,6 +1324,7 @@ export function initMainContent({
       setImportPanelVisible(false);
       setIdleCursorDotVisible(true);
       setTimelineVisible(false);
+      treatmentFilesPanel.clear();
       return;
     }
 
@@ -1339,6 +1364,7 @@ export function initMainContent({
     setImportPanelVisible(false);
     setIdleCursorDotVisible(true);
     setTimelineVisible(false);
+    treatmentFilesPanel.clear();
   }
 
   // Initial state is no selected patient.
