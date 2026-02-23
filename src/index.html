@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Medical Photo Manager</title>
+    <script type="module" src="/main.js"></script>
+  </head>
+
+  <body>
+    <!-- DEBUG -->
+    <div id="debugBadge" style="position:fixed;left:12px;bottom:12px;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.08);font:12px -apple-system;z-index:9999;">
+      debug: (loading)
+    </div>
+    <div id="debugWindowBadge" style="position:fixed;right:12px;bottom:12px;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.08);font:12px -apple-system;z-index:9999;">
+      window: (loading)
+    </div>
+    <!-- ONBOARDING (shown when workspace not set) -->
+    <div id="onboardingView" class="onboarding-root" hidden>
+      <div class="container" id="onboardingCard">
+        <div class="folder-wrapper" id="pickWorkspaceIcon">
+          <div id="folderIconContainer">
+            <!-- Original Folder SVG -->
+            <svg id="folderSvg" width="130" height="130" viewBox="0 0 100 100" fill="none">
+              <path d="M10 30C10 26.6863 12.6863 24 16 24H35L42 32H84C87.3137 32 90 34.6863 90 38V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V30Z" fill="var(--folder-back)"/>
+              <g class="folder-front">
+                <path d="M10 40C10 36.6863 12.6863 34 16 34H84C87.3137 34 90 36.6863 90 40V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V40Z" fill="var(--folder-front)"/>
+                <circle cx="50" cy="57" r="8" fill="white" fill-opacity="0.5"/>
+                <rect x="49.2" y="53" width="1.6" height="8" rx="0.8" fill="white"/>
+                <rect x="46" y="56.2" width="8" height="1.6" rx="0.8" fill="white"/>
+              </g>
+            </svg> 
+          </div>
+        </div>
+
+        <h2>Select Workspace</h2>
+        <p>Choose the primary directory for your local assets.</p>
+
+        <button class="btn" id="pickWorkspaceBtn">Browse Folders</button>
+      </div>
+    </div>
+
+    <!-- MAIN APP (shown after workspace set) -->
+    <div class="app" id="appView" hidden>
+      <div class="main-layout">
+        <aside class="patient-sidebar">
+          <div class="patient-sidebar-top">
+            <div class="patient-sidebar-header">Patients</div>
+            <button class="icon-btn patient-add-btn" id="addPatientBtn" aria-label="Add patient">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+                <path class="plus-v" d="M12 5v14" stroke-linecap="round"/>
+                <path class="plus-h" d="M5 12h14" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+          <div class="patient-add-form" id="addPatientForm" hidden>
+            <input id="newPatientLastName" class="patient-add-input" type="text" placeholder="Last name" autocomplete="off" />
+            <input id="newPatientFirstName" class="patient-add-input" type="text" placeholder="First name" autocomplete="off" />
+            <div class="patient-add-id-row">
+              <input id="newPatientId" class="patient-add-input" type="text" placeholder="ID" autocomplete="off" />
+              <button class="icon-btn patient-add-confirm-btn" id="confirmAddPatientBtn" aria-label="Create patient" disabled>
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
+                  <path d="M6 12.5L10 16.5L18 8.5" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+          <input
+            id="patientSearchInput"
+            class="patient-search-input"
+            type="search"
+            placeholder="Search patients..."
+            autocomplete="off"
+          />
+          <div class="patient-list-wrap">
+            <ul id="patientList" class="patient-list"></ul>
+          </div>
+        </aside>
+        <section class="main-canvas"></section>
+      </div>
+
+      <button class="icon-btn gear-btn" id="openSettings" aria-label="Open settings">
+        <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      </button>
+
+      <div class="overlay" id="overlay" aria-hidden="true"></div>
+
+      <aside class="settings" id="settingsPanel" aria-hidden="true">
+        <div class="settings-header">
+          <button class="icon-btn close-btn" id="closeSettings" aria-label="Close settings">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M18 6 6 18M6 6l12 12"/>
+            </svg>
+          </button>
+          <div class="settings-header-title">Settings</div>
+        </div>
+
+        <div class="settings-body">
+          <div class="settings-section">
+            <div class="settings-category">WORKSPACE</div>
+            <div class="settings-row">
+              <button class="settings-value workspace-path-link" id="workspacePath" type="button">(not set)</button>
+              <button class="folder-change-btn" id="changeWorkspaceBtn" aria-label="Change workspace">
+                <svg class="folder-change-icon" width="22" height="22" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+                  <path d="M10 30C10 26.6863 12.6863 24 16 24H35L42 32H84C87.3137 32 90 34.6863 90 38V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V30Z" fill="var(--folder-back)"/>
+                  <path d="M10 40C10 36.6863 12.6863 34 16 34H84C87.3137 34 90 36.6863 90 40V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V40Z" fill="var(--folder-front)"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-category">APPEARANCE</div>
+            <div class="settings-row">
+              <div class="settings-value">Always show Folder Names in Timeline</div>
+              <label class="toggle-switch" for="alwaysShowTimelineNames">
+                <input type="checkbox" id="alwaysShowTimelineNames" />
+                <span class="toggle-slider" aria-hidden="true"></span>
+              </label>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-category">INDEXING</div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-category">DATABASE</div>
+            <div class="settings-row">
+              <div class="settings-value database-status-wrap">
+                <div class="database-status-line">
+                  <span class="db-status-spinner" id="dbStatusSpinner" hidden aria-hidden="true"></span>
+                  <span id="dbStatusText">Up to date</span>
+                </div>
+                <div class="database-status-time" id="dbStatusTime">Never Updated</div>
+              </div>
+              <button class="folder-change-btn db-reload-btn" id="dbReloadBtn" aria-label="Update database">
+                <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="settings-section">
+            <div class="settings-category">DEBUG</div>
+            <div class="settings-row">
+              <div class="settings-value">Show debug in Frontend</div>
+              <label class="toggle-switch" for="showFrontendDebug">
+                <input type="checkbox" id="showFrontendDebug" />
+                <span class="toggle-slider" aria-hidden="true"></span>
+              </label>
+            </div>
+            <div class="settings-row debug-delete-row inactive" id="deleteWorkspaceRow">
+              <div class="settings-value" id="deleteWorkspaceLabel">Delete Folder Direktory</div>
+              <button class="folder-change-btn delete-folder-btn" id="deleteWorkspaceBtn" aria-label="delete folder direktory" disabled>
+                <svg class="delete-folder-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                  <path d="M7 7L17 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                  <path d="M17 7L7 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </body>
+</html>
