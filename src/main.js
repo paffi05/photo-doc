@@ -10,6 +10,8 @@ const appView = document.getElementById("appView");
 
 const pickBtn = document.getElementById("pickWorkspaceBtn");
 const pickIcon = document.getElementById("pickWorkspaceIcon");
+const onboardingTitle = document.getElementById("onboardingTitle");
+const onboardingSubtitle = document.getElementById("onboardingSubtitle");
 
 const openBtn = document.getElementById("openSettings");
 const closeBtn = document.getElementById("closeSettings");
@@ -47,8 +49,8 @@ function ts() {
   return new Date().toISOString();
 }
 
-let transitionTimeoutId = null;
-let transitionStartedAt = null;
+let isWorkspaceSetupInProgress = false;
+let onboardingReadyWorkspaceDir = null;
 let currentWorkspaceDir = null;
 let patientSearchDebounceId = null;
 let isDbUpdating = false;
@@ -491,13 +493,20 @@ function clearPatients() {
 }
 
 function showMainScreen(workspaceDir) {
+  showMainScreenWithOptions(workspaceDir);
+}
+
+function showMainScreenWithOptions(workspaceDir, options = {}) {
+  const skipLoadPatients = options?.skipLoadPatients ?? false;
   console.log(`[transition ${ts()}] showing main screen`);
   onboardingView.hidden = true;
   appView.hidden = false;
   sidebarLayout.applyPatientSidebarMode();
   sidebarLayout.setPatientSidebarHidden(false);
   setWorkspacePathDisplay(workspaceDir);
-  loadPatients(workspaceDir);
+  if (!skipLoadPatients) {
+    loadPatients(workspaceDir);
+  }
   requestAnimationFrame(sidebarLayout.updateTopButtonSpacing);
   console.log(
     `[transition ${ts()}] view flags onboarding.hidden=${onboardingView.hidden} app.hidden=${appView.hidden}`
@@ -505,6 +514,20 @@ function showMainScreen(workspaceDir) {
 }
 
 // ---------- Folder -> Checkmark ----------
+function setOnboardingCopy(title, subtitle) {
+  if (onboardingTitle) onboardingTitle.textContent = title;
+  if (onboardingSubtitle) onboardingSubtitle.textContent = subtitle;
+}
+
+function setOnboardingBusyState(isBusy) {
+  if (pickBtn) pickBtn.disabled = isBusy;
+  pickIcon?.classList.toggle("is-busy", isBusy);
+}
+
+function setOnboardingButtonLabel(label) {
+  if (pickBtn) pickBtn.textContent = label;
+}
+
 function replaceFolderWithCheckmark() {
   if (!folderIconContainer) return;
 
@@ -524,6 +547,16 @@ function replaceFolderWithCheckmark() {
   `;
 }
 
+function replaceFolderWithLoadingSpinner() {
+  if (!folderIconContainer) return;
+
+  folderIconContainer.innerHTML = `
+    <svg class="setup-spinner-svg" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
+      <circle class="setup-spinner-ring" cx="120" cy="120" r="96"/>
+    </svg>
+  `;
+}
+
 function restoreOnboardingFolderIcon() {
   if (!folderIconContainer) return;
 
@@ -538,6 +571,14 @@ function restoreOnboardingFolderIcon() {
       </g>
     </svg>
   `;
+}
+
+function restoreOnboardingIdleState() {
+  restoreOnboardingFolderIcon();
+  setOnboardingCopy("Select Main Folder", "Please select the folder where your patient folders are stored.");
+  setOnboardingButtonLabel("Browse Folders");
+  onboardingReadyWorkspaceDir = null;
+  setOnboardingBusyState(false);
 }
 
 // Confetti burst from the folder/checkmark position (subtle)
@@ -590,6 +631,9 @@ function burstConfettiFromFolder() {
 
 // ---------- Workspace pick ----------
 async function pickWorkspaceAndSave() {
+  if (isWorkspaceSetupInProgress) return;
+  isWorkspaceSetupInProgress = true;
+  setOnboardingBusyState(true);
   setDebugState("picking workspace");
   try {
     const isAlreadyInMainView = !appView.hidden;
@@ -601,12 +645,16 @@ async function pickWorkspaceAndSave() {
 
     if (!dir) {
       setDebugState("workspace pick cancelled");
+      isWorkspaceSetupInProgress = false;
+      setOnboardingBusyState(false);
       return;
     }
 
     const workspaceDir = Array.isArray(dir) ? dir[0] : dir;
     if (!workspaceDir) {
       setDebugState("workspace pick invalid");
+      isWorkspaceSetupInProgress = false;
+      setOnboardingBusyState(false);
       return;
     }
 
@@ -618,34 +666,30 @@ async function pickWorkspaceAndSave() {
       loadPatients(workspaceDir);
       setDebugState("ready");
       console.log(`[transition ${ts()}] workspace updated in main view (no transition timer)`);
+      isWorkspaceSetupInProgress = false;
+      setOnboardingBusyState(false);
       return;
     }
 
+    replaceFolderWithLoadingSpinner();
+    setOnboardingCopy("Setting Up Database", "Please wait while we complete indexing.");
+    await loadPatients(workspaceDir, { minStatusMs: 3000 });
+
     // ONLY change the folder icon -> checkmark animation
     replaceFolderWithCheckmark();
+    setOnboardingCopy("Setup Complete", "Your workspace is ready. You can now work with your data.");
     console.log(`[transition ${ts()}] checkmark icon applied`);
     burstConfettiFromFolder();
-
-    // After the animation, switch to main screen
-    const transitionDelayMs = 2000;
-    const dueAt = Date.now() + transitionDelayMs;
-    if (transitionTimeoutId !== null) clearTimeout(transitionTimeoutId);
-    transitionStartedAt = Date.now();
-    setDebugState("transitioning (2.0s)");
-    console.log(
-      `[transition ${ts()}] timer started (${transitionDelayMs}ms), due=${new Date(dueAt).toISOString()}`
-    );
-    transitionTimeoutId = setTimeout(() => {
-      const elapsedMs = transitionStartedAt ? Date.now() - transitionStartedAt : -1;
-      console.log(`[transition ${ts()}] timer fired after ${elapsedMs}ms, switching to main screen`);
-      showMainScreen(workspaceDir);
-      setDebugState("ready");
-      transitionTimeoutId = null;
-      transitionStartedAt = null;
-    }, transitionDelayMs);
+    onboardingReadyWorkspaceDir = workspaceDir;
+    setOnboardingButtonLabel("Start");
+    setDebugState("ready to start");
+    isWorkspaceSetupInProgress = false;
+    setOnboardingBusyState(false);
   } catch (err) {
     console.error("Failed to open folder dialog:", err);
     setDebugState("error: save workspace");
+    restoreOnboardingIdleState();
+    isWorkspaceSetupInProgress = false;
   }
 }
 
@@ -669,7 +713,7 @@ async function boot() {
     if (!workspaceDir) {
       onboardingView.hidden = false;
       appView.hidden = true;
-      restoreOnboardingFolderIcon();
+      restoreOnboardingIdleState();
       clearPatients();
       setDebugState("no workspace");
       return;
@@ -685,8 +729,20 @@ async function boot() {
 }
 
 // ---------- Events ----------
-pickBtn?.addEventListener("click", pickWorkspaceAndSave);
-pickIcon?.addEventListener("click", pickWorkspaceAndSave);
+pickBtn?.addEventListener("click", async () => {
+  if (onboardingReadyWorkspaceDir) {
+    const workspaceDir = onboardingReadyWorkspaceDir;
+    onboardingReadyWorkspaceDir = null;
+    showMainScreenWithOptions(workspaceDir, { skipLoadPatients: true });
+    setDebugState("ready");
+    return;
+  }
+  await pickWorkspaceAndSave();
+});
+pickIcon?.addEventListener("click", async () => {
+  if (onboardingReadyWorkspaceDir || isWorkspaceSetupInProgress) return;
+  await pickWorkspaceAndSave();
+});
 
 changeWorkspaceBtn?.addEventListener("click", pickWorkspaceAndSave);
 showFrontendDebugToggle?.addEventListener("change", (e) => {
@@ -706,7 +762,7 @@ deleteWorkspaceBtn?.addEventListener("click", async () => {
     await invoke("clear_workspace");
     setWorkspacePathDisplay(null);
     sidebarLayout.closeSettings();
-    restoreOnboardingFolderIcon();
+    restoreOnboardingIdleState();
     onboardingView.hidden = false;
     appView.hidden = true;
     clearPatients();

@@ -1415,6 +1415,7 @@ body{
   border-radius:32px;
   box-shadow:0 20px 40px rgba(0,0,0,0.04);
   width:320px;
+  min-height: 430px;
 }
 
 @keyframes float {
@@ -1444,6 +1445,11 @@ body{
   transform: translateY(3px) skewX(-2deg);
 }
 
+.folder-wrapper.is-busy{
+  pointer-events: none;
+  cursor: default;
+}
+
 .btn{
   margin-top:2.5rem;
   padding:14px 32px;
@@ -1463,8 +1469,50 @@ body{
   box-shadow:0 6px 20px rgba(108, 99, 255, 0.3);
 }
 
-.onboarding-root h2{ color:#2D3436; margin-bottom:8px; font-size:1.5rem; }
-.onboarding-root p{ color:#636E72; margin-top:0; font-size:0.95rem; line-height:1.4; }
+.btn:disabled{
+  background: #e5e7eb;
+  color: #9ca3af;
+  box-shadow: none;
+  opacity: 1;
+  cursor: default;
+}
+
+.onboarding-root h2{
+  color:#2D3436;
+  margin-bottom:8px;
+  font-size:1.5rem;
+  min-height: 38px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.onboarding-root p{
+  color:#636E72;
+  margin-top:0;
+  font-size:0.95rem;
+  line-height:1.4;
+  min-height: 44px;
+}
+
+.setup-spinner-svg{
+  width: 130px;
+  height: 130px;
+  animation: setupSpin 0.95s linear infinite;
+}
+
+.setup-spinner-ring{
+  stroke: #2563eb;
+  stroke-width: 19;
+  fill: none;
+  stroke-linecap: round;
+  stroke-dasharray: 420 220;
+}
+
+@keyframes setupSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
 /* --- Settings categories (your requirement) --- */
 .settings-category{
