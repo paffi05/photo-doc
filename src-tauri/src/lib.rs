@@ -3,12 +3,15 @@ use base64::Engine;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Default)]
 struct WindowState {
@@ -215,6 +218,45 @@ struct ImagePreviewRow {
 }
 
 #[derive(Serialize)]
+struct CachedImagePreviewRow {
+    path: String,
+    kind: String,
+    preview_path: Option<String>,
+    data_url: Option<String>,
+}
+
+#[derive(Serialize)]
+struct CachedPreviewPathRow {
+    path: String,
+    preview_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PreviewCacheEntry {
+    file_name: String,
+    size: u64,
+    last_access_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct PreviewCacheIndex {
+    entries: HashMap<String, PreviewCacheEntry>,
+}
+
+#[derive(Serialize)]
+struct PreviewCacheStatsRow {
+    used_bytes: u64,
+    max_bytes: u64,
+    used_percent: f64,
+}
+
+#[derive(Serialize)]
+struct PreviewDebugCountsRow {
+    db_image_count: u64,
+    cache_image_count: u64,
+}
+
+#[derive(Serialize)]
 struct StartImportResponse {
     job_id: u64,
     target_folder: String,
@@ -229,7 +271,37 @@ struct ImportProgressEvent {
     error: Option<String>,
 }
 
+#[derive(Serialize, Clone)]
+struct ImportPreviewReadyEvent {
+    path: String,
+    preview_path: String,
+}
+
+#[derive(Serialize, Clone)]
+struct PreviewFillStatusEvent {
+    running: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct PreviewFillProgressEvent {
+    running: bool,
+    message: String,
+    completed: u64,
+    total: u64,
+}
+
 static IMPORT_JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
+static IMPORT_ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static PREVIEW_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PREVIEW_FILL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+const PREVIEW_CACHE_DIM: u32 = 200;
+const PREVIEW_CACHE_QUALITY: u8 = 52;
+const QUICK_PREVIEW_DIM: u32 = 84;
+const QUICK_PREVIEW_QUALITY: u8 = 44;
+const PREVIEW_CACHE_MAX_AGE_DAYS: u64 = 90;
+const PREVIEW_PREFETCH_FOLDERS: usize = 3;
+const PREVIEW_PREFETCH_IMAGES_PER_FOLDER: usize = 40;
 
 fn patient_metadata_path(folder_path: &PathBuf) -> PathBuf {
     folder_path.join(".mpm-metadata.json")
@@ -408,6 +480,514 @@ fn generate_preview_data_url(path: &Path) -> Option<String> {
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
     Some(format!("data:image/png;base64,{}", b64))
+}
+
+fn generate_quick_preview_data_url(path: &Path) -> Option<String> {
+    let reader = image::ImageReader::open(path).ok()?;
+    let img = reader.decode().ok()?;
+    let thumb = img.thumbnail(QUICK_PREVIEW_DIM, QUICK_PREVIEW_DIM).to_rgb8();
+    let mut bytes = Vec::new();
+    let mut encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, QUICK_PREVIEW_QUALITY);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(thumb))
+        .ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:image/jpeg;base64,{}", b64))
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn preview_cache_lock() -> &'static Mutex<()> {
+    PREVIEW_CACHE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn get_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
+    let base_dir = app_handle
+        .path()
+        .app_cache_dir()
+        .or_else(|_| app_handle.path().app_data_dir())
+        .expect("failed to get app cache dir");
+    let cache_dir = base_dir.join("preview-cache");
+    fs::create_dir_all(&cache_dir).ok();
+    cache_dir
+}
+
+fn preview_cache_index_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join("index.json")
+}
+
+fn load_preview_cache_index(cache_dir: &Path) -> PreviewCacheIndex {
+    let path = preview_cache_index_path(cache_dir);
+    if !path.exists() {
+        return PreviewCacheIndex::default();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return PreviewCacheIndex::default(),
+    };
+    serde_json::from_str::<PreviewCacheIndex>(&content).unwrap_or_default()
+}
+
+fn save_preview_cache_index(cache_dir: &Path, index: &PreviewCacheIndex) -> Result<(), String> {
+    let path = preview_cache_index_path(cache_dir);
+    let json = serde_json::to_string(index).map_err(|e| e.to_string())?;
+    fs::write(path, json).map_err(|e| e.to_string())
+}
+
+fn build_preview_cache_key(path: &Path, file_size: u64, modified_ms: u64) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalized_path.to_string_lossy().hash(&mut hasher);
+    file_size.hash(&mut hasher);
+    modified_ms.hash(&mut hasher);
+    PREVIEW_CACHE_DIM.hash(&mut hasher);
+    PREVIEW_CACHE_QUALITY.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn build_preview_cache_key_legacy(path: &Path, file_size: u64, modified_ms: u64) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.to_string_lossy().hash(&mut hasher);
+    file_size.hash(&mut hasher);
+    modified_ms.hash(&mut hasher);
+    PREVIEW_CACHE_DIM.hash(&mut hasher);
+    PREVIEW_CACHE_QUALITY.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn generate_preview_cache_bytes(path: &Path) -> Result<Vec<u8>, String> {
+    let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
+    let img = reader.decode().map_err(|e| e.to_string())?;
+    let thumb = img.thumbnail(PREVIEW_CACHE_DIM, PREVIEW_CACHE_DIM).to_rgb8();
+    let mut bytes = Vec::new();
+    let mut encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut bytes, PREVIEW_CACHE_QUALITY);
+    encoder
+        .encode_image(&image::DynamicImage::ImageRgb8(thumb))
+        .map_err(|e| e.to_string())?;
+    Ok(bytes)
+}
+
+fn cleanup_preview_cache(
+    cache_dir: &Path,
+    index: &mut PreviewCacheIndex,
+    max_cache_bytes: u64,
+) {
+    let now = now_ms();
+    let max_age_ms = PREVIEW_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+
+    index.entries.retain(|_, entry| {
+        let file_path = cache_dir.join(&entry.file_name);
+        if !file_path.exists() {
+            return false;
+        }
+        if now.saturating_sub(entry.last_access_ms) > max_age_ms {
+            let _ = fs::remove_file(file_path);
+            return false;
+        }
+        true
+    });
+
+    let mut total_bytes = 0_u64;
+    let mut items: Vec<(String, u64, u64, String)> = Vec::new();
+    for (key, entry) in &index.entries {
+        let path = cache_dir.join(&entry.file_name);
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(entry.size);
+        total_bytes = total_bytes.saturating_add(size);
+        items.push((key.clone(), entry.last_access_ms, size, entry.file_name.clone()));
+    }
+
+    if total_bytes <= max_cache_bytes {
+        return;
+    }
+
+    items.sort_by_key(|(_, last_access_ms, _, _)| *last_access_ms);
+    for (key, _, size, file_name) in items {
+        if total_bytes <= max_cache_bytes {
+            break;
+        }
+        let _ = fs::remove_file(cache_dir.join(file_name));
+        index.entries.remove(&key);
+        total_bytes = total_bytes.saturating_sub(size);
+    }
+
+    // Remove orphan preview jpg files that are no longer referenced by the cache index.
+    // This prevents duplicate legacy/new-key files from accumulating indefinitely.
+    let known_files: HashSet<String> = index
+        .entries
+        .values()
+        .map(|entry| entry.file_name.clone())
+        .collect();
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_preview_jpg = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false);
+            if !is_preview_jpg {
+                continue;
+            }
+            let file_name = match path.file_name().and_then(|s| s.to_str()) {
+                Some(v) => v,
+                None => continue,
+            };
+            if !known_files.contains(file_name) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+}
+
+fn compute_preview_cache_used_bytes(cache_dir: &Path) -> u64 {
+    let mut used_bytes = 0_u64;
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_preview_jpg = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false);
+            if !is_preview_jpg {
+                continue;
+            }
+            if let Ok(meta) = fs::metadata(&path) {
+                used_bytes = used_bytes.saturating_add(meta.len());
+            }
+        }
+    }
+    used_bytes
+}
+
+fn compute_preview_cache_image_count(cache_dir: &Path) -> u64 {
+    let mut image_count = 0_u64;
+    if let Ok(entries) = fs::read_dir(cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_preview_jpg = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false);
+            if is_preview_jpg {
+                image_count = image_count.saturating_add(1);
+            }
+        }
+    }
+    image_count
+}
+
+fn resolve_existing_cache_file_path(cache_dir: &Path, path_buf: &Path, file_size: u64, modified_ms: u64) -> PathBuf {
+    let key = build_preview_cache_key(path_buf, file_size, modified_ms);
+    let cache_file_path = cache_dir.join(format!("{key}.jpg"));
+    if cache_file_path.exists() {
+        return cache_file_path;
+    }
+
+    let legacy_key = build_preview_cache_key_legacy(path_buf, file_size, modified_ms);
+    let legacy_cache_file_path = cache_dir.join(format!("{legacy_key}.jpg"));
+    if legacy_cache_file_path.exists() {
+        return legacy_cache_file_path;
+    }
+
+    cache_file_path
+}
+
+fn emit_preview_fill_progress(
+    app_handle: &tauri::AppHandle,
+    running: bool,
+    message: impl Into<String>,
+    completed: u64,
+    total: u64,
+) {
+    let _ = app_handle.emit(
+        "preview-fill-progress",
+        PreviewFillProgressEvent {
+            running,
+            message: message.into(),
+            completed,
+            total,
+        },
+    );
+}
+
+fn run_preview_cache_cleanup(app_handle: &tauri::AppHandle) {
+    let Ok(_guard) = preview_cache_lock().lock() else {
+        return;
+    };
+    let cache_dir = get_preview_cache_dir(app_handle);
+    let settings = read_settings(app_handle).unwrap_or_default();
+    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
+    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let mut index = load_preview_cache_index(&cache_dir);
+    cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
+    index.entries.retain(|_, entry| {
+        let path = cache_dir.join(&entry.file_name);
+        fs::metadata(&path).is_ok()
+    });
+    let _ = save_preview_cache_index(&cache_dir, &index);
+}
+
+fn collect_workspace_expected_preview_files(workspace: &Path) -> HashSet<String> {
+    let mut expected = HashSet::new();
+    let mut stack = vec![workspace.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = match fs::read_dir(&dir) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_supported_preview_image(&path) {
+                continue;
+            }
+            let meta = match fs::metadata(&path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let file_size = meta.len();
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let key = build_preview_cache_key(&path, file_size, modified_ms);
+            expected.insert(format!("{key}.jpg"));
+        }
+    }
+
+    expected
+}
+
+fn run_preview_cache_cleanup_for_workspace(app_handle: &tauri::AppHandle, workspace: &Path) {
+    let Ok(_guard) = preview_cache_lock().lock() else {
+        return;
+    };
+    let cache_dir = get_preview_cache_dir(app_handle);
+    let settings = read_settings(app_handle).unwrap_or_default();
+    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
+    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let mut index = load_preview_cache_index(&cache_dir);
+
+    cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
+    let expected = collect_workspace_expected_preview_files(workspace);
+
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_preview_jpg = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("jpg"))
+                .unwrap_or(false);
+            if !is_preview_jpg {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !expected.contains(file_name) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    index.entries.retain(|_, entry| {
+        expected.contains(&entry.file_name) && fs::metadata(cache_dir.join(&entry.file_name)).is_ok()
+    });
+    let _ = save_preview_cache_index(&cache_dir, &index);
+}
+
+fn emit_import_preview_ready_events(
+    app_handle: &tauri::AppHandle,
+    rows: &[CachedImagePreviewRow],
+) {
+    for row in rows {
+        let path = row.path.trim().to_string();
+        let preview_path = row.preview_path.clone().unwrap_or_default().trim().to_string();
+        if path.is_empty() || preview_path.is_empty() {
+            continue;
+        }
+        let _ = app_handle.emit(
+            "import-preview-ready",
+            ImportPreviewReadyEvent { path, preview_path },
+        );
+    }
+}
+
+fn resolve_cached_previews(
+    app_handle: &tauri::AppHandle,
+    paths: &[String],
+    include_data_url: bool,
+    generate_if_missing: bool,
+) -> Result<Vec<CachedImagePreviewRow>, String> {
+    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+    let cache_dir = get_preview_cache_dir(app_handle);
+    let mut index = load_preview_cache_index(&cache_dir);
+    let settings = read_settings(app_handle).unwrap_or_default();
+    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
+    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let current_ms = now_ms();
+    let mut index_changed = false;
+
+    let mut out = Vec::with_capacity(paths.len());
+    for raw_path in paths {
+        let path = raw_path.clone();
+        if path.is_empty() {
+            continue;
+        }
+
+        let path_buf = PathBuf::from(&path);
+        if !is_supported_preview_image(&path_buf) {
+            out.push(CachedImagePreviewRow {
+                path,
+                kind: "none".to_string(),
+                preview_path: None,
+                data_url: None,
+            });
+            continue;
+        }
+
+        let kind = match imagesize::size(&path_buf) {
+            Ok(size) => classify_image_ratio(size.width, size.height),
+            Err(_) => "other".to_string(),
+        };
+
+        let file_meta = match fs::metadata(&path_buf) {
+            Ok(meta) => meta,
+            Err(_) => {
+                out.push(CachedImagePreviewRow {
+                    path,
+                    kind,
+                    preview_path: None,
+                    data_url: None,
+                });
+                continue;
+            }
+        };
+        let file_size = file_meta.len();
+        let modified_ms = file_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let cache_key = build_preview_cache_key(&path_buf, file_size, modified_ms);
+        let file_name = format!("{cache_key}.jpg");
+        let cache_file_path = cache_dir.join(&file_name);
+        let legacy_cache_key = build_preview_cache_key_legacy(&path_buf, file_size, modified_ms);
+        let legacy_file_name = format!("{legacy_cache_key}.jpg");
+        let legacy_cache_file_path = cache_dir.join(&legacy_file_name);
+
+        if !cache_file_path.exists() && legacy_cache_file_path.exists() {
+            let _ = fs::rename(&legacy_cache_file_path, &cache_file_path);
+        }
+
+        if !cache_file_path.exists() {
+            if !generate_if_missing {
+                out.push(CachedImagePreviewRow {
+                    path,
+                    kind,
+                    preview_path: None,
+                    data_url: None,
+                });
+                continue;
+            }
+            match generate_preview_cache_bytes(&path_buf) {
+                Ok(bytes) => {
+                    let tmp_path = cache_dir.join(format!("{file_name}.tmp"));
+                    fs::write(&tmp_path, &bytes).map_err(|e| e.to_string())?;
+                    fs::rename(&tmp_path, &cache_file_path).map_err(|e| e.to_string())?;
+                    index.entries.insert(
+                        cache_key.clone(),
+                        PreviewCacheEntry {
+                            file_name: file_name.clone(),
+                            size: bytes.len() as u64,
+                            last_access_ms: current_ms,
+                        },
+                    );
+                    index_changed = true;
+                }
+                Err(_) => {
+                    out.push(CachedImagePreviewRow {
+                        path,
+                        kind,
+                        preview_path: None,
+                        data_url: None,
+                    });
+                    continue;
+                }
+            }
+        } else if generate_if_missing {
+            let cached_size = fs::metadata(&cache_file_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            index.entries.insert(
+                cache_key.clone(),
+                PreviewCacheEntry {
+                    file_name: file_name.clone(),
+                    size: cached_size,
+                    last_access_ms: current_ms,
+                },
+            );
+            index_changed = true;
+        }
+
+        out.push(CachedImagePreviewRow {
+            path,
+            kind,
+            preview_path: Some(cache_file_path.to_string_lossy().to_string()),
+            data_url: if include_data_url {
+                fs::read(&cache_file_path)
+                    .ok()
+                    .map(|bytes| format!(
+                        "data:image/jpeg;base64,{}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    ))
+            } else {
+                None
+            },
+        });
+    }
+
+    if generate_if_missing {
+        cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
+        index_changed = true;
+    }
+    if index_changed {
+        let _ = save_preview_cache_index(&cache_dir, &index);
+    }
+    Ok(out)
 }
 
 fn metadata_to_search_text(metadata: &PatientMetadata) -> String {
@@ -888,6 +1468,36 @@ fn open_workspace_dir(workspace_dir: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn open_preview_cache_dir(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let cache_dir = get_preview_cache_dir(&app_handle);
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(&cache_dir);
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("explorer");
+        c.arg(&cache_dir);
+        c
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(&cache_dir);
+        c
+    };
+
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn open_path_with_default(path: String) -> Result<(), String> {
     let target = path.trim().to_string();
     if target.is_empty() {
@@ -1221,7 +1831,7 @@ async fn get_image_preview_kinds(paths: Vec<String>) -> Result<Vec<ImagePreviewK
         let mut out = Vec::with_capacity(paths.len());
 
         for raw_path in paths {
-            let path = raw_path.trim().to_string();
+            let path = raw_path;
             if path.is_empty() {
                 continue;
             }
@@ -1251,7 +1861,7 @@ async fn get_image_previews(paths: Vec<String>) -> Result<Vec<ImagePreviewRow>, 
         let mut out = Vec::with_capacity(paths.len());
 
         for raw_path in paths {
-            let path = raw_path.trim().to_string();
+            let path = raw_path;
             if path.is_empty() {
                 continue;
             }
@@ -1280,6 +1890,186 @@ async fn get_image_previews(paths: Vec<String>) -> Result<Vec<ImagePreviewRow>, 
         }
 
         Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_quick_image_previews(paths: Vec<String>) -> Result<Vec<ImagePreviewRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::with_capacity(paths.len());
+
+        for raw_path in paths {
+            let path = raw_path;
+            if path.is_empty() {
+                continue;
+            }
+
+            let path_buf = PathBuf::from(&path);
+            if !is_supported_preview_image(&path_buf) {
+                out.push(ImagePreviewRow {
+                    path,
+                    kind: "none".to_string(),
+                    data_url: None,
+                });
+                continue;
+            }
+
+            let kind = match imagesize::size(&path_buf) {
+                Ok(size) => classify_image_ratio(size.width, size.height),
+                Err(_) => "other".to_string(),
+            };
+            let data_url = generate_quick_preview_data_url(&path_buf);
+
+            out.push(ImagePreviewRow {
+                path,
+                kind,
+                data_url,
+            });
+        }
+
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_cached_image_previews(
+    app_handle: tauri::AppHandle,
+    paths: Vec<String>,
+    include_data_url: Option<bool>,
+    generate_if_missing: Option<bool>,
+) -> Result<Vec<CachedImagePreviewRow>, String> {
+    let include_data_url = include_data_url.unwrap_or(true);
+    let generate_if_missing = generate_if_missing.unwrap_or(true);
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_cached_previews(&app_handle, &paths, include_data_url, generate_if_missing)
+    })
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_existing_cached_preview_paths(
+    app_handle: tauri::AppHandle,
+    paths: Vec<String>,
+) -> Result<Vec<CachedPreviewPathRow>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_dir = get_preview_cache_dir(&app_handle);
+        let mut out = Vec::with_capacity(paths.len());
+
+        for raw_path in paths {
+            let path = raw_path;
+            if path.is_empty() {
+                continue;
+            }
+
+            let path_buf = PathBuf::from(&path);
+            if !is_supported_preview_image(&path_buf) {
+                out.push(CachedPreviewPathRow {
+                    path,
+                    preview_path: None,
+                });
+                continue;
+            }
+
+            let file_meta = match fs::metadata(&path_buf) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    out.push(CachedPreviewPathRow {
+                        path,
+                        preview_path: None,
+                    });
+                    continue;
+                }
+            };
+
+            let file_size = file_meta.len();
+            let modified_ms = file_meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let cache_file_path =
+                resolve_existing_cache_file_path(&cache_dir, &path_buf, file_size, modified_ms);
+
+            out.push(CachedPreviewPathRow {
+                path,
+                preview_path: if cache_file_path.exists() {
+                    Some(cache_file_path.to_string_lossy().to_string())
+                } else {
+                    None
+                },
+            });
+        }
+
+        Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn prefetch_treatment_folder_previews(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+    treatment_folders: Vec<String>,
+) -> Result<(), String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Ok(());
+    }
+
+    let patient_folder = patient_folder.trim().to_string();
+    if patient_folder.is_empty() {
+        return Ok(());
+    }
+
+    let selected_folders: Vec<String> = treatment_folders
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(PREVIEW_PREFETCH_FOLDERS)
+        .collect();
+
+    if selected_folders.is_empty() {
+        return Ok(());
+    }
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut image_paths = Vec::new();
+        for treatment_folder in selected_folders {
+            let treatment_path = workspace.join(&patient_folder).join(&treatment_folder);
+            if !treatment_path.exists() || !treatment_path.is_dir() {
+                continue;
+            }
+
+            let mut folder_paths = Vec::new();
+            for entry in fs::read_dir(&treatment_path).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let file_type = entry.file_type().map_err(|e| e.to_string())?;
+                if !file_type.is_file() {
+                    continue;
+                }
+                let p = entry.path();
+                if !is_supported_preview_image(&p) {
+                    continue;
+                }
+                folder_paths.push(p.to_string_lossy().to_string());
+            }
+            folder_paths.sort();
+            image_paths.extend(folder_paths.into_iter().take(PREVIEW_PREFETCH_IMAGES_PER_FOLDER));
+        }
+
+        if image_paths.is_empty() {
+            return Ok(());
+        }
+        let _ = resolve_cached_previews(&app_handle, &image_paths, false, true)?;
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1366,6 +2156,15 @@ fn start_import_files(
     let target_dir_clone = target_dir.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
+        struct ImportActiveGuard;
+        impl Drop for ImportActiveGuard {
+            fn drop(&mut self) {
+                IMPORT_ACTIVE_COUNT.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        IMPORT_ACTIVE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _import_active_guard = ImportActiveGuard;
+
         let total_bytes: u64 = import_files
             .iter()
             .filter_map(|p| fs::metadata(p).ok())
@@ -1374,6 +2173,19 @@ fn start_import_files(
         let total_count: u64 = import_files.len() as u64;
         let mut copied_bytes: u64 = 0;
         let mut copied_count: u64 = 0;
+        let mut pending_preview_paths: Vec<String> = Vec::new();
+        let (preview_tx, preview_rx) = std::sync::mpsc::channel::<Vec<String>>();
+        let preview_handle = app_handle_clone.clone();
+        std::thread::spawn(move || {
+            while let Ok(batch) = preview_rx.recv() {
+                if batch.is_empty() {
+                    continue;
+                }
+                if let Ok(rows) = resolve_cached_previews(&preview_handle, &batch, false, true) {
+                    emit_import_preview_ready_events(&preview_handle, &rows);
+                }
+            }
+        });
 
         let emit_progress = |percent: f64, done: bool, error: Option<String>| {
             let payload = ImportProgressEvent {
@@ -1401,6 +2213,15 @@ fn start_import_files(
                     if delete_origin {
                         let _ = fs::remove_file(&src_path);
                     }
+
+                    if is_supported_preview_image(&dst_path) {
+                        pending_preview_paths.push(dst_path.to_string_lossy().to_string());
+                        if pending_preview_paths.len() >= 6 {
+                            let batch = std::mem::take(&mut pending_preview_paths);
+                            let _ = preview_tx.send(batch);
+                        }
+                    }
+
                     copied_bytes = copied_bytes.saturating_add(written);
                     copied_count = copied_count.saturating_add(1);
                     let percent = if total_bytes > 0 {
@@ -1419,6 +2240,11 @@ fn start_import_files(
             }
         }
 
+        if !pending_preview_paths.is_empty() {
+            let batch = std::mem::take(&mut pending_preview_paths);
+            let _ = preview_tx.send(batch);
+        }
+        drop(preview_tx);
         emit_progress(100.0, true, None);
     });
 
@@ -1446,6 +2272,272 @@ fn set_cache_size_gb(app_handle: tauri::AppHandle, cache_size_gb: u8) -> Result<
     Ok(cache_size_gb)
 }
 
+#[tauri::command]
+fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
+    let settings = read_settings(&app_handle).unwrap_or_default();
+    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
+    let max_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let cache_dir = get_preview_cache_dir(&app_handle);
+    let used_bytes = if let Ok(_guard) = preview_cache_lock().try_lock() {
+        let mut index = load_preview_cache_index(&cache_dir);
+        cleanup_preview_cache(&cache_dir, &mut index, max_bytes);
+        index.entries.retain(|_, entry| {
+            let path = cache_dir.join(&entry.file_name);
+            fs::metadata(&path).is_ok()
+        });
+        let _ = save_preview_cache_index(&cache_dir, &index);
+        compute_preview_cache_used_bytes(&cache_dir)
+    } else {
+        // Avoid blocking UI calls (e.g. cache slider updates) while background fill holds the lock.
+        compute_preview_cache_used_bytes(&cache_dir)
+    };
+
+    let used_percent = if max_bytes > 0 {
+        ((used_bytes as f64 / max_bytes as f64) * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    Ok(PreviewCacheStatsRow {
+        used_bytes,
+        max_bytes,
+        used_percent,
+    })
+}
+
+#[tauri::command]
+fn get_preview_debug_counts(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<PreviewDebugCountsRow, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    let mut db_image_count = 0_u64;
+
+    if workspace.exists() && workspace.is_dir() {
+        let conn = open_db(&app_handle)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT patient_folder, folder_name
+                 FROM patient_treatment_index
+                 WHERE workspace_dir = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let rows = stmt
+            .query_map(params![workspace_dir], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+
+        for row in rows {
+            let (patient_folder, treatment_folder) = row.map_err(|e| e.to_string())?;
+            let treatment_path = workspace.join(patient_folder).join(treatment_folder);
+            if !treatment_path.exists() || !treatment_path.is_dir() {
+                continue;
+            }
+            let entries = match fs::read_dir(&treatment_path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() || !is_supported_preview_image(&path) {
+                    continue;
+                }
+                db_image_count = db_image_count.saturating_add(1);
+            }
+        }
+    }
+
+    let cache_dir = get_preview_cache_dir(&app_handle);
+    let cache_image_count = if workspace.exists() && workspace.is_dir() {
+        let conn = open_db(&app_handle)?;
+        let mut mapped_count = 0_u64;
+        let mut stmt = conn
+            .prepare(
+                "SELECT patient_folder, folder_name
+                 FROM patient_treatment_index
+                 WHERE workspace_dir = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![workspace_dir], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (patient_folder, treatment_folder) = row.map_err(|e| e.to_string())?;
+            let treatment_path = workspace.join(patient_folder).join(treatment_folder);
+            if !treatment_path.exists() || !treatment_path.is_dir() {
+                continue;
+            }
+            let entries = match fs::read_dir(&treatment_path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() || !is_supported_preview_image(&path) {
+                    continue;
+                }
+                let meta = match fs::metadata(&path) {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let file_size = meta.len();
+                let modified_ms = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let cache_file_path =
+                    resolve_existing_cache_file_path(&cache_dir, &path, file_size, modified_ms);
+                if cache_file_path.exists() {
+                    mapped_count = mapped_count.saturating_add(1);
+                }
+            }
+        }
+        mapped_count
+    } else {
+        compute_preview_cache_image_count(&cache_dir)
+    };
+
+    Ok(PreviewDebugCountsRow {
+        db_image_count,
+        cache_image_count,
+    })
+}
+
+#[tauri::command]
+async fn cleanup_preview_cache_for_workspace(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace = PathBuf::from(workspace_dir.trim());
+        if !workspace.exists() || !workspace.is_dir() {
+            return Ok(());
+        }
+        run_preview_cache_cleanup_for_workspace(&app_handle, &workspace);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+#[tauri::command]
+fn get_preview_fill_status() -> bool {
+    PREVIEW_FILL_RUNNING.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn start_background_preview_fill(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<bool, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    if PREVIEW_FILL_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    let _ = app_handle.emit(
+        "preview-fill-status",
+        PreviewFillStatusEvent { running: true },
+    );
+    let app_handle_clone = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        const BATCH_SIZE: usize = 18;
+        let mut stack = vec![workspace];
+        let mut all_images: Vec<String> = Vec::new();
+
+        while let Some(dir) = stack.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    continue;
+                };
+                let path = entry.path();
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
+
+                if file_type.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if !file_type.is_file() || !is_supported_preview_image(&path) {
+                    continue;
+                }
+
+                all_images.push(path.to_string_lossy().to_string());
+            }
+        }
+
+        let total = all_images.len() as u64;
+        let mut completed = 0_u64;
+        if total > 0 {
+            emit_preview_fill_progress(
+                &app_handle_clone,
+                true,
+                format!("Creating new previews ({completed}/{total})"),
+                completed,
+                total,
+            );
+        } else {
+            emit_preview_fill_progress(&app_handle_clone, true, "Creating new previews (0/0)", 0, 0);
+        }
+
+        for chunk in all_images.chunks(BATCH_SIZE) {
+            let batch: Vec<String> = chunk.to_vec();
+            let _ = resolve_cached_previews(&app_handle_clone, &batch, false, true);
+            completed = completed.saturating_add(batch.len() as u64);
+            emit_preview_fill_progress(
+                &app_handle_clone,
+                true,
+                format!("Creating new previews ({completed}/{total})"),
+                completed,
+                total,
+            );
+            std::thread::sleep(Duration::from_millis(24));
+        }
+
+        if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+            emit_preview_fill_progress(
+                &app_handle_clone,
+                true,
+                "Cleanup on hold (import in progress)",
+                completed,
+                total,
+            );
+        } else {
+            emit_preview_fill_progress(&app_handle_clone, true, "Removing old files", completed, total);
+            run_preview_cache_cleanup(&app_handle_clone);
+            emit_preview_fill_progress(&app_handle_clone, true, "Clearing duplicates", completed, total);
+            run_preview_cache_cleanup(&app_handle_clone);
+        }
+
+        PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
+        emit_preview_fill_progress(&app_handle_clone, false, "Up to date", completed, total);
+        let _ = app_handle_clone.emit(
+            "preview-fill-status",
+            PreviewFillStatusEvent { running: false },
+        );
+    });
+
+    Ok(true)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1469,6 +2561,7 @@ pub fn run() {
             save_workspace,
             clear_workspace,
             open_workspace_dir,
+            open_preview_cache_dir,
             open_path_with_default,
             list_patient_treatment_folders,
             list_patient_timeline_entries,
@@ -1483,8 +2576,17 @@ pub fn run() {
             search_patients,
             get_image_preview_kinds,
             get_image_previews,
+            get_quick_image_previews,
+            get_cached_image_previews,
+            get_existing_cached_preview_paths,
+            prefetch_treatment_folder_previews,
             start_import_files,
             set_cache_size_gb,
+            get_preview_cache_stats,
+            get_preview_debug_counts,
+            cleanup_preview_cache_for_workspace,
+            get_preview_fill_status,
+            start_background_preview_fill,
             load_settings
         ])
         .run(tauri::generate_context!())

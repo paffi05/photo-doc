@@ -1,5 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import confetti from "canvas-confetti";
 import { initSidebarLayout } from "./sidebar-layout";
 import { initMainContent } from "./main-content";
@@ -41,6 +42,13 @@ const dbStatusSpinner = document.getElementById("dbStatusSpinner");
 const dbReloadBtn = document.getElementById("dbReloadBtn");
 const cacheSizeSlider = document.getElementById("cacheSizeSlider");
 const cacheSizeValue = document.getElementById("cacheSizeValue");
+const cacheUsageBar = document.getElementById("cacheUsageBar");
+const cacheUsageText = document.getElementById("cacheUsageText");
+const openCacheFolderBtn = document.getElementById("openCacheFolderBtn");
+const indexingWarmupSpinner = document.getElementById("indexingWarmupSpinner");
+const indexingProgressSpinner = document.getElementById("indexingProgressSpinner");
+const indexingProgressText = document.getElementById("indexingProgressText");
+const indexingDebugCounts = document.getElementById("indexingDebugCounts");
 
 function setDebugState(state) {
   if (!debugBadge) return;
@@ -56,12 +64,15 @@ let onboardingReadyWorkspaceDir = null;
 let currentWorkspaceDir = null;
 let patientSearchDebounceId = null;
 let isDbUpdating = false;
+let isPreviewFillRunning = false;
+let previewFillPollIntervalId = null;
+let indexingDebugCountsInFlight = false;
 let selectedPatient = null;
 let selectedPatientId = "";
 let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
-const importingPatients = new Set();
+const importingPatientJobCounts = new Map();
 let lastRenderedPatientEntries = [];
 let lastRenderedFilterText = "";
 
@@ -100,11 +111,22 @@ const mainContent = initMainContent({
   onImportActivityChange: ({ patientFolder, active }) => {
     if (!patientFolder) return;
     if (active) {
-      importingPatients.add(patientFolder);
+      const nextCount = (importingPatientJobCounts.get(patientFolder) ?? 0) + 1;
+      importingPatientJobCounts.set(patientFolder, nextCount);
     } else {
-      importingPatients.delete(patientFolder);
+      const currentCount = importingPatientJobCounts.get(patientFolder) ?? 0;
+      const nextCount = Math.max(0, currentCount - 1);
+      if (nextCount > 0) {
+        importingPatientJobCounts.set(patientFolder, nextCount);
+      } else {
+        importingPatientJobCounts.delete(patientFolder);
+      }
     }
     renderPatientList(lastRenderedPatientEntries, lastRenderedFilterText);
+  },
+  onImportDebugStateChange: (state) => {
+    if (!state) return;
+    setDebugState(state);
   },
   onCheckMissingPatientIdTaken: async (patientId) => {
     if (!currentWorkspaceDir) return false;
@@ -141,6 +163,7 @@ function setDebugVisibility(show) {
   if (!debugBadge) return;
   debugBadge.hidden = !show;
   if (debugWindowBadge) debugWindowBadge.hidden = !show;
+  if (indexingDebugCounts) indexingDebugCounts.hidden = !show;
 }
 
 function updateWindowDebugSize() {
@@ -218,6 +241,135 @@ function setCacheSizeUi(valueGb) {
   const cacheSizeGb = clampCacheSizeGb(valueGb);
   if (cacheSizeSlider) cacheSizeSlider.value = String(cacheSizeGb);
   if (cacheSizeValue) cacheSizeValue.textContent = `${cacheSizeGb} GB`;
+}
+
+function formatBytesShort(bytes = 0) {
+  const n = Number(bytes) || 0;
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 ** 3) return `${(n / (1024 ** 2)).toFixed(1)} MB`;
+  return `${(n / (1024 ** 3)).toFixed(2)} GB`;
+}
+
+function setCacheUsageUi({ usedBytes = 0, maxBytes = 0, percent = 0 } = {}) {
+  const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+  const visiblePercent = safePercent > 0 ? Math.max(2, safePercent) : 0;
+  if (cacheUsageBar) {
+    cacheUsageBar.style.width = `${visiblePercent}%`;
+  }
+  if (cacheUsageText) {
+    cacheUsageText.textContent = `Cache usage: ${safePercent.toFixed(1)}% (${formatBytesShort(usedBytes)} / ${formatBytesShort(maxBytes)})`;
+  }
+}
+
+function setIndexingProgressUi({ running = false, message = "Up to date" } = {}) {
+  if (indexingProgressSpinner) indexingProgressSpinner.hidden = !running;
+  if (indexingProgressText) indexingProgressText.textContent = message || "Up to date";
+}
+
+function setIndexingDebugCountsUi(dbImageCount = 0, cacheImageCount = 0, { show = false } = {}) {
+  if (!indexingDebugCounts) return;
+  indexingDebugCounts.textContent = `DB/CACHE: ${dbImageCount}/${cacheImageCount}`;
+  indexingDebugCounts.hidden = !show;
+}
+
+function shouldShowIndexingDebugCounts() {
+  return Boolean(showFrontendDebugToggle?.checked) && Boolean(currentWorkspaceDir);
+}
+
+async function refreshIndexingDebugCounts() {
+  if (!indexingDebugCounts) return;
+  if (!shouldShowIndexingDebugCounts()) {
+    setIndexingDebugCountsUi(0, 0, { show: false });
+    return;
+  }
+  if (indexingDebugCountsInFlight) return;
+  indexingDebugCountsInFlight = true;
+  try {
+    const stats = await invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir });
+    const dbImageCount = Number(stats?.db_image_count ?? stats?.dbImageCount ?? 0) || 0;
+    const cacheImageCount = Number(stats?.cache_image_count ?? stats?.cacheImageCount ?? 0) || 0;
+    setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: true });
+  } catch (err) {
+    console.error("get_preview_debug_counts failed:", err);
+    setIndexingDebugCountsUi(0, 0, { show: true });
+  } finally {
+    indexingDebugCountsInFlight = false;
+  }
+}
+
+function setPreviewFillRunning(running) {
+  isPreviewFillRunning = Boolean(running);
+  if (indexingWarmupSpinner) indexingWarmupSpinner.hidden = !isPreviewFillRunning;
+  if (!isPreviewFillRunning) {
+    setIndexingProgressUi({ running: false, message: "Up to date" });
+  } else if (indexingProgressText && indexingProgressText.textContent === "Up to date") {
+    setIndexingProgressUi({ running: true, message: "Preparing indexing..." });
+  }
+  if (isPreviewFillRunning) {
+    if (previewFillPollIntervalId === null) {
+      previewFillPollIntervalId = setInterval(() => {
+        void refreshCacheUsageUi();
+        void refreshIndexingDebugCounts();
+      }, 5000);
+    }
+  } else if (previewFillPollIntervalId !== null) {
+    clearInterval(previewFillPollIntervalId);
+    previewFillPollIntervalId = null;
+  }
+}
+
+async function ensureBackgroundPreviewFill(cacheStats = null) {
+  if (!currentWorkspaceDir || isPreviewFillRunning) return;
+  try {
+    const counts = await invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir });
+    const dbImageCount = Number(counts?.db_image_count ?? counts?.dbImageCount ?? 0) || 0;
+    const cacheImageCount = Number(counts?.cache_image_count ?? counts?.cacheImageCount ?? 0) || 0;
+
+    if (dbImageCount > cacheImageCount) {
+      setIndexingProgressUi({ running: true, message: `Checking previews (${cacheImageCount}/${dbImageCount})` });
+      const started = await invoke("start_background_preview_fill", { workspaceDir: currentWorkspaceDir });
+      if (started) {
+        setPreviewFillRunning(true);
+      } else {
+        setIndexingProgressUi({ running: false, message: "Up to date" });
+      }
+    } else {
+      setIndexingProgressUi({ running: true, message: "Removing old files" });
+      await invoke("cleanup_preview_cache_for_workspace", { workspaceDir: currentWorkspaceDir });
+      setIndexingProgressUi({ running: false, message: "Up to date" });
+      void refreshCacheUsageUi();
+      void refreshIndexingDebugCounts();
+    }
+  } catch (err) {
+    console.error("startup preview check failed:", err);
+    setIndexingProgressUi({ running: false, message: "Up to date" });
+  }
+}
+
+async function refreshCacheUsageUi() {
+  try {
+    const stats = await invoke("get_preview_cache_stats");
+    setCacheUsageUi({
+      usedBytes: stats?.used_bytes ?? stats?.usedBytes ?? 0,
+      maxBytes: stats?.max_bytes ?? stats?.maxBytes ?? 0,
+      percent: stats?.used_percent ?? stats?.usedPercent ?? 0,
+    });
+    return stats;
+  } catch (err) {
+    console.error("get_preview_cache_stats failed:", err);
+    const fallback = {
+      used_bytes: 0,
+      max_bytes: (DEFAULT_CACHE_SIZE_GB * 1024 * 1024 * 1024),
+      used_percent: 0,
+    };
+    setCacheUsageUi({
+      usedBytes: fallback.used_bytes,
+      maxBytes: fallback.max_bytes,
+      percent: fallback.used_percent,
+    });
+    return fallback;
+  }
 }
 
 function formatDateTime(date) {
@@ -396,7 +548,7 @@ function renderPatientList(entries, filterText = "") {
       item.classList.add("selected");
     }
 
-    if (importingPatients.has(folderName)) {
+    if ((importingPatientJobCounts.get(folderName) ?? 0) > 0) {
       const importSpinner = document.createElement("span");
       importSpinner.className = "patient-import-spinner";
       importSpinner.setAttribute("aria-hidden", "true");
@@ -487,13 +639,14 @@ async function loadPatients(workspaceDir, options = {}) {
 
   await searchPatients(query);
   await mainContent.refreshTimelineForSelection();
+  await refreshIndexingDebugCounts();
 }
 
 function clearPatients() {
   currentWorkspaceDir = null;
   selectedPatient = null;
   selectedPatientId = "";
-  importingPatients.clear();
+  importingPatientJobCounts.clear();
   sidebarLayout.clearAutoHidePatientSidebar();
   sidebarLayout.setPatientSidebarHidden(false);
   if (patientSearchDebounceId !== null) {
@@ -505,6 +658,9 @@ function clearPatients() {
   resetAddPatientForm();
   mainContent.clearSelectedPatientHeader();
   renderPatientList([], "");
+  setPreviewFillRunning(false);
+  setIndexingProgressUi({ running: false, message: "Up to date" });
+  setIndexingDebugCountsUi(0, 0, { show: false });
   setDbStatusIdle();
 }
 
@@ -517,9 +673,15 @@ function showMainScreenWithOptions(workspaceDir, options = {}) {
   console.log(`[transition ${ts()}] showing main screen`);
   onboardingView.hidden = true;
   appView.hidden = false;
+  currentWorkspaceDir = workspaceDir;
   sidebarLayout.applyPatientSidebarMode();
   sidebarLayout.setPatientSidebarHidden(false);
   setWorkspacePathDisplay(workspaceDir);
+  void (async () => {
+    const stats = await refreshCacheUsageUi();
+    await ensureBackgroundPreviewFill(stats);
+    await refreshIndexingDebugCounts();
+  })();
   if (!skipLoadPatients) {
     loadPatients(workspaceDir);
   }
@@ -729,6 +891,8 @@ async function boot() {
       settings?.cacheSizeGb ??
       DEFAULT_CACHE_SIZE_GB;
     setCacheSizeUi(cacheSizeGb);
+    await refreshCacheUsageUi();
+    await refreshIndexingDebugCounts();
     console.log("workspaceDir:", workspaceDir);
 
     if (!workspaceDir) {
@@ -746,6 +910,7 @@ async function boot() {
   } catch (err) {
     console.error("load_settings failed:", err);
     setCacheSizeUi(DEFAULT_CACHE_SIZE_GB);
+    await refreshCacheUsageUi();
     setDebugState("error: load settings");
   }
 }
@@ -772,6 +937,7 @@ showFrontendDebugToggle?.addEventListener("change", (e) => {
   setDebugVisibility(show);
   setDeleteWorkspaceAvailability(show);
   writeDebugVisibilityPref(show);
+  void refreshIndexingDebugCounts();
 });
 alwaysShowTimelineNamesToggle?.addEventListener("change", (e) => {
   const enabled = Boolean(e.target?.checked);
@@ -798,6 +964,7 @@ deleteWorkspaceBtn?.addEventListener("click", async () => {
 dbReloadBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || isDbUpdating) return;
   await loadPatients(currentWorkspaceDir, { minStatusMs: 1500 });
+  await refreshIndexingDebugCounts();
 });
 cacheSizeSlider?.addEventListener("input", (e) => {
   const value = clampCacheSizeGb(e.target?.value ?? DEFAULT_CACHE_SIZE_GB);
@@ -811,9 +978,12 @@ cacheSizeSlider?.addEventListener("change", async (e) => {
   try {
     const saved = await invoke("set_cache_size_gb", { cacheSizeGb: value });
     setCacheSizeUi(saved);
+    const stats = await refreshCacheUsageUi();
+    await ensureBackgroundPreviewFill(stats);
   } catch (err) {
     console.error("set_cache_size_gb failed:", err);
     setCacheSizeUi(DEFAULT_CACHE_SIZE_GB);
+    await refreshCacheUsageUi();
   } finally {
     cacheSizeSlider.disabled = false;
   }
@@ -871,6 +1041,13 @@ workspacePathEl?.addEventListener("click", async () => {
     console.error("open_workspace_dir failed:", err);
   }
 });
+openCacheFolderBtn?.addEventListener("click", async () => {
+  try {
+    await invoke("open_preview_cache_dir");
+  } catch (err) {
+    console.error("open_preview_cache_dir failed:", err);
+  }
+});
 
 window.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && sidebarLayout.isSettingsOpen()) sidebarLayout.closeSettings();
@@ -911,4 +1088,31 @@ sidebarLayout.applyPatientSidebarMode();
 sidebarLayout.updateTopButtonSpacing();
 updateAddPatientFormState();
 renderPatientList([], "");
+void listen("preview-fill-status", (event) => {
+  const running = Boolean(event?.payload?.running);
+  setPreviewFillRunning(running);
+  if (!running) {
+    void refreshCacheUsageUi();
+    void refreshIndexingDebugCounts();
+  }
+});
+void listen("preview-fill-progress", (event) => {
+  const running = Boolean(event?.payload?.running);
+  const message = String(event?.payload?.message ?? "").trim();
+  setIndexingProgressUi({
+    running,
+    message: message || (running ? "Indexing..." : "Up to date"),
+  });
+});
+void (async () => {
+  try {
+    const running = await invoke("get_preview_fill_status");
+    setPreviewFillRunning(running);
+    if (!running) {
+      setIndexingProgressUi({ running: false, message: "Up to date" });
+    }
+  } catch (err) {
+    console.error("get_preview_fill_status failed:", err);
+  }
+})();
 boot();

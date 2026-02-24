@@ -10,6 +10,7 @@ export function initMainContent({
   onDropOverlayWillShow,
   resolveImportContext,
   onImportActivityChange,
+  onImportDebugStateChange,
   onCheckMissingPatientIdTaken,
   onSubmitMissingPatientId,
 }) {
@@ -55,18 +56,6 @@ export function initMainContent({
   const contentScrollLayer = document.createElement("div");
   contentScrollLayer.className = "main-content-scroll-layer";
   mainCanvas.appendChild(contentScrollLayer);
-
-  const importProgressCapsule = document.createElement("div");
-  importProgressCapsule.className = "import-progress-capsule";
-  importProgressCapsule.hidden = true;
-  importProgressCapsule.innerHTML = `
-    <svg class="import-progress-ring" viewBox="0 0 36 36" aria-hidden="true">
-      <circle class="import-progress-track" cx="18" cy="18" r="16"></circle>
-      <circle class="import-progress-value" cx="18" cy="18" r="16"></circle>
-    </svg>
-    <span class="import-progress-text">0</span>
-  `;
-  mainCanvas.appendChild(importProgressCapsule);
 
   const {
     importPanel,
@@ -166,14 +155,9 @@ export function initMainContent({
   let importPreviewRequestId = 0;
   const IMPORT_PREVIEW_MAX_ITEMS = 160;
   const IMPORT_PREVIEW_CONCURRENCY = 4;
-  let activeImportJobId = null;
-  let activeImportTargetFolder = "";
-  let activeImportWorkspaceDir = "";
-  let activeImportPatientFolder = "";
-  let importProgressShownAt = 0;
-  let importFinalizeTimerId = null;
-  let importProgressValue = 0;
-  let importProgressAnimationRafId = null;
+  const importJobs = new Map();
+  let importLiveRefreshTimerId = null;
+  let importLiveRefreshPending = false;
   let missingPatientIdTaken = false;
   let missingPatientIdChecking = false;
   let missingPatientIdCheckToken = 0;
@@ -257,17 +241,62 @@ export function initMainContent({
     }
   }
 
-  function forceHideImportProgressCapsule() {
-    importProgressCapsule.hidden = true;
-    importProgressCapsule.classList.remove("visible");
-    importProgressCapsule.classList.remove("on-selected-dot");
+  function createImportProgressCapsule() {
+    const capsule = document.createElement("div");
+    capsule.className = "import-progress-capsule";
+    capsule.hidden = true;
+    capsule.innerHTML = `
+      <svg class="import-progress-ring" viewBox="0 0 36 36" aria-hidden="true">
+        <circle class="import-progress-track" cx="18" cy="18" r="16"></circle>
+        <circle class="import-progress-value" cx="18" cy="18" r="16"></circle>
+      </svg>
+      <span class="import-progress-text">0</span>
+    `;
+    mainCanvas.appendChild(capsule);
+    return capsule;
+  }
+
+  function updateImportProgressCapsule(capsule, percent = 0) {
+    if (!capsule) return;
+    const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    const textEl = capsule.querySelector(".import-progress-text");
+    const valueCircle = capsule.querySelector(".import-progress-value");
+    if (textEl) textEl.textContent = `${Math.round(safePercent)}`;
+    if (valueCircle) {
+      const circumference = 2 * Math.PI * 16;
+      const offset = circumference * (1 - safePercent / 100);
+      valueCircle.style.strokeDasharray = `${circumference}`;
+      valueCircle.style.strokeDashoffset = `${offset}`;
+    }
+  }
+
+  function updateImportProgressActiveClass() {
+    const hasActive = Array.from(importJobs.values()).some((job) => !job.done);
+    mainCanvas.classList.toggle("import-progress-active", hasActive);
+    if (typeof onImportDebugStateChange === "function") {
+      onImportDebugStateChange(hasActive ? `importing (${importJobs.size} job${importJobs.size === 1 ? "" : "s"})` : "ready");
+    }
+  }
+
+  function scheduleImportLiveRefresh() {
+    if (importLiveRefreshPending) return;
+    importLiveRefreshPending = true;
+    if (importLiveRefreshTimerId !== null) {
+      clearTimeout(importLiveRefreshTimerId);
+      importLiveRefreshTimerId = null;
+    }
+    importLiveRefreshTimerId = setTimeout(() => {
+      importLiveRefreshTimerId = null;
+      importLiveRefreshPending = false;
+      void refreshTimeline();
+    }, 700);
   }
 
   function setTimelineVisible(visible) {
     timeline.hidden = !visible;
     mainCanvas.classList.toggle("main-no-timeline", !visible);
     if (!visible) {
-      forceHideImportProgressCapsule();
+      positionImportProgressCapsules();
     }
   }
 
@@ -323,6 +352,7 @@ export function initMainContent({
       mainCanvas.classList.remove("main-header-frost-visible");
       return;
     }
+    treatmentFilesPanel.clear();
     contentScrollLayer.scrollTop = 0;
     mainCanvas.classList.remove("main-header-frost-visible");
   }
@@ -331,113 +361,111 @@ export function initMainContent({
     mainCanvas.classList.toggle("main-header-frost-visible", contentScrollLayer.scrollTop > 0);
   }
 
-  function updateImportProgressCapsule(percent = 0) {
-    const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
-    importProgressValue = safePercent;
-    const textEl = importProgressCapsule.querySelector(".import-progress-text");
-    const valueCircle = importProgressCapsule.querySelector(".import-progress-value");
-    if (textEl) textEl.textContent = `${Math.round(safePercent)}`;
-    if (valueCircle) {
-      const circumference = 2 * Math.PI * 16;
-      const offset = circumference * (1 - safePercent / 100);
-      valueCircle.style.strokeDasharray = `${circumference}`;
-      valueCircle.style.strokeDashoffset = `${offset}`;
-    }
-  }
-
-  function positionImportProgressCapsule() {
-    if (!activeImportJobId) {
-      forceHideImportProgressCapsule();
-      return false;
-    }
+  function positionImportProgressCapsules() {
     const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
-    const sameContext =
-      context?.workspaceDir === activeImportWorkspaceDir &&
-      context?.patientFolder === activeImportPatientFolder;
-    if (!sameContext) {
-      forceHideImportProgressCapsule();
-      return false;
-    }
-    let targetDot = null;
-    let targetPoint = null;
     const points = Array.from(timelineTrack?.querySelectorAll(".main-timeline-point") ?? []);
-    for (const point of points) {
-      if (point?.dataset?.timelineKey === activeImportTargetFolder) {
-        targetPoint = point;
-        targetDot = point.querySelector(".main-timeline-dot");
-        break;
+    const groups = new Map();
+
+    for (const job of importJobs.values()) {
+      const sameContext =
+        context?.workspaceDir === job.workspaceDir &&
+        context?.patientFolder === job.patientFolder;
+      if (!sameContext) {
+        job.capsule.hidden = true;
+        job.capsule.classList.remove("visible");
+        continue;
+      }
+
+      const groupKey = `${job.workspaceDir}::${job.patientFolder}::${job.targetFolder}`;
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(job);
+    }
+
+    for (const groupJobs of groups.values()) {
+      if (!Array.isArray(groupJobs) || groupJobs.length < 1) continue;
+      groupJobs.sort((a, b) => a.id - b.id);
+      const leadJob = groupJobs[0];
+      const combinedProgress =
+        groupJobs.reduce((sum, j) => sum + (Number(j.progressValue) || 0), 0) / groupJobs.length;
+
+      let targetDot = null;
+      let targetPoint = null;
+      for (const point of points) {
+        if (point?.dataset?.timelineKey === leadJob.targetFolder) {
+          targetPoint = point;
+          targetDot = point.querySelector(".main-timeline-dot");
+          break;
+        }
+      }
+
+      if (!targetDot) {
+        for (const job of groupJobs) {
+          job.capsule.hidden = true;
+          job.capsule.classList.remove("visible");
+        }
+        continue;
+      }
+
+      updateImportProgressCapsule(leadJob.capsule, combinedProgress);
+      if (targetPoint && leadJob.capsule.parentElement !== targetPoint) {
+        targetPoint.appendChild(leadJob.capsule);
+      }
+      leadJob.capsule.hidden = false;
+      leadJob.capsule.classList.add("visible");
+      leadJob.capsule.classList.toggle(
+        "on-selected-dot",
+        Boolean(targetPoint?.classList?.contains("selected"))
+      );
+      leadJob.capsule.style.left = "50%";
+      leadJob.capsule.style.top = "5px";
+
+      for (let i = 1; i < groupJobs.length; i += 1) {
+        const job = groupJobs[i];
+        job.capsule.hidden = true;
+        job.capsule.classList.remove("visible");
       }
     }
-    if (!targetDot) {
-      forceHideImportProgressCapsule();
-      return false;
-    }
-    if (targetPoint && importProgressCapsule.parentElement !== targetPoint) {
-      targetPoint.appendChild(importProgressCapsule);
-    }
-    importProgressCapsule.hidden = false;
-    importProgressCapsule.classList.add("visible");
-    importProgressCapsule.classList.toggle(
-      "on-selected-dot",
-      Boolean(targetPoint?.classList?.contains("selected"))
-    );
-    importProgressCapsule.style.left = "50%";
-    importProgressCapsule.style.top = "5px";
-    return true;
   }
 
-  function showImportProgressCapsule() {
-    if (importFinalizeTimerId !== null) {
-      clearTimeout(importFinalizeTimerId);
-      importFinalizeTimerId = null;
+  function trackNewImportJob({ jobId, targetFolder, workspaceDir, patientFolder }) {
+    const id = Number(jobId) || null;
+    if (!id) return;
+    if (importJobs.has(id)) return;
+
+    const capsule = createImportProgressCapsule();
+    const job = {
+      id,
+      targetFolder: String(targetFolder ?? "").trim(),
+      workspaceDir: String(workspaceDir ?? "").trim(),
+      patientFolder: String(patientFolder ?? "").trim(),
+      capsule,
+      progressValue: 1,
+      shownAt: Date.now(),
+      done: false,
+      released: false,
+      finalizeTimerId: null,
+      animationRafId: null,
+    };
+    importJobs.set(id, job);
+    updateImportProgressCapsule(capsule, 1);
+    updateImportProgressActiveClass();
+    if (typeof onImportDebugStateChange === "function") {
+      onImportDebugStateChange(`import started (#${id})`);
     }
-    importProgressShownAt = Date.now();
-    importProgressValue = 0;
-    if (importProgressAnimationRafId !== null) {
-      cancelAnimationFrame(importProgressAnimationRafId);
-      importProgressAnimationRafId = null;
-    }
-    importProgressCapsule.hidden = true;
-    importProgressCapsule.classList.remove("done");
-    importProgressCapsule.classList.remove("holding");
-    mainCanvas.classList.add("import-progress-active");
-    importProgressCapsule.classList.remove("visible");
-    updateImportProgressCapsule(1);
-    requestAnimationFrame(() => {
-      if (positionImportProgressCapsule()) {
-        importProgressCapsule.classList.add("visible");
-      }
-    });
+    requestAnimationFrame(positionImportProgressCapsules);
   }
 
-  function hideImportProgressCapsule() {
-    if (importFinalizeTimerId !== null) {
-      clearTimeout(importFinalizeTimerId);
-      importFinalizeTimerId = null;
-    }
-    if (importProgressAnimationRafId !== null) {
-      cancelAnimationFrame(importProgressAnimationRafId);
-      importProgressAnimationRafId = null;
-    }
-    importProgressCapsule.classList.remove("holding");
-    importProgressCapsule.classList.remove("visible");
-    mainCanvas.classList.remove("import-progress-active");
-    importProgressCapsule.classList.add("done");
-    setTimeout(() => {
-      importProgressCapsule.hidden = true;
-      importProgressCapsule.classList.remove("done");
-    }, 250);
-  }
-
-  function animateImportProgressTo100(durationMs, onDone) {
-    if (importProgressAnimationRafId !== null) {
-      cancelAnimationFrame(importProgressAnimationRafId);
-      importProgressAnimationRafId = null;
+  function animateJobProgressTo100(job, durationMs, onDone) {
+    if (!job) return;
+    if (job.animationRafId !== null) {
+      cancelAnimationFrame(job.animationRafId);
+      job.animationRafId = null;
     }
 
-    const startPercent = Math.max(1, Math.min(99, importProgressValue));
+    const startPercent = Math.max(1, Math.min(99, job.progressValue));
     if (durationMs <= 0) {
-      updateImportProgressCapsule(100);
+      job.progressValue = 100;
+      updateImportProgressCapsule(job.capsule, 100);
       if (typeof onDone === "function") onDone();
       return;
     }
@@ -447,15 +475,38 @@ export function initMainContent({
       const elapsed = now - startTs;
       const t = Math.min(1, elapsed / durationMs);
       const next = startPercent + (100 - startPercent) * t;
-      updateImportProgressCapsule(next);
+      job.progressValue = next;
+      updateImportProgressCapsule(job.capsule, next);
       if (t < 1) {
-        importProgressAnimationRafId = requestAnimationFrame(tick);
+        job.animationRafId = requestAnimationFrame(tick);
         return;
       }
-      importProgressAnimationRafId = null;
+      job.animationRafId = null;
       if (typeof onDone === "function") onDone();
     };
-    importProgressAnimationRafId = requestAnimationFrame(tick);
+    job.animationRafId = requestAnimationFrame(tick);
+  }
+
+  function releaseImportJob(job) {
+    if (!job || job.released) return;
+    job.released = true;
+    if (job.finalizeTimerId !== null) clearTimeout(job.finalizeTimerId);
+    if (job.animationRafId !== null) cancelAnimationFrame(job.animationRafId);
+    if (typeof onImportActivityChange === "function" && job.patientFolder) {
+      onImportActivityChange({ patientFolder: job.patientFolder, active: false });
+    }
+    job.capsule.classList.remove("holding");
+    job.capsule.classList.remove("visible");
+    job.capsule.classList.add("done");
+    setTimeout(() => {
+      job.capsule.remove();
+    }, 250);
+    importJobs.delete(job.id);
+    updateImportProgressActiveClass();
+    if (typeof onImportDebugStateChange === "function") {
+      onImportDebugStateChange(`import finished (#${job.id})`);
+    }
+    requestAnimationFrame(positionImportProgressCapsules);
   }
 
   function extractFileName(pathLike = "") {
@@ -757,6 +808,31 @@ export function initMainContent({
     });
   }
 
+  function prefetchNeighborTreatmentPreviews() {
+    const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
+    if (!context?.workspaceDir || !context?.patientFolder || !selectedTimelinePoint) return;
+
+    const points = Array.from(timelineTrack?.querySelectorAll(".main-timeline-point") ?? []);
+    if (points.length < 1) return;
+    const selectedIndex = points.indexOf(selectedTimelinePoint);
+    if (selectedIndex === -1) return;
+
+    const neighborFolders = [];
+    for (const offset of [-2, -1, 1, 2]) {
+      const point = points[selectedIndex + offset];
+      const folderName = point?.dataset?.folderName ?? "";
+      if (!folderName) continue;
+      neighborFolders.push(folderName);
+    }
+    if (neighborFolders.length < 1) return;
+
+    void invoke("prefetch_treatment_folder_previews", {
+      workspaceDir: context.workspaceDir,
+      patientFolder: context.patientFolder,
+      treatmentFolders: neighborFolders,
+    });
+  }
+
   function syncImportDateAvailability() {
     const hasExistingSelection = Boolean(getSelectedTimelineFolderName());
     if (importDate) importDate.disabled = hasExistingSelection;
@@ -793,6 +869,7 @@ export function initMainContent({
     updateImportSelectionUi();
     updateImportStartEnabled();
     updateTreatmentFilesPanelForSelection();
+    prefetchNeighborTreatmentPreviews();
   }
 
   function animateTimelineScrollTo(targetScrollLeft, durationMs = 300) {
@@ -890,7 +967,7 @@ export function initMainContent({
         }
         updateImportStartEnabled();
         ensureTimelinePointVisible(point);
-        positionImportProgressCapsule();
+        positionImportProgressCapsules();
       });
       if (selectedTimelineKey && timelineKey === selectedTimelineKey) {
         setSelectedTimelinePoint(point);
@@ -929,7 +1006,7 @@ export function initMainContent({
         timelinePrefixLine.hidden = false;
         timelinePrefixLine.style.width = `${Math.max(0, firstCenterInTimeline)}px`;
       }
-      positionImportProgressCapsule();
+      positionImportProgressCapsules();
     });
     setTimelineVisible(true);
   }
@@ -1233,6 +1310,9 @@ export function initMainContent({
       if (isNew && (!date || !treatmentName)) return;
 
       try {
+        if (typeof onImportDebugStateChange === "function") {
+          onImportDebugStateChange(`starting import (${lastDroppedPaths.length} files)`);
+        }
         importStartBtn.disabled = true;
         importCancelBtn.disabled = true;
         const result = await invoke("start_import_files", {
@@ -1245,21 +1325,27 @@ export function initMainContent({
           deleteOrigin: Boolean(importDeleteOrigin.checked),
         });
 
-        activeImportJobId = Number(result?.job_id ?? result?.jobId ?? 0) || null;
-        activeImportTargetFolder = String(result?.target_folder ?? result?.targetFolder ?? "").trim();
-        activeImportWorkspaceDir = context.workspaceDir;
-        activeImportPatientFolder = context.patientFolder;
-        if (typeof onImportActivityChange === "function" && activeImportPatientFolder) {
-          onImportActivityChange({ patientFolder: activeImportPatientFolder, active: true });
+        const startedJobId = Number(result?.job_id ?? result?.jobId ?? 0) || null;
+        const startedTargetFolder = String(result?.target_folder ?? result?.targetFolder ?? "").trim();
+        if (typeof onImportActivityChange === "function" && context.patientFolder) {
+          onImportActivityChange({ patientFolder: context.patientFolder, active: true });
         }
+        trackNewImportJob({
+          jobId: startedJobId,
+          targetFolder: startedTargetFolder,
+          workspaceDir: context.workspaceDir,
+          patientFolder: context.patientFolder,
+        });
         setImportPanelVisible(false);
-        showImportProgressCapsule();
-        if (activeImportTargetFolder) {
-          selectedTimelineKey = activeImportTargetFolder;
+        if (startedTargetFolder) {
+          selectedTimelineKey = startedTargetFolder;
           await refreshTimeline();
         }
       } catch (err) {
         console.error("start_import_files failed:", err);
+        if (typeof onImportDebugStateChange === "function") {
+          onImportDebugStateChange("error: start import");
+        }
         importStartBtn.disabled = false;
         importCancelBtn.disabled = false;
       }
@@ -1268,36 +1354,47 @@ export function initMainContent({
   appWindow.listen("import-progress", (event) => {
     const payload = event?.payload ?? {};
     const jobId = Number(payload?.job_id ?? payload?.jobId ?? 0) || null;
-    if (!activeImportJobId || !jobId || jobId !== activeImportJobId) return;
+    if (!jobId) return;
+    const job = importJobs.get(jobId);
+    if (!job) return;
 
     const percent = Number(payload?.percent ?? 0);
     const done = Boolean(payload?.done);
     const error = payload?.error ? String(payload.error) : "";
 
-    updateImportProgressCapsule(percent);
-    positionImportProgressCapsule();
+    job.progressValue = Math.max(0, Math.min(100, Number(percent) || 0));
+    updateImportProgressCapsule(job.capsule, job.progressValue);
+    positionImportProgressCapsules();
+    if (typeof onImportDebugStateChange === "function") {
+      onImportDebugStateChange(`import #${job.id}: ${Math.round(job.progressValue)}%`);
+    }
 
-    if (!done) return;
-    const elapsed = Date.now() - importProgressShownAt;
-    const minVisibleMs = importProgressValue >= 99 ? 1000 : 2000;
+    if (!done) {
+      const selectedFolder = getSelectedTimelineFolderName().trim();
+      if (selectedFolder && selectedFolder === job.targetFolder) {
+        scheduleImportLiveRefresh();
+      }
+      return;
+    }
+    job.done = true;
+    const elapsed = Date.now() - job.shownAt;
+    const minVisibleMs = 1500;
     const waitMs = Math.max(0, minVisibleMs - elapsed);
     if (waitMs > 0) {
-      importProgressCapsule.classList.add("holding");
-      updateImportProgressCapsule(1);
+      job.capsule.classList.add("holding");
+      updateImportProgressCapsule(job.capsule, Math.max(1, job.progressValue));
     }
-    if (importFinalizeTimerId !== null) clearTimeout(importFinalizeTimerId);
-    animateImportProgressTo100(waitMs, () => {
+    if (job.finalizeTimerId !== null) clearTimeout(job.finalizeTimerId);
+    animateJobProgressTo100(job, waitMs, () => {
       if (error) {
         console.error("import failed:", error);
+        if (typeof onImportDebugStateChange === "function") {
+          onImportDebugStateChange(`error: import #${job.id}`);
+        }
+      } else {
+        void refreshTimeline();
       }
-      hideImportProgressCapsule();
-      if (typeof onImportActivityChange === "function" && activeImportPatientFolder) {
-        onImportActivityChange({ patientFolder: activeImportPatientFolder, active: false });
-      }
-      activeImportJobId = null;
-      activeImportTargetFolder = "";
-      activeImportWorkspaceDir = "";
-      activeImportPatientFolder = "";
+      releaseImportJob(job);
       importStartBtn.disabled = false;
       importCancelBtn.disabled = false;
     });

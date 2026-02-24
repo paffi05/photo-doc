@@ -1,7 +1,19 @@
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
+const VISIBLE_FIRST_IMAGE_COUNT = 10;
+const VISIBLE_FIRST_PREVIEW_CONCURRENCY = 6;
+const INITIAL_IMAGE_PREVIEWS = 30;
 const PREVIEW_CONCURRENCY = 4;
-const MAX_IMAGE_PREVIEWS = 120;
+const FILL_RUNNING_PREVIEW_CONCURRENCY = 2;
+const FILL_RUNNING_QUICK_BATCH_SIZE = 6;
+const FALLBACK_RECOVERY_BATCH_SIZE = 20;
+
+function normalizePath(pathLike = "") {
+  if (typeof pathLike === "string") return pathLike;
+  if (pathLike === null || pathLike === undefined) return "";
+  return String(pathLike);
+}
 
 function formatBytes(bytes = 0) {
   const n = Number(bytes) || 0;
@@ -51,10 +63,45 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
 
   let activeContextKey = "";
   let activeRequestId = 0;
+  let isBackgroundFillRunning = false;
+  const runtimePreviewByPath = new Map();
+  const cacheWarmupRequested = new Set();
+  let activeCardsByPath = new Map();
+
+  void listen("preview-fill-status", (event) => {
+    isBackgroundFillRunning = Boolean(event?.payload?.running);
+  });
+  void listen("import-preview-ready", (event) => {
+    const path = normalizePath(event?.payload?.path ?? "");
+    const previewPath = normalizePath(event?.payload?.preview_path ?? event?.payload?.previewPath ?? "");
+    if (!path || !previewPath) return;
+    if (!activeCardsByPath.has(path)) return;
+    let src = "";
+    try {
+      src = convertFileSrc(previewPath);
+    } catch {
+      src = "";
+    }
+    if (!src) return;
+    setThumbImage(path, activeCardsByPath, src, {
+      requestId: activeRequestId,
+      allowPathFallback: true,
+      previewQuality: "full",
+    });
+  });
+  void (async () => {
+    try {
+      isBackgroundFillRunning = Boolean(await invoke("get_preview_fill_status"));
+    } catch {
+      isBackgroundFillRunning = false;
+    }
+  })();
 
   function clearPanel() {
     activeContextKey = "";
     activeRequestId += 1;
+    cacheWarmupRequested.clear();
+    activeCardsByPath = new Map();
     panel.hidden = true;
     folderEl.textContent = "";
     countsEl.textContent = "";
@@ -105,7 +152,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
     card.className = "treatment-image-card";
     card.title = file.path;
     card.innerHTML = `
-      <span class="treatment-image-thumb loading"></span>
+      <span class="treatment-image-thumb fallback">IMG</span>
       <span class="treatment-image-name">${file.name}</span>
     `;
     card.addEventListener("click", () => {
@@ -116,43 +163,258 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
     return card;
   }
 
-  async function fillImagePreviews(cardsByPath, imageFiles, requestId) {
-    const queue = [...imageFiles];
-    const workerCount = Math.min(PREVIEW_CONCURRENCY, queue.length);
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (queue.length > 0) {
-        const file = queue.shift();
-        if (!file) continue;
-        if (requestId !== activeRequestId) return;
-        try {
-          const rows = await invoke("get_image_previews", { paths: [file.path] });
+  function setFallbackThumb(path, cardsByPath) {
+    const card = cardsByPath.get(path);
+    const thumb = card?.querySelector(".treatment-image-thumb");
+    if (!thumb) return;
+    runtimePreviewByPath.delete(path);
+    thumb.classList.remove("loading");
+    thumb.classList.add("fallback");
+    thumb.textContent = "IMG";
+  }
+
+  function setThumbImage(path, cardsByPath, src, { requestId = 0, allowPathFallback = false, previewQuality = "full" } = {}) {
+    if (!src) return;
+    const card = cardsByPath.get(path);
+    const thumb = card?.querySelector(".treatment-image-thumb");
+    if (!thumb) return;
+
+    const quality = previewQuality === "quick" ? "quick" : "full";
+    runtimePreviewByPath.set(path, { src, quality });
+
+    thumb.classList.remove("loading");
+    thumb.classList.remove("fallback");
+    const img = document.createElement("img");
+    img.className = quality === "quick" ? "quick-preview" : "full-preview";
+    img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
+
+    if (allowPathFallback) {
+      img.addEventListener("error", () => {
+        void (async () => {
           if (requestId !== activeRequestId) return;
-          const row = Array.isArray(rows) ? rows[0] : null;
-          const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
-          const card = cardsByPath.get(file.path);
-          if (!card) continue;
-          const thumb = card.querySelector(".treatment-image-thumb");
-          if (!thumb) continue;
-          thumb.classList.remove("loading");
-          if (dataUrl) {
-            thumb.innerHTML = `<img src="${dataUrl}" alt="" loading="lazy" decoding="async" />`;
-          } else {
-            thumb.classList.add("fallback");
-            thumb.textContent = "IMG";
+          try {
+            const rows = await invoke("get_cached_image_previews", {
+              paths: [path],
+              includeDataUrl: true,
+              generateIfMissing: true,
+            });
+            if (requestId !== activeRequestId) return;
+            const row = Array.isArray(rows) ? rows[0] : null;
+            const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
+            if (!dataUrl) {
+              setFallbackThumb(path, cardsByPath);
+              return;
+            }
+            const cardNow = cardsByPath.get(path);
+            const thumbNow = cardNow?.querySelector(".treatment-image-thumb");
+            const imgNow = thumbNow?.querySelector("img");
+            if (!imgNow) return;
+            imgNow.src = dataUrl;
+          } catch {
+            if (requestId !== activeRequestId) return;
+            setFallbackThumb(path, cardsByPath);
           }
-        } catch (err) {
-          if (requestId !== activeRequestId) return;
-          const card = cardsByPath.get(file.path);
-          const thumb = card?.querySelector(".treatment-image-thumb");
-          if (thumb) {
-            thumb.classList.remove("loading");
-            thumb.classList.add("fallback");
-            thumb.textContent = "IMG";
-          }
+        })();
+      }, { once: true });
+    }
+
+    img.src = src;
+    thumb.innerHTML = "";
+    thumb.appendChild(img);
+  }
+
+  function applyRuntimePreviewIfAvailable(path, cardsByPath) {
+    const hit = runtimePreviewByPath.get(path);
+    if (!hit?.src) return false;
+    setThumbImage(path, cardsByPath, hit.src, {
+      requestId: activeRequestId,
+      allowPathFallback: false,
+      previewQuality: hit.quality,
+    });
+    return true;
+  }
+
+  async function loadExistingCachedPreviewSrcMap(paths = []) {
+    const normalized = Array.isArray(paths)
+      ? paths.map((p) => normalizePath(p)).filter((p) => p.length > 0)
+      : [];
+    if (normalized.length < 1) return new Map();
+    const rows = await invoke("get_existing_cached_preview_paths", { paths: normalized });
+    const out = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const path = normalizePath(row?.path ?? "");
+      const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+      if (!path || !previewPath) continue;
+      try {
+        out.set(path, convertFileSrc(previewPath));
+      } catch {
+        // ignore conversion failures
+      }
+    }
+    return out;
+  }
+
+  async function loadCachedPreviewSrc(path) {
+    const rows = await invoke("get_cached_image_previews", {
+      paths: [path],
+      includeDataUrl: false,
+      generateIfMissing: false,
+    });
+    const row = Array.isArray(rows) ? rows[0] : null;
+    const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+    if (!previewPath) return "";
+    try {
+      return convertFileSrc(previewPath);
+    } catch {
+      return "";
+    }
+  }
+
+  async function loadQuickPreviewSrc(path) {
+    const rows = await invoke("get_quick_image_previews", { paths: [path] });
+    const row = Array.isArray(rows) ? rows[0] : null;
+    return normalizePath(row?.data_url ?? row?.dataUrl ?? "");
+  }
+
+  async function loadQuickPreviewSrcMap(paths = []) {
+    const normalized = Array.isArray(paths)
+      ? paths.map((p) => normalizePath(p)).filter((p) => p.length > 0)
+      : [];
+    if (normalized.length < 1) return new Map();
+    const rows = await invoke("get_quick_image_previews", { paths: normalized });
+    const out = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const path = normalizePath(row?.path ?? "");
+      const dataUrl = normalizePath(row?.data_url ?? row?.dataUrl ?? "");
+      if (!path || !dataUrl) continue;
+      out.set(path, dataUrl);
+    }
+    return out;
+  }
+
+  function listFallbackPaths(cardsByPath, files = []) {
+    const out = [];
+    for (const file of files) {
+      const path = normalizePath(file?.path ?? "");
+      if (!path) continue;
+      const card = cardsByPath.get(path);
+      const thumb = card?.querySelector(".treatment-image-thumb");
+      if (!thumb) continue;
+      const hasImg = Boolean(thumb.querySelector("img"));
+      const isFallback = thumb.classList.contains("fallback");
+      if (!hasImg || isFallback) out.push(path);
+    }
+    return out;
+  }
+
+  async function recoverFallbackThumbs(cardsByPath, files, requestId) {
+    const fallbackPaths = listFallbackPaths(cardsByPath, files);
+    if (fallbackPaths.length < 1) return;
+
+    for (let i = 0; i < fallbackPaths.length; i += FALLBACK_RECOVERY_BATCH_SIZE) {
+      if (requestId !== activeRequestId) return;
+      const batch = fallbackPaths.slice(i, i + FALLBACK_RECOVERY_BATCH_SIZE);
+      let rows = [];
+      try {
+        rows = await invoke("get_cached_image_previews", {
+          paths: batch,
+          includeDataUrl: true,
+          generateIfMissing: true,
+        });
+      } catch {
+        rows = [];
+      }
+      if (requestId !== activeRequestId) return;
+      const map = new Map();
+      for (const row of Array.isArray(rows) ? rows : []) {
+        const path = normalizePath(row?.path ?? "");
+        const dataUrl = normalizePath(row?.data_url ?? row?.dataUrl ?? "");
+        if (path && dataUrl) map.set(path, dataUrl);
+      }
+      for (const path of batch) {
+        const src = map.get(path) ?? "";
+        if (src) {
+          setThumbImage(path, cardsByPath, src, {
+            requestId,
+            allowPathFallback: false,
+            previewQuality: "full",
+          });
+        } else {
+          setFallbackThumb(path, cardsByPath);
         }
       }
+    }
+  }
+
+  function warmCachePreviewInBackground(path) {
+    if (!path || cacheWarmupRequested.has(path)) return;
+    cacheWarmupRequested.add(path);
+    void invoke("get_cached_image_previews", {
+      paths: [path],
+      includeDataUrl: false,
+      generateIfMissing: true,
+    }).catch(() => {});
+  }
+
+  async function fillImagePreviewsProgressively(
+    cardsByPath,
+    imageFiles,
+    requestId,
+    {
+      concurrency = PREVIEW_CONCURRENCY,
+      existingCacheByPath = null,
+    } = {}
+  ) {
+    const queue = [...(Array.isArray(imageFiles) ? imageFiles : [])];
+
+    const adjustedConcurrency = isBackgroundFillRunning
+      ? Math.min(Math.max(1, FILL_RUNNING_PREVIEW_CONCURRENCY), Math.max(1, concurrency))
+      : Math.max(1, concurrency);
+    const workerCount = Math.min(adjustedConcurrency, queue.length);
+
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (queue.length > 0) {
+        if (requestId !== activeRequestId) return;
+        const file = queue.shift();
+        const path = normalizePath(file?.path ?? "");
+        if (!path) continue;
+
+        const existingSrc = existingCacheByPath?.get(path) ?? "";
+        if (existingSrc) {
+          setThumbImage(path, cardsByPath, existingSrc, {
+            requestId,
+            allowPathFallback: true,
+            previewQuality: "full",
+          });
+          continue;
+        }
+
+        let cachedSrc = "";
+        try {
+          cachedSrc = await loadCachedPreviewSrc(path);
+        } catch {
+          cachedSrc = "";
+        }
+        if (requestId !== activeRequestId) return;
+
+        if (cachedSrc) {
+          setThumbImage(path, cardsByPath, cachedSrc, {
+            requestId,
+            allowPathFallback: true,
+            previewQuality: "full",
+          });
+          continue;
+        }
+
+        setFallbackThumb(path, cardsByPath);
+        warmCachePreviewInBackground(path);
+      }
     });
+
     await Promise.all(workers);
+    await recoverFallbackThumbs(cardsByPath, imageFiles, requestId);
   }
 
   async function setContext({ workspaceDir = "", patientFolder = "", treatmentFolder = "" } = {}) {
@@ -179,7 +441,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
       });
       if (requestId !== activeRequestId || contextKey !== activeContextKey) return;
       files = Array.isArray(rows) ? rows : [];
-    } catch (err) {
+    } catch {
       if (requestId !== activeRequestId) return;
       loadingEl.hidden = true;
       emptyEl.hidden = false;
@@ -203,21 +465,73 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
 
     renderOtherFiles(otherFiles);
 
-    const cappedImages = imageFiles.slice(0, MAX_IMAGE_PREVIEWS);
     const cardsByPath = new Map();
-    for (const file of cappedImages) {
+    for (const file of imageFiles) {
       const card = createImageCard(file);
       cardsByPath.set(file.path, card);
       imagesGridEl.appendChild(card);
     }
-    if (imageFiles.length > cappedImages.length) {
-      const note = document.createElement("div");
-      note.className = "treatment-images-limit-note";
-      note.textContent = `Showing first ${cappedImages.length} image previews.`;
-      imagesGridEl.appendChild(note);
+    activeCardsByPath = cardsByPath;
+
+    const needsLoad = [];
+    for (const file of imageFiles) {
+      const path = normalizePath(file?.path ?? "");
+      if (!path) continue;
+      if (!applyRuntimePreviewIfAvailable(path, cardsByPath)) {
+        needsLoad.push(file);
+      }
     }
 
-    await fillImagePreviews(cardsByPath, cappedImages, requestId);
+    const visibleFirst = needsLoad.slice(0, VISIBLE_FIRST_IMAGE_COUNT);
+    const initial = needsLoad.slice(VISIBLE_FIRST_IMAGE_COUNT, INITIAL_IMAGE_PREVIEWS);
+    const rest = needsLoad.slice(INITIAL_IMAGE_PREVIEWS);
+
+    const allNeededPaths = needsLoad.map((f) => normalizePath(f?.path ?? "")).filter((p) => p.length > 0);
+    let existingCacheByPath = new Map();
+    try {
+      existingCacheByPath = await loadExistingCachedPreviewSrcMap(allNeededPaths);
+    } catch {
+      existingCacheByPath = new Map();
+    }
+    if (requestId !== activeRequestId) return;
+
+    for (const [path, src] of existingCacheByPath.entries()) {
+      setThumbImage(path, cardsByPath, src, {
+        requestId,
+        allowPathFallback: true,
+        previewQuality: "full",
+      });
+    }
+
+    const firstPhase = [...visibleFirst, ...initial].filter((f) => {
+      const path = normalizePath(f?.path ?? "");
+      return path && !existingCacheByPath.has(path);
+    });
+
+    void fillImagePreviewsProgressively(
+      cardsByPath,
+      firstPhase,
+      requestId,
+      {
+        concurrency: isBackgroundFillRunning ? FILL_RUNNING_PREVIEW_CONCURRENCY : VISIBLE_FIRST_PREVIEW_CONCURRENCY,
+        existingCacheByPath,
+      }
+    );
+
+    if (rest.length > 0) {
+      const restMissing = rest.filter((f) => {
+        const path = normalizePath(f?.path ?? "");
+        return path && !existingCacheByPath.has(path);
+      });
+      if (restMissing.length > 0) {
+        setTimeout(() => {
+          void fillImagePreviewsProgressively(cardsByPath, restMissing, requestId, {
+            concurrency: isBackgroundFillRunning ? FILL_RUNNING_PREVIEW_CONCURRENCY : PREVIEW_CONCURRENCY,
+            existingCacheByPath,
+          });
+        }, 0);
+      }
+    }
   }
 
   return {

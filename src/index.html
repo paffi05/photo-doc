@@ -125,7 +125,11 @@
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">INDEXING</div>
+            <div class="settings-category-row">
+              <div class="settings-category">INDEXING</div>
+              <span class="indexing-status-spinner" id="indexingWarmupSpinner" hidden aria-hidden="true"></span>
+              <span class="indexing-debug-counts" id="indexingDebugCounts" hidden></span>
+            </div>
             <div class="settings-row">
               <div class="settings-value">Cache Size</div>
               <div class="cache-size-control">
@@ -139,6 +143,27 @@
                   aria-label="Cache size in gigabytes"
                 />
                 <div class="cache-size-value" id="cacheSizeValue">5 GB</div>
+              </div>
+            </div>
+            <div class="cache-usage-wrap">
+              <div class="cache-usage-track" aria-hidden="true">
+                <div class="cache-usage-fill" id="cacheUsageBar"></div>
+              </div>
+              <div class="cache-usage-row">
+                <div class="cache-usage-text" id="cacheUsageText">Cache usage: 0%</div>
+                <button
+                  type="button"
+                  class="cache-open-btn"
+                  id="openCacheFolderBtn"
+                  aria-label="Open cache folder"
+                  title="Open cache folder"
+                >
+                  &gt;
+                </button>
+              </div>
+              <div class="indexing-progress-row">
+                <span class="indexing-progress-spinner" id="indexingProgressSpinner" hidden aria-hidden="true"></span>
+                <span class="indexing-progress-text" id="indexingProgressText">Up to date</span>
               </div>
             </div>
           </div>
