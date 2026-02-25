@@ -1472,6 +1472,13 @@ export function initMainContent({
     mainCanvas,
     setSelectedPatientHeader,
     clearSelectedPatientHeader,
+    invalidateTreatmentPreviewCache: () => {
+      treatmentFilesPanel.invalidateRuntimePreviewCache();
+    },
+    refreshTreatmentFilesForSelection: async () => {
+      if (!hasPatientSelection) return;
+      await treatmentFilesPanel.refreshActiveContext();
+    },
     refreshTimelineForSelection: async () => {
       if (!hasPatientSelection) {
         setTimelineVisible(false);

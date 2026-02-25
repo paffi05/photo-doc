@@ -3,13 +3,13 @@ use base64::Engine;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -29,6 +29,7 @@ struct Settings {
     window_state: Option<WindowState>,
     cache_size_gb: Option<u8>,
     keep_local_cache_copy: Option<bool>,
+    preview_performance_mode: Option<String>,
 }
 
 fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -325,6 +326,42 @@ const PREVIEW_PREFETCH_FOLDERS: usize = 3;
 const PREVIEW_PREFETCH_IMAGES_PER_FOLDER: usize = 40;
 const LOCAL_CACHE_COPY_DIR_NAME: &str = ".preview-cache";
 const IMPORT_PREVIEW_MICROBATCH_SIZE: usize = 2;
+const PREVIEW_PERF_GENTLE: &str = "gentle";
+const PREVIEW_PERF_AUTO: &str = "auto";
+const PREVIEW_PERF_FAST: &str = "fast";
+
+fn normalize_preview_performance_mode(raw: &str) -> String {
+    let mode = raw.trim().to_ascii_lowercase();
+    match mode.as_str() {
+        PREVIEW_PERF_GENTLE => PREVIEW_PERF_GENTLE.to_string(),
+        PREVIEW_PERF_FAST => PREVIEW_PERF_FAST.to_string(),
+        _ => PREVIEW_PERF_AUTO.to_string(),
+    }
+}
+
+fn preview_worker_count_for_mode(mode: &str, logical_cores: usize) -> usize {
+    let cores = logical_cores.max(1);
+    match mode {
+        PREVIEW_PERF_GENTLE => {
+            if cores <= 4 { 1 } else { 2 }
+        }
+        PREVIEW_PERF_FAST => {
+            let workers = ((cores as f64) * 0.80).round() as usize;
+            workers.max(2).min(cores)
+        }
+        _ => {
+            if cores <= 2 {
+                1
+            } else if cores <= 6 {
+                2
+            } else if cores <= 10 {
+                3
+            } else {
+                4
+            }
+        }
+    }
+}
 
 fn patient_metadata_path(folder_path: &PathBuf) -> PathBuf {
     folder_path.join(".mpm-metadata.json")
@@ -871,6 +908,9 @@ fn schedule_local_cache_copy_sync_if_enabled(app_handle: &tauri::AppHandle) {
     if !settings.keep_local_cache_copy.unwrap_or(false) {
         return;
     }
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+        return;
+    }
     let Some(workspace_dir) = settings.workspace_dir else {
         return;
     };
@@ -1325,21 +1365,43 @@ fn resolve_cached_previews(
     let current_ms = now_ms();
     let mut index_changed = false;
 
-    let mut out = Vec::with_capacity(paths.len());
+    struct PlannedRow {
+        path: String,
+        kind: String,
+        cache_key: String,
+        file_name: String,
+        cache_file_path: PathBuf,
+    }
+    struct GenerateTask {
+        row_index: usize,
+        source_path: PathBuf,
+        cache_file_path: PathBuf,
+        file_name: String,
+    }
+    enum RowState {
+        Skip,
+        Ready(CachedImagePreviewRow),
+        Planned(PlannedRow),
+    }
+
+    let mut rows: Vec<RowState> = Vec::with_capacity(paths.len());
+    let mut tasks: Vec<GenerateTask> = Vec::new();
+
     for raw_path in paths {
         let path = raw_path.clone();
         if path.is_empty() {
+            rows.push(RowState::Skip);
             continue;
         }
 
         let path_buf = PathBuf::from(&path);
         if !is_supported_preview_image(&path_buf) {
-            out.push(CachedImagePreviewRow {
+            rows.push(RowState::Ready(CachedImagePreviewRow {
                 path,
                 kind: "none".to_string(),
                 preview_path: None,
                 data_url: None,
-            });
+            }));
             continue;
         }
 
@@ -1351,12 +1413,12 @@ fn resolve_cached_previews(
         let file_meta = match fs::metadata(&path_buf) {
             Ok(meta) => meta,
             Err(_) => {
-                out.push(CachedImagePreviewRow {
+                rows.push(RowState::Ready(CachedImagePreviewRow {
                     path,
                     kind,
                     preview_path: None,
                     data_url: None,
-                });
+                }));
                 continue;
             }
         };
@@ -1371,78 +1433,165 @@ fn resolve_cached_previews(
         let file_name = format!("{cache_key}.jpg");
         let cache_file_path = cache_dir.join(&file_name);
         let legacy_cache_key = build_preview_cache_key_legacy(&path_buf, file_size, modified_ms);
-        let legacy_file_name = format!("{legacy_cache_key}.jpg");
-        let legacy_cache_file_path = cache_dir.join(&legacy_file_name);
+        let legacy_cache_file_path = cache_dir.join(format!("{legacy_cache_key}.jpg"));
 
         if !cache_file_path.exists() && legacy_cache_file_path.exists() {
             let _ = fs::rename(&legacy_cache_file_path, &cache_file_path);
         }
 
-        if !cache_file_path.exists() {
-            if !generate_if_missing {
-                out.push(CachedImagePreviewRow {
-                    path,
-                    kind,
-                    preview_path: None,
-                    data_url: None,
-                });
+        if !cache_file_path.exists() && generate_if_missing {
+            tasks.push(GenerateTask {
+                row_index: rows.len(),
+                source_path: path_buf,
+                cache_file_path: cache_file_path.clone(),
+                file_name: file_name.clone(),
+            });
+        }
+
+        rows.push(RowState::Planned(PlannedRow {
+            path,
+            kind,
+            cache_key,
+            file_name,
+            cache_file_path,
+        }));
+    }
+
+    if generate_if_missing && !tasks.is_empty() {
+        let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
+        let logical_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let perf_mode = normalize_preview_performance_mode(
+            settings
+                .preview_performance_mode
+                .as_deref()
+                .unwrap_or(PREVIEW_PERF_AUTO),
+        );
+        let worker_count = preview_worker_count_for_mode(&perf_mode, logical_cores);
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u64)>();
+        let mut handles = Vec::new();
+
+        for worker_id in 0..worker_count {
+            let queue_clone = Arc::clone(&queue);
+            let tx_clone = tx.clone();
+            handles.push(std::thread::spawn(move || {
+                loop {
+                    if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                        || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    let task = {
+                        let Ok(mut q) = queue_clone.lock() else {
+                            break;
+                        };
+                        q.pop_front()
+                    };
+                    let Some(task) = task else {
+                        break;
+                    };
+
+                    if task.cache_file_path.exists() {
+                        let size = fs::metadata(&task.cache_file_path).map(|m| m.len()).unwrap_or(0);
+                        let _ = tx_clone.send((task.row_index, size));
+                        continue;
+                    }
+
+                    let bytes = match generate_preview_cache_bytes(&task.source_path) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let tmp_path = task.cache_file_path.with_file_name(format!(
+                        "{}.tmp{}",
+                        task.file_name, worker_id
+                    ));
+                    if fs::write(&tmp_path, &bytes).is_err() {
+                        let _ = fs::remove_file(&tmp_path);
+                        continue;
+                    }
+                    if fs::rename(&tmp_path, &task.cache_file_path).is_err() {
+                        let _ = fs::remove_file(&tmp_path);
+                        continue;
+                    }
+                    let _ = tx_clone.send((task.row_index, bytes.len() as u64));
+                }
+            }));
+        }
+        drop(tx);
+
+        let mut generated_sizes: HashMap<usize, u64> = HashMap::new();
+        for (row_index, size) in rx {
+            generated_sizes.insert(row_index, size);
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+
+        for (row_index, size) in generated_sizes {
+            let Some(RowState::Planned(planned)) = rows.get(row_index) else {
                 continue;
-            }
-            match generate_preview_cache_bytes(&path_buf) {
-                Ok(bytes) => {
-                    let tmp_path = cache_dir.join(format!("{file_name}.tmp"));
-                    fs::write(&tmp_path, &bytes).map_err(|e| e.to_string())?;
-                    fs::rename(&tmp_path, &cache_file_path).map_err(|e| e.to_string())?;
-                    index.entries.insert(
-                        cache_key.clone(),
-                        PreviewCacheEntry {
-                            file_name: file_name.clone(),
-                            size: bytes.len() as u64,
-                            last_access_ms: current_ms,
-                        },
-                    );
-                    index_changed = true;
-                }
-                Err(_) => {
-                    out.push(CachedImagePreviewRow {
-                        path,
-                        kind,
-                        preview_path: None,
-                        data_url: None,
-                    });
-                    continue;
-                }
-            }
-        } else if generate_if_missing {
-            let cached_size = fs::metadata(&cache_file_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            };
             index.entries.insert(
-                cache_key.clone(),
+                planned.cache_key.clone(),
                 PreviewCacheEntry {
-                    file_name: file_name.clone(),
-                    size: cached_size,
+                    file_name: planned.file_name.clone(),
+                    size,
                     last_access_ms: current_ms,
                 },
             );
             index_changed = true;
         }
+    }
 
-        out.push(CachedImagePreviewRow {
-            path,
-            kind,
-            preview_path: Some(cache_file_path.to_string_lossy().to_string()),
-            data_url: if include_data_url {
-                fs::read(&cache_file_path)
-                    .ok()
-                    .map(|bytes| format!(
-                        "data:image/jpeg;base64,{}",
-                        base64::engine::general_purpose::STANDARD.encode(bytes)
-                    ))
-            } else {
-                None
-            },
-        });
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        match row {
+            RowState::Skip => {}
+            RowState::Ready(v) => out.push(v),
+            RowState::Planned(planned) => {
+                if !planned.cache_file_path.exists() {
+                    out.push(CachedImagePreviewRow {
+                        path: planned.path,
+                        kind: planned.kind,
+                        preview_path: None,
+                        data_url: None,
+                    });
+                    continue;
+                }
+
+                if generate_if_missing {
+                    let cached_size = fs::metadata(&planned.cache_file_path)
+                        .map(|m| m.len())
+                        .unwrap_or(0);
+                    index.entries.insert(
+                        planned.cache_key.clone(),
+                        PreviewCacheEntry {
+                            file_name: planned.file_name.clone(),
+                            size: cached_size,
+                            last_access_ms: current_ms,
+                        },
+                    );
+                    index_changed = true;
+                }
+
+                out.push(CachedImagePreviewRow {
+                    path: planned.path,
+                    kind: planned.kind,
+                    preview_path: Some(planned.cache_file_path.to_string_lossy().to_string()),
+                    data_url: if include_data_url {
+                        fs::read(&planned.cache_file_path)
+                            .ok()
+                            .map(|bytes| format!(
+                                "data:image/jpeg;base64,{}",
+                                base64::engine::general_purpose::STANDARD.encode(bytes)
+                            ))
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
     }
 
     if generate_if_missing {
@@ -2770,11 +2919,27 @@ fn set_cache_size_gb(app_handle: tauri::AppHandle, cache_size_gb: u8) -> Result<
 }
 
 #[tauri::command]
+fn set_preview_performance_mode(
+    app_handle: tauri::AppHandle,
+    mode: String,
+) -> Result<String, String> {
+    let normalized = normalize_preview_performance_mode(&mode);
+    let mut settings = read_settings(&app_handle)?;
+    settings.preview_performance_mode = Some(normalized.clone());
+    write_settings(&app_handle, &settings)?;
+    Ok(normalized)
+}
+
+#[tauri::command]
 async fn set_keep_local_cache_copy(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
     enabled: bool,
 ) -> Result<LocalCacheCopyStatusRow, String> {
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
+        return Err("cannot change local cache mode while preview creation is active".to_string());
+    }
+
     let mut settings = read_settings(&app_handle)?;
     settings.keep_local_cache_copy = Some(enabled);
     write_settings(&app_handle, &settings)?;
@@ -2889,6 +3054,10 @@ async fn sync_local_cache_copy(
 
 #[tauri::command]
 fn delete_local_cache_copy_files(app_handle: tauri::AppHandle) -> Result<(), String> {
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
+        return Err("cannot delete local cache while preview creation is active".to_string());
+    }
+
     let cache_dir = preview_cache_dir_path(&app_handle);
     let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
     if !cache_dir.exists() {
@@ -3301,6 +3470,7 @@ pub fn run() {
             prefetch_treatment_folder_previews,
             start_import_files,
             set_cache_size_gb,
+            set_preview_performance_mode,
             set_keep_local_cache_copy,
             get_local_cache_copy_status,
             sync_local_cache_copy,

@@ -8,6 +8,7 @@ const PREVIEW_CONCURRENCY = 4;
 const FILL_RUNNING_PREVIEW_CONCURRENCY = 2;
 const FILL_RUNNING_QUICK_BATCH_SIZE = 6;
 const FALLBACK_RECOVERY_BATCH_SIZE = 20;
+const THUMB_RECOVERY_RETRY_DELAYS_MS = [350, 900, 1800];
 
 function normalizePath(pathLike = "") {
   if (typeof pathLike === "string") return pathLike;
@@ -62,14 +63,24 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
   const otherListEl = panel.querySelector(".treatment-files-other-list");
 
   let activeContextKey = "";
+  let activeContext = { workspaceDir: "", patientFolder: "", treatmentFolder: "" };
   let activeRequestId = 0;
   let isBackgroundFillRunning = false;
   const runtimePreviewByPath = new Map();
   const cacheWarmupRequested = new Set();
   let activeCardsByPath = new Map();
+  let activeImageFiles = [];
 
   void listen("preview-fill-status", (event) => {
+    const wasRunning = isBackgroundFillRunning;
     isBackgroundFillRunning = Boolean(event?.payload?.running);
+    if (wasRunning && !isBackgroundFillRunning && activeCardsByPath.size > 0 && activeImageFiles.length > 0) {
+      const requestId = activeRequestId;
+      setTimeout(() => {
+        if (requestId !== activeRequestId) return;
+        void recoverFallbackThumbs(activeCardsByPath, activeImageFiles, requestId);
+      }, 180);
+    }
   });
   void listen("import-preview-ready", (event) => {
     const path = normalizePath(event?.payload?.path ?? "");
@@ -99,9 +110,11 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
 
   function clearPanel() {
     activeContextKey = "";
+    activeContext = { workspaceDir: "", patientFolder: "", treatmentFolder: "" };
     activeRequestId += 1;
     cacheWarmupRequested.clear();
     activeCardsByPath = new Map();
+    activeImageFiles = [];
     panel.hidden = true;
     folderEl.textContent = "";
     countsEl.textContent = "";
@@ -173,6 +186,41 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
     thumb.textContent = "IMG";
   }
 
+  function recoverSingleThumbWithRetry(path, cardsByPath, requestId, attempt = 0) {
+    void (async () => {
+      if (requestId !== activeRequestId) return;
+      try {
+        const rows = await invoke("get_cached_image_previews", {
+          paths: [path],
+          includeDataUrl: true,
+          generateIfMissing: true,
+        });
+        if (requestId !== activeRequestId) return;
+        const row = Array.isArray(rows) ? rows[0] : null;
+        const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
+        if (dataUrl) {
+          setThumbImage(path, cardsByPath, dataUrl, {
+            requestId,
+            allowPathFallback: false,
+            previewQuality: "full",
+          });
+          return;
+        }
+      } catch {
+        if (requestId !== activeRequestId) return;
+      }
+
+      if (attempt < THUMB_RECOVERY_RETRY_DELAYS_MS.length) {
+        const delay = THUMB_RECOVERY_RETRY_DELAYS_MS[attempt];
+        setTimeout(() => {
+          recoverSingleThumbWithRetry(path, cardsByPath, requestId, attempt + 1);
+        }, delay);
+        return;
+      }
+      setFallbackThumb(path, cardsByPath);
+    })();
+  }
+
   function setThumbImage(path, cardsByPath, src, { requestId = 0, allowPathFallback = false, previewQuality = "full" } = {}) {
     if (!src) return;
     const card = cardsByPath.get(path);
@@ -192,31 +240,8 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
 
     if (allowPathFallback) {
       img.addEventListener("error", () => {
-        void (async () => {
-          if (requestId !== activeRequestId) return;
-          try {
-            const rows = await invoke("get_cached_image_previews", {
-              paths: [path],
-              includeDataUrl: true,
-              generateIfMissing: true,
-            });
-            if (requestId !== activeRequestId) return;
-            const row = Array.isArray(rows) ? rows[0] : null;
-            const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
-            if (!dataUrl) {
-              setFallbackThumb(path, cardsByPath);
-              return;
-            }
-            const cardNow = cardsByPath.get(path);
-            const thumbNow = cardNow?.querySelector(".treatment-image-thumb");
-            const imgNow = thumbNow?.querySelector("img");
-            if (!imgNow) return;
-            imgNow.src = dataUrl;
-          } catch {
-            if (requestId !== activeRequestId) return;
-            setFallbackThumb(path, cardsByPath);
-          }
-        })();
+        if (requestId !== activeRequestId) return;
+        recoverSingleThumbWithRetry(path, cardsByPath, requestId, 0);
       }, { once: true });
     }
 
@@ -342,7 +367,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
             previewQuality: "full",
           });
         } else {
-          setFallbackThumb(path, cardsByPath);
+          recoverSingleThumbWithRetry(path, cardsByPath, requestId, 0);
         }
       }
     }
@@ -428,6 +453,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
     }
 
     const contextKey = `${w}::${p}::${t}`;
+    activeContext = { workspaceDir: w, patientFolder: p, treatmentFolder: t };
     activeContextKey = contextKey;
     const requestId = ++activeRequestId;
     setLoadingState(t);
@@ -472,6 +498,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
       imagesGridEl.appendChild(card);
     }
     activeCardsByPath = cardsByPath;
+    activeImageFiles = imageFiles;
 
     const needsLoad = [];
     for (const file of imageFiles) {
@@ -537,5 +564,12 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
   return {
     clear: clearPanel,
     setContext,
+    invalidateRuntimePreviewCache: () => {
+      runtimePreviewByPath.clear();
+    },
+    refreshActiveContext: async () => {
+      if (!activeContext?.workspaceDir || !activeContext?.patientFolder || !activeContext?.treatmentFolder) return;
+      await setContext(activeContext);
+    },
   };
 }

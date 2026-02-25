@@ -128,21 +128,6 @@
             <div class="settings-category-row">
               <div class="settings-category">INDEXING</div>
             </div>
-            <div class="settings-row">
-              <div class="settings-value">Cache Size</div>
-              <div class="cache-size-control">
-                <input
-                  type="range"
-                  id="cacheSizeSlider"
-                  min="1"
-                  max="10"
-                  step="1"
-                  value="5"
-                  aria-label="Cache size in gigabytes"
-                />
-                <div class="cache-size-value" id="cacheSizeValue">5 GB</div>
-              </div>
-            </div>
             <div class="cache-usage-wrap">
               <div class="cache-usage-track" aria-hidden="true">
                 <div class="cache-usage-fill" id="cacheUsageBar"></div>
@@ -158,6 +143,36 @@
                 >
                   &gt;
                 </button>
+              </div>
+              <div class="settings-row">
+                <div class="settings-value">Cache Size</div>
+                <div class="cache-size-control">
+                  <input
+                    type="range"
+                    id="cacheSizeSlider"
+                    min="1"
+                    max="10"
+                    step="1"
+                    value="5"
+                    aria-label="Cache size in gigabytes"
+                  />
+                  <div class="cache-size-value" id="cacheSizeValue">5 GB</div>
+                </div>
+              </div>
+              <div class="settings-row processing-speed-row">
+                <div class="settings-value">Processing Speed</div>
+                <div class="processing-speed-control">
+                  <input
+                    type="range"
+                    id="previewSpeedSlider"
+                    min="0"
+                    max="2"
+                    step="1"
+                    value="1"
+                    aria-label="Preview generation speed"
+                  />
+                  <div class="processing-speed-value" id="previewSpeedValue">Auto</div>
+                </div>
               </div>
               <div class="indexing-progress-row">
                 <span class="indexing-progress-spinner" id="indexingProgressSpinner" hidden aria-hidden="true"></span>
