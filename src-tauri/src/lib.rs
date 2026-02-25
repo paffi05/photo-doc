@@ -28,6 +28,7 @@ struct Settings {
     workspace_dir: Option<String>,
     window_state: Option<WindowState>,
     cache_size_gb: Option<u8>,
+    keep_local_cache_copy: Option<bool>,
 }
 
 fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -256,6 +257,22 @@ struct PreviewDebugCountsRow {
     cache_image_count: u64,
 }
 
+#[derive(Serialize, Clone)]
+struct LocalCacheCopyStatusRow {
+    enabled: bool,
+    running: bool,
+    state: String,
+    last_sync_ms: Option<u64>,
+    local_cache_exists: bool,
+    local_cache_file_count: u64,
+}
+
+#[derive(Default)]
+struct LocalCacheCopyRuntime {
+    state: String,
+    last_sync_ms: Option<u64>,
+}
+
 #[derive(Serialize)]
 struct StartImportResponse {
     job_id: u64,
@@ -294,6 +311,10 @@ static IMPORT_JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static IMPORT_ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PREVIEW_FILL_RUNNING: AtomicBool = AtomicBool::new(false);
+static PREVIEW_FILL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+static LOCAL_CACHE_COPY_RUNTIME: OnceLock<Mutex<LocalCacheCopyRuntime>> = OnceLock::new();
+static LOCAL_CACHE_COPY_RUNNING: AtomicBool = AtomicBool::new(false);
+static LOCAL_CACHE_COPY_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 const PREVIEW_CACHE_DIM: u32 = 200;
 const PREVIEW_CACHE_QUALITY: u8 = 52;
@@ -302,6 +323,8 @@ const QUICK_PREVIEW_QUALITY: u8 = 44;
 const PREVIEW_CACHE_MAX_AGE_DAYS: u64 = 90;
 const PREVIEW_PREFETCH_FOLDERS: usize = 3;
 const PREVIEW_PREFETCH_IMAGES_PER_FOLDER: usize = 40;
+const LOCAL_CACHE_COPY_DIR_NAME: &str = ".preview-cache";
+const IMPORT_PREVIEW_MICROBATCH_SIZE: usize = 2;
 
 fn patient_metadata_path(folder_path: &PathBuf) -> PathBuf {
     folder_path.join(".mpm-metadata.json")
@@ -507,15 +530,358 @@ fn preview_cache_lock() -> &'static Mutex<()> {
     PREVIEW_CACHE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn local_cache_copy_runtime() -> &'static Mutex<LocalCacheCopyRuntime> {
+    LOCAL_CACHE_COPY_RUNTIME.get_or_init(|| Mutex::new(LocalCacheCopyRuntime {
+        state: "up_to_date".to_string(),
+        last_sync_ms: None,
+    }))
+}
+
+fn set_local_cache_copy_runtime_state(state: &str, last_sync_ms: Option<u64>) {
+    if let Ok(mut runtime) = local_cache_copy_runtime().lock() {
+        runtime.state = state.to_string();
+        if last_sync_ms.is_some() {
+            runtime.last_sync_ms = last_sync_ms;
+        }
+    }
+}
+
 fn get_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
+    let cache_dir = preview_cache_dir_path(app_handle);
+    fs::create_dir_all(&cache_dir).ok();
+    cache_dir
+}
+
+fn preview_cache_dir_path(app_handle: &tauri::AppHandle) -> PathBuf {
     let base_dir = app_handle
         .path()
         .app_cache_dir()
         .or_else(|_| app_handle.path().app_data_dir())
         .expect("failed to get app cache dir");
-    let cache_dir = base_dir.join("preview-cache");
-    fs::create_dir_all(&cache_dir).ok();
-    cache_dir
+    base_dir.join("preview-cache")
+}
+
+fn get_active_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
+    let settings = read_settings(app_handle).unwrap_or_default();
+    if let Some(workspace_dir) = settings.workspace_dir {
+        let workspace = PathBuf::from(workspace_dir.trim());
+        if workspace.exists() && workspace.is_dir() {
+            let main_cache_dir = get_local_cache_copy_dir(&workspace);
+            fs::create_dir_all(&main_cache_dir).ok();
+            if settings.keep_local_cache_copy.unwrap_or(false) {
+                return get_preview_cache_dir(app_handle);
+            }
+            return main_cache_dir;
+        }
+    }
+    get_preview_cache_dir(app_handle)
+}
+
+fn get_local_cache_copy_dir(workspace: &Path) -> PathBuf {
+    workspace.join(LOCAL_CACHE_COPY_DIR_NAME)
+}
+
+fn is_cache_preview_jpeg(path: &Path) -> bool {
+    path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let ext = e.to_ascii_lowercase();
+            ext == "jpg" || ext == "jpeg"
+        })
+        .unwrap_or(false)
+}
+
+fn walk_cache_files(cache_dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![cache_dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if file_type.is_file() {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn list_cache_files(cache_dir: &Path) -> HashMap<String, (PathBuf, u64, u64)> {
+    let mut out = HashMap::new();
+    for path in walk_cache_files(cache_dir) {
+            if path.parent() != Some(cache_dir) {
+                // cache index addresses flat file names in cache root; ignore nested entries here
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".tmp") {
+                continue;
+            }
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            out.insert(name.to_string(), (path, meta.len(), modified_ms));
+    }
+    out
+}
+
+fn copy_if_newer(src_path: &Path, src_size: u64, src_modified_ms: u64, dst_path: &Path) -> Result<bool, String> {
+    let mut should_copy = true;
+    if let Ok(meta) = fs::metadata(dst_path) {
+        let dst_size = meta.len();
+        let dst_modified_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        should_copy = src_size != dst_size || src_modified_ms > dst_modified_ms;
+    }
+    if !should_copy {
+        return Ok(false);
+    }
+
+    let tmp_path = dst_path.with_extension("tmp");
+    fs::copy(src_path, &tmp_path).map_err(|e| e.to_string())?;
+    fs::rename(&tmp_path, dst_path).map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+fn copy_preview_cache_main_to_local(main_cache_dir: &Path, local_cache_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(local_cache_dir).map_err(|e| e.to_string())?;
+    let main_files = list_cache_files(main_cache_dir);
+    for (_, (src_path, src_size, src_modified_ms)) in main_files {
+        if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            return Err("cancelled".to_string());
+        }
+        let Some(file_name) = src_path.file_name() else {
+            continue;
+        };
+        let dst_path = local_cache_dir.join(file_name);
+        let _ = copy_if_newer(&src_path, src_size, src_modified_ms, &dst_path)?;
+    }
+    Ok(())
+}
+
+fn reconcile_preview_cache_dirs(main_cache_dir: &Path, local_cache_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(local_cache_dir).map_err(|e| e.to_string())?;
+    let main_files = list_cache_files(main_cache_dir);
+    let local_files = list_cache_files(local_cache_dir);
+
+    let mut file_names: HashSet<String> = main_files.keys().cloned().collect();
+    file_names.extend(local_files.keys().cloned());
+
+    for file_name in file_names {
+        if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            return Err("cancelled".to_string());
+        }
+        match (main_files.get(&file_name), local_files.get(&file_name)) {
+            (Some((main_path, main_size, main_modified_ms)), Some((local_path, local_size, local_modified_ms))) => {
+                if main_modified_ms >= local_modified_ms {
+                    let _ = copy_if_newer(main_path, *main_size, *main_modified_ms, local_path)?;
+                } else {
+                    let _ = copy_if_newer(local_path, *local_size, *local_modified_ms, main_path)?;
+                }
+            }
+            (Some((main_path, main_size, main_modified_ms)), None) => {
+                let dst_path = local_cache_dir.join(&file_name);
+                let _ = copy_if_newer(main_path, *main_size, *main_modified_ms, &dst_path)?;
+            }
+            (None, Some((local_path, local_size, local_modified_ms))) => {
+                let dst_path = main_cache_dir.join(&file_name);
+                let _ = copy_if_newer(local_path, *local_size, *local_modified_ms, &dst_path)?;
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+fn mirror_cache_dir_from_source(source_cache_dir: &Path, target_cache_dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(target_cache_dir).map_err(|e| e.to_string())?;
+    let source_files = list_cache_files(source_cache_dir);
+    let target_files = list_cache_files(target_cache_dir);
+
+    for (file_name, (src_path, src_size, src_modified_ms)) in &source_files {
+        if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            return Err("cancelled".to_string());
+        }
+        let dst_path = target_cache_dir.join(file_name);
+        let _ = copy_if_newer(src_path, *src_size, *src_modified_ms, &dst_path)?;
+    }
+
+    for file_name in target_files.keys() {
+        if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            return Err("cancelled".to_string());
+        }
+        if source_files.contains_key(file_name) {
+            continue;
+        }
+        let _ = fs::remove_file(target_cache_dir.join(file_name));
+    }
+
+    Ok(())
+}
+
+fn enforce_cache_files_match_index(cache_dir: &Path) -> Result<(), String> {
+    let mut index = load_preview_cache_index(cache_dir);
+    index.entries.retain(|_, entry| fs::metadata(cache_dir.join(&entry.file_name)).is_ok());
+
+    let known_files: HashSet<String> = index
+        .entries
+        .values()
+        .map(|entry| entry.file_name.clone())
+        .collect();
+
+    for path in walk_cache_files(cache_dir) {
+        if !is_cache_preview_jpeg(&path) {
+            continue;
+        }
+        let in_root = path.parent() == Some(cache_dir);
+        let Some(file_name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !in_root || !known_files.contains(file_name) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    save_preview_cache_index(cache_dir, &index)
+}
+
+fn local_cache_copy_status_row(
+    app_handle: &tauri::AppHandle,
+    enabled: bool,
+    running: bool,
+    runtime: &LocalCacheCopyRuntime,
+) -> LocalCacheCopyStatusRow {
+    let state = if !enabled {
+        "disabled".to_string()
+    } else if running {
+        runtime.state.clone()
+    } else if runtime.state.is_empty() {
+        "up_to_date".to_string()
+    } else {
+        runtime.state.clone()
+    };
+    LocalCacheCopyStatusRow {
+        enabled,
+        running,
+        state,
+        last_sync_ms: runtime.last_sync_ms,
+        local_cache_exists: preview_cache_dir_path(app_handle).exists(),
+        local_cache_file_count: walk_cache_files(&preview_cache_dir_path(app_handle)).len() as u64,
+    }
+}
+
+fn run_local_cache_copy_sync(
+    app_handle: &tauri::AppHandle,
+    workspace: &Path,
+    initial_copy: bool,
+) -> Result<(), String> {
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let main_cache_dir = get_local_cache_copy_dir(workspace);
+    let local_cache_dir = get_preview_cache_dir(app_handle);
+    fs::create_dir_all(&main_cache_dir).map_err(|e| e.to_string())?;
+    let phase = if initial_copy { "copying" } else { "updating" };
+    set_local_cache_copy_runtime_state(phase, None);
+
+    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    if initial_copy {
+        // On first enable, prime local cache and then reconcile both directions.
+        // This guarantees missing files are copied no matter which side has them.
+        copy_preview_cache_main_to_local(&main_cache_dir, &local_cache_dir)?;
+    }
+    reconcile_preview_cache_dirs(&main_cache_dir, &local_cache_dir)?;
+    let settings = read_settings(app_handle).unwrap_or_default();
+    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
+    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    cleanup_preview_cache_for_workspace_dir(app_handle, &main_cache_dir, workspace, max_cache_bytes);
+    if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+    {
+        set_local_cache_copy_runtime_state("paused", None);
+        return Err("cancelled".to_string());
+    }
+    enforce_cache_files_match_index(&main_cache_dir)?;
+    // Keep local copy as exact mirror of the workspace main cache after each sync.
+    mirror_cache_dir_from_source(&main_cache_dir, &local_cache_dir)?;
+    enforce_cache_files_match_index(&local_cache_dir)?;
+    if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+    {
+        set_local_cache_copy_runtime_state("paused", None);
+        return Err("cancelled".to_string());
+    }
+    set_local_cache_copy_runtime_state("up_to_date", Some(now_ms()));
+    Ok(())
+}
+
+fn sync_local_cache_copy_if_enabled(app_handle: &tauri::AppHandle, workspace_dir: &str) {
+    let settings = read_settings(app_handle).unwrap_or_default();
+    if !settings.keep_local_cache_copy.unwrap_or(false) {
+        return;
+    }
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return;
+    }
+    if LOCAL_CACHE_COPY_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    let _ = run_local_cache_copy_sync(app_handle, &workspace, false);
+    LOCAL_CACHE_COPY_RUNNING.store(false, Ordering::Relaxed);
+}
+
+fn schedule_local_cache_copy_sync_if_enabled(app_handle: &tauri::AppHandle) {
+    let settings = read_settings(app_handle).unwrap_or_default();
+    if !settings.keep_local_cache_copy.unwrap_or(false) {
+        return;
+    }
+    let Some(workspace_dir) = settings.workspace_dir else {
+        return;
+    };
+    let workspace_dir = workspace_dir.trim().to_string();
+    if workspace_dir.is_empty() {
+        return;
+    }
+    let app_handle_clone = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        sync_local_cache_copy_if_enabled(&app_handle_clone, &workspace_dir);
+    });
 }
 
 fn preview_cache_index_path(cache_dir: &Path) -> PathBuf {
@@ -579,6 +945,11 @@ fn cleanup_preview_cache(
     index: &mut PreviewCacheIndex,
     max_cache_bytes: u64,
 ) {
+    if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+    {
+        return;
+    }
     let now = now_ms();
     let max_age_ms = PREVIEW_CACHE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
 
@@ -597,6 +968,11 @@ fn cleanup_preview_cache(
     let mut total_bytes = 0_u64;
     let mut items: Vec<(String, u64, u64, String)> = Vec::new();
     for (key, entry) in &index.entries {
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            break;
+        }
         let path = cache_dir.join(&entry.file_name);
         let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(entry.size);
         total_bytes = total_bytes.saturating_add(size);
@@ -609,6 +985,11 @@ fn cleanup_preview_cache(
 
     items.sort_by_key(|(_, last_access_ms, _, _)| *last_access_ms);
     for (key, _, size, file_name) in items {
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            break;
+        }
         if total_bytes <= max_cache_bytes {
             break;
         }
@@ -626,15 +1007,16 @@ fn cleanup_preview_cache(
         .collect();
     if let Ok(entries) = fs::read_dir(cache_dir) {
         for entry in entries.flatten() {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            {
+                break;
+            }
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
-            let is_preview_jpg = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("jpg"))
-                .unwrap_or(false);
+            let is_preview_jpg = is_cache_preview_jpeg(&path);
             if !is_preview_jpg {
                 continue;
             }
@@ -657,11 +1039,7 @@ fn compute_preview_cache_used_bytes(cache_dir: &Path) -> u64 {
             if !path.is_file() {
                 continue;
             }
-            let is_preview_jpg = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("jpg"))
-                .unwrap_or(false);
+            let is_preview_jpg = is_cache_preview_jpeg(&path);
             if !is_preview_jpg {
                 continue;
             }
@@ -681,11 +1059,7 @@ fn compute_preview_cache_image_count(cache_dir: &Path) -> u64 {
             if !path.is_file() {
                 continue;
             }
-            let is_preview_jpg = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("jpg"))
-                .unwrap_or(false);
+            let is_preview_jpg = is_cache_preview_jpeg(&path);
             if is_preview_jpg {
                 image_count = image_count.saturating_add(1);
             }
@@ -732,7 +1106,7 @@ fn run_preview_cache_cleanup(app_handle: &tauri::AppHandle) {
     let Ok(_guard) = preview_cache_lock().lock() else {
         return;
     };
-    let cache_dir = get_preview_cache_dir(app_handle);
+    let cache_dir = get_active_preview_cache_dir(app_handle);
     let settings = read_settings(app_handle).unwrap_or_default();
     let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
     let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
@@ -750,11 +1124,21 @@ fn collect_workspace_expected_preview_files(workspace: &Path) -> HashSet<String>
     let mut stack = vec![workspace.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            break;
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(v) => v,
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            {
+                break;
+            }
             let path = entry.path();
             let file_type = match entry.file_type() {
                 Ok(v) => v,
@@ -786,30 +1170,111 @@ fn collect_workspace_expected_preview_files(workspace: &Path) -> HashSet<String>
     expected
 }
 
+fn collect_workspace_expected_preview_files_from_db(
+    app_handle: &tauri::AppHandle,
+    workspace: &Path,
+) -> Result<HashSet<String>, String> {
+    let workspace_dir = workspace.to_string_lossy().to_string();
+    let conn = open_db(app_handle)?;
+    let mut expected = HashSet::new();
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT patient_folder, folder_name
+             FROM patient_treatment_index
+             WHERE workspace_dir = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![workspace_dir], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| e.to_string())?;
+
+    for row in rows {
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            break;
+        }
+        let (patient_folder, treatment_folder) = row.map_err(|e| e.to_string())?;
+        let treatment_path = workspace.join(patient_folder).join(treatment_folder);
+        if !treatment_path.exists() || !treatment_path.is_dir() {
+            continue;
+        }
+        let entries = match fs::read_dir(&treatment_path) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            {
+                break;
+            }
+            let path = entry.path();
+            if !path.is_file() || !is_supported_preview_image(&path) {
+                continue;
+            }
+            let meta = match fs::metadata(&path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let file_size = meta.len();
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let key = build_preview_cache_key(&path, file_size, modified_ms);
+            expected.insert(format!("{key}.jpg"));
+        }
+    }
+
+    Ok(expected)
+}
+
 fn run_preview_cache_cleanup_for_workspace(app_handle: &tauri::AppHandle, workspace: &Path) {
     let Ok(_guard) = preview_cache_lock().lock() else {
         return;
     };
-    let cache_dir = get_preview_cache_dir(app_handle);
+    let cache_dir = get_active_preview_cache_dir(app_handle);
     let settings = read_settings(app_handle).unwrap_or_default();
     let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
     let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    cleanup_preview_cache_for_workspace_dir(app_handle, &cache_dir, workspace, max_cache_bytes);
+}
+
+fn cleanup_preview_cache_for_workspace_dir(
+    app_handle: &tauri::AppHandle,
+    cache_dir: &Path,
+    workspace: &Path,
+    max_cache_bytes: u64,
+) {
+    if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+    {
+        return;
+    }
     let mut index = load_preview_cache_index(&cache_dir);
 
     cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
-    let expected = collect_workspace_expected_preview_files(workspace);
+    let expected = collect_workspace_expected_preview_files_from_db(app_handle, workspace)
+        .unwrap_or_else(|_| collect_workspace_expected_preview_files(workspace));
 
     if let Ok(entries) = fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            {
+                break;
+            }
             let path = entry.path();
             if !path.is_file() {
                 continue;
             }
-            let is_preview_jpg = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| e.eq_ignore_ascii_case("jpg"))
-                .unwrap_or(false);
+            let is_preview_jpg = is_cache_preview_jpeg(&path);
             if !is_preview_jpg {
                 continue;
             }
@@ -852,9 +1317,9 @@ fn resolve_cached_previews(
     generate_if_missing: bool,
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
     let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
-    let cache_dir = get_preview_cache_dir(app_handle);
-    let mut index = load_preview_cache_index(&cache_dir);
     let settings = read_settings(app_handle).unwrap_or_default();
+    let cache_dir = get_active_preview_cache_dir(app_handle);
+    let mut index = load_preview_cache_index(&cache_dir);
     let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
     let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
     let current_ms = now_ms();
@@ -1468,8 +1933,20 @@ fn open_workspace_dir(workspace_dir: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn open_preview_cache_dir(app_handle: tauri::AppHandle) -> Result<(), String> {
-    let cache_dir = get_preview_cache_dir(&app_handle);
+fn open_preview_cache_dir(app_handle: tauri::AppHandle, workspace_dir: Option<String>) -> Result<(), String> {
+    let settings = read_settings(&app_handle).unwrap_or_default();
+    let workspace_value = workspace_dir
+        .unwrap_or_else(|| settings.workspace_dir.unwrap_or_default())
+        .trim()
+        .to_string();
+    let cache_dir = if workspace_value.is_empty() {
+        get_preview_cache_dir(&app_handle)
+    } else {
+        let workspace = PathBuf::from(workspace_value);
+        let main_cache_dir = get_local_cache_copy_dir(&workspace);
+        fs::create_dir_all(&main_cache_dir).map_err(|e| e.to_string())?;
+        main_cache_dir
+    };
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
 
     #[cfg(target_os = "macos")]
@@ -1944,11 +2421,23 @@ async fn get_cached_image_previews(
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
     let include_data_url = include_data_url.unwrap_or(true);
     let generate_if_missing = generate_if_missing.unwrap_or(true);
-    tauri::async_runtime::spawn_blocking(move || {
-        resolve_cached_previews(&app_handle, &paths, include_data_url, generate_if_missing)
+    let app_handle_for_resolve = app_handle.clone();
+    let rows = tauri::async_runtime::spawn_blocking(move || {
+        resolve_cached_previews(
+            &app_handle_for_resolve,
+            &paths,
+            include_data_url,
+            generate_if_missing,
+        )
     })
-        .await
-        .map_err(|e| e.to_string())?
+    .await
+    .map_err(|e| e.to_string())??;
+
+    if generate_if_missing {
+        schedule_local_cache_copy_sync_if_enabled(&app_handle);
+    }
+
+    Ok(rows)
 }
 
 #[tauri::command]
@@ -1957,7 +2446,7 @@ async fn get_existing_cached_preview_paths(
     paths: Vec<String>,
 ) -> Result<Vec<CachedPreviewPathRow>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let cache_dir = get_preview_cache_dir(&app_handle);
+        let cache_dir = get_active_preview_cache_dir(&app_handle);
         let mut out = Vec::with_capacity(paths.len());
 
         for raw_path in paths {
@@ -2040,7 +2529,8 @@ async fn prefetch_treatment_folder_previews(
         return Ok(());
     }
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let app_handle_for_resolve = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
         let mut image_paths = Vec::new();
         for treatment_folder in selected_folders {
             let treatment_path = workspace.join(&patient_folder).join(&treatment_folder);
@@ -2066,13 +2556,16 @@ async fn prefetch_treatment_folder_previews(
         }
 
         if image_paths.is_empty() {
-            return Ok(());
+            return Ok::<(), String>(());
         }
-        let _ = resolve_cached_previews(&app_handle, &image_paths, false, true)?;
+        let _ = resolve_cached_previews(&app_handle_for_resolve, &image_paths, false, true)?;
         Ok(())
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())??;
+
+    schedule_local_cache_copy_sync_if_enabled(&app_handle);
+    Ok(())
 }
 
 #[tauri::command]
@@ -2148,6 +2641,7 @@ fn start_import_files(
 
     let job_id = IMPORT_JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let app_handle_clone = app_handle.clone();
+    let workspace_dir_for_preview_sync = workspace_dir.clone();
     let import_files = file_paths
         .into_iter()
         .map(|p| p.trim().to_string())
@@ -2176,6 +2670,7 @@ fn start_import_files(
         let mut pending_preview_paths: Vec<String> = Vec::new();
         let (preview_tx, preview_rx) = std::sync::mpsc::channel::<Vec<String>>();
         let preview_handle = app_handle_clone.clone();
+        let preview_workspace_dir = workspace_dir_for_preview_sync.clone();
         std::thread::spawn(move || {
             while let Ok(batch) = preview_rx.recv() {
                 if batch.is_empty() {
@@ -2185,6 +2680,8 @@ fn start_import_files(
                     emit_import_preview_ready_events(&preview_handle, &rows);
                 }
             }
+            // Sync to workspace main cache only after preview generation completes.
+            sync_local_cache_copy_if_enabled(&preview_handle, &preview_workspace_dir);
         });
 
         let emit_progress = |percent: f64, done: bool, error: Option<String>| {
@@ -2216,7 +2713,7 @@ fn start_import_files(
 
                     if is_supported_preview_image(&dst_path) {
                         pending_preview_paths.push(dst_path.to_string_lossy().to_string());
-                        if pending_preview_paths.len() >= 6 {
+                        if pending_preview_paths.len() >= IMPORT_PREVIEW_MICROBATCH_SIZE {
                             let batch = std::mem::take(&mut pending_preview_paths);
                             let _ = preview_tx.send(batch);
                         }
@@ -2273,11 +2770,162 @@ fn set_cache_size_gb(app_handle: tauri::AppHandle, cache_size_gb: u8) -> Result<
 }
 
 #[tauri::command]
+async fn set_keep_local_cache_copy(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    enabled: bool,
+) -> Result<LocalCacheCopyStatusRow, String> {
+    let mut settings = read_settings(&app_handle)?;
+    settings.keep_local_cache_copy = Some(enabled);
+    write_settings(&app_handle, &settings)?;
+
+    if !enabled {
+        LOCAL_CACHE_COPY_RUNNING.store(false, Ordering::Relaxed);
+        set_local_cache_copy_runtime_state("disabled", None);
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, false, false, &runtime));
+    }
+
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime));
+    }
+
+    if LOCAL_CACHE_COPY_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, true, true, &runtime));
+    }
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+
+    let app_handle_clone = app_handle.clone();
+    let workspace_clone = workspace.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_local_cache_copy_sync(&app_handle_clone, &workspace_clone, true)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    LOCAL_CACHE_COPY_RUNNING.store(false, Ordering::Relaxed);
+    result?;
+
+    let runtime = local_cache_copy_runtime()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime))
+}
+
+#[tauri::command]
+fn get_local_cache_copy_status(
+    app_handle: tauri::AppHandle,
+) -> Result<LocalCacheCopyStatusRow, String> {
+    let settings = read_settings(&app_handle).unwrap_or_default();
+    let enabled = settings.keep_local_cache_copy.unwrap_or(false);
+    let running = LOCAL_CACHE_COPY_RUNNING.load(Ordering::Relaxed);
+    let runtime = local_cache_copy_runtime()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(local_cache_copy_status_row(&app_handle, enabled, running, &runtime))
+}
+
+#[tauri::command]
+async fn sync_local_cache_copy(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<LocalCacheCopyStatusRow, String> {
+    let settings = read_settings(&app_handle).unwrap_or_default();
+    let enabled = settings.keep_local_cache_copy.unwrap_or(false);
+    if !enabled {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, false, false, &runtime));
+    }
+
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime));
+    }
+
+    if LOCAL_CACHE_COPY_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, true, true, &runtime));
+    }
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+
+    let app_handle_clone = app_handle.clone();
+    let workspace_clone = workspace.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_local_cache_copy_sync(&app_handle_clone, &workspace_clone, false)
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    LOCAL_CACHE_COPY_RUNNING.store(false, Ordering::Relaxed);
+    result?;
+
+    let runtime = local_cache_copy_runtime()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime))
+}
+
+#[tauri::command]
+fn delete_local_cache_copy_files(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let cache_dir = preview_cache_dir_path(&app_handle);
+    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+    if !cache_dir.exists() {
+        return Ok(());
+    }
+
+    // Safety guard: never allow this command to target workspace main cache.
+    if let Ok(settings) = read_settings(&app_handle) {
+        if let Some(workspace_dir) = settings.workspace_dir {
+            let workspace_main_cache = get_local_cache_copy_dir(Path::new(workspace_dir.trim()));
+            let local_canon = fs::canonicalize(&cache_dir).unwrap_or(cache_dir.clone());
+            let main_canon = fs::canonicalize(&workspace_main_cache).unwrap_or(workspace_main_cache);
+            if local_canon == main_canon {
+                return Err("refusing to delete workspace main cache via local cache delete".to_string());
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let _ = fs::remove_dir_all(path);
+            } else {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
     let settings = read_settings(&app_handle).unwrap_or_default();
     let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
     let max_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
-    let cache_dir = get_preview_cache_dir(&app_handle);
+    let cache_dir = get_active_preview_cache_dir(&app_handle);
     let used_bytes = if let Ok(_guard) = preview_cache_lock().try_lock() {
         let mut index = load_preview_cache_index(&cache_dir);
         cleanup_preview_cache(&cache_dir, &mut index, max_bytes);
@@ -2349,7 +2997,7 @@ fn get_preview_debug_counts(
         }
     }
 
-    let cache_dir = get_preview_cache_dir(&app_handle);
+    let cache_dir = get_active_preview_cache_dir(&app_handle);
     let cache_image_count = if workspace.exists() && workspace.is_dir() {
         let conn = open_db(&app_handle)?;
         let mut mapped_count = 0_u64;
@@ -2414,6 +3062,8 @@ async fn cleanup_preview_cache_for_workspace(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
 ) -> Result<(), String> {
+    PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
         let workspace = PathBuf::from(workspace_dir.trim());
         if !workspace.exists() || !workspace.is_dir() {
@@ -2428,6 +3078,42 @@ async fn cleanup_preview_cache_for_workspace(
 #[tauri::command]
 fn get_preview_fill_status() -> bool {
     PREVIEW_FILL_RUNNING.load(Ordering::Relaxed)
+}
+
+#[tauri::command]
+fn stop_all_cache_tasks(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let any_running = PREVIEW_FILL_RUNNING.load(Ordering::Relaxed)
+        || LOCAL_CACHE_COPY_RUNNING.load(Ordering::Relaxed);
+    PREVIEW_FILL_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    let _ = app_handle.emit(
+        "preview-fill-progress",
+        PreviewFillProgressEvent {
+            running: true,
+            message: "Pausing...".to_string(),
+            completed: 0,
+            total: 0,
+        },
+    );
+    Ok(any_running)
+}
+
+#[tauri::command]
+fn stop_background_preview_fill(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    if !PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    PREVIEW_FILL_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    let _ = app_handle.emit(
+        "preview-fill-progress",
+        PreviewFillProgressEvent {
+            running: true,
+            message: "Pausing...".to_string(),
+            completed: 0,
+            total: 0,
+        },
+    );
+    Ok(true)
 }
 
 #[tauri::command]
@@ -2446,6 +3132,8 @@ fn start_background_preview_fill(
     {
         return Ok(false);
     }
+    PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 
     let _ = app_handle.emit(
         "preview-fill-status",
@@ -2454,10 +3142,14 @@ fn start_background_preview_fill(
     let app_handle_clone = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
         const BATCH_SIZE: usize = 18;
+        let workspace_dir_value = workspace.to_string_lossy().to_string();
         let mut stack = vec![workspace];
         let mut all_images: Vec<String> = Vec::new();
 
         while let Some(dir) = stack.pop() {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+                break;
+            }
             let entries = match fs::read_dir(&dir) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -2486,7 +3178,16 @@ fn start_background_preview_fill(
 
         let total = all_images.len() as u64;
         let mut completed = 0_u64;
-        if total > 0 {
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+            PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
+            PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+            emit_preview_fill_progress(&app_handle_clone, false, "Paused", completed, total);
+            let _ = app_handle_clone.emit(
+                "preview-fill-status",
+                PreviewFillStatusEvent { running: false },
+            );
+            return;
+        } else if total > 0 {
             emit_preview_fill_progress(
                 &app_handle_clone,
                 true,
@@ -2499,6 +3200,9 @@ fn start_background_preview_fill(
         }
 
         for chunk in all_images.chunks(BATCH_SIZE) {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+                break;
+            }
             let batch: Vec<String> = chunk.to_vec();
             let _ = resolve_cached_previews(&app_handle_clone, &batch, false, true);
             completed = completed.saturating_add(batch.len() as u64);
@@ -2511,6 +3215,20 @@ fn start_background_preview_fill(
             );
             std::thread::sleep(Duration::from_millis(24));
         }
+
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+            PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
+            PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+            emit_preview_fill_progress(&app_handle_clone, false, "Paused", completed, total);
+            let _ = app_handle_clone.emit(
+                "preview-fill-status",
+                PreviewFillStatusEvent { running: false },
+            );
+            return;
+        }
+
+        // First create previews in local cache; sync to workspace main cache afterwards.
+        sync_local_cache_copy_if_enabled(&app_handle_clone, &workspace_dir_value);
 
         if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
             emit_preview_fill_progress(
@@ -2528,6 +3246,7 @@ fn start_background_preview_fill(
         }
 
         PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
+        PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         emit_preview_fill_progress(&app_handle_clone, false, "Up to date", completed, total);
         let _ = app_handle_clone.emit(
             "preview-fill-status",
@@ -2582,10 +3301,16 @@ pub fn run() {
             prefetch_treatment_folder_previews,
             start_import_files,
             set_cache_size_gb,
+            set_keep_local_cache_copy,
+            get_local_cache_copy_status,
+            sync_local_cache_copy,
+            delete_local_cache_copy_files,
             get_preview_cache_stats,
             get_preview_debug_counts,
             cleanup_preview_cache_for_workspace,
             get_preview_fill_status,
+            stop_all_cache_tasks,
+            stop_background_preview_fill,
             start_background_preview_fill,
             load_settings
         ])

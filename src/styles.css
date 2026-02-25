@@ -1580,11 +1580,12 @@ body{
 }
 
 .indexing-debug-counts{
-  margin-left: 4px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.02em;
-  color: rgba(15,23,42,0.58);
+  margin-left: 0;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: rgba(0,0,0,0.56);
+  line-height: 1.25;
   white-space: nowrap;
 }
 
@@ -1817,8 +1818,8 @@ body{
 .indexing-progress-spinner{
   width: 11px;
   height: 11px;
-  border: 2px solid rgba(236,72,153,0.24);
-  border-top-color: #ec4899;
+  border: 2px solid rgba(37, 99, 235, 0.2);
+  border-top-color: #2563eb;
   border-radius: 50%;
   animation: dbSpin 0.9s linear infinite;
 }
@@ -1827,6 +1828,26 @@ body{
   font-size: 11px;
   color: rgba(0,0,0,0.56);
   line-height: 1.25;
+}
+
+.cache-reload-btn{
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 8px;
+}
+
+.local-cache-copy-row{
+  margin-top: 2px;
+  padding-top: 2px;
+}
+
+.delete-action-row{
+  align-items: center;
+}
+
+.delete-action-row .folder-change-btn{
+  margin-top: 4px;
 }
 
 .cache-open-btn{
@@ -1932,6 +1953,10 @@ body{
 }
 
 .debug-delete-row.inactive .settings-value{
+  color: rgba(0,0,0,0.35);
+}
+
+.delete-action-row.inactive .settings-value{
   color: rgba(0,0,0,0.35);
 }
 
