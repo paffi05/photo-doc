@@ -164,6 +164,55 @@ fn split_patient_name(folder_name: &str) -> (String, String) {
     (folder_name.trim().to_string(), String::new())
 }
 
+fn is_valid_patient_folder_name(folder_name: &str) -> bool {
+    if folder_name.is_empty() || folder_name.trim() != folder_name {
+        return false;
+    }
+    if folder_name.matches(',').count() != 1 {
+        return false;
+    }
+    let Some(comma_idx) = folder_name.find(',') else {
+        return false;
+    };
+    let last_name = &folder_name[..comma_idx];
+    let rest_with_space = &folder_name[comma_idx + 1..];
+    if last_name.is_empty() || last_name.trim() != last_name {
+        return false;
+    }
+    if !rest_with_space.starts_with(' ') {
+        return false;
+    }
+    let first_and_id = rest_with_space.trim_start();
+    if first_and_id.is_empty() || first_and_id.trim() != first_and_id {
+        return false;
+    }
+
+    if let Some(open_idx) = first_and_id.rfind(" (") {
+        if !first_and_id.ends_with(')') || open_idx + 2 >= first_and_id.len() - 1 {
+            return false;
+        }
+        let first_name = &first_and_id[..open_idx];
+        let id_part = &first_and_id[open_idx + 2..first_and_id.len() - 1];
+        if first_name.is_empty() || first_name.trim() != first_name || id_part.trim().is_empty() {
+            return false;
+        }
+        if first_name.contains(',')
+            || id_part.contains(',')
+            || first_name.contains('(')
+            || first_name.contains(')')
+            || id_part.contains('(')
+            || id_part.contains(')')
+        {
+            return false;
+        }
+        return true;
+    }
+
+    !first_and_id.contains(',')
+        && !first_and_id.contains('(')
+        && !first_and_id.contains(')')
+}
+
 fn strip_patient_id_suffix(first_name: &str) -> String {
     let trimmed = first_name.trim();
     if trimmed.ends_with(')') {
@@ -188,6 +237,13 @@ struct PatientMetadata {
 struct PatientSearchRow {
     folder_name: String,
     patient_id: String,
+}
+
+#[derive(Serialize)]
+struct InvalidPatientFoldersRow {
+    invalid_count: u64,
+    invalid_folders: Vec<String>,
+    invalid_files: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1673,11 +1729,11 @@ fn create_patient_with_metadata(
         return Err("workspace directory does not exist".to_string());
     }
 
-    let last_name = last_name.trim();
-    let first_name = first_name.trim();
+    let last_name = last_name.trim_end();
+    let first_name = first_name.trim_end();
     let patient_id = patient_id.trim();
 
-    if last_name.is_empty() || first_name.is_empty() || patient_id.is_empty() {
+    if last_name.trim().is_empty() || first_name.trim().is_empty() || patient_id.is_empty() {
         return Err("last name, first name and id are required".to_string());
     }
 
@@ -2050,6 +2106,16 @@ fn clear_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn delete_database(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let db_path = get_db_path(&app_handle);
+    if db_path.exists() {
+        fs::remove_file(&db_path).map_err(|e| e.to_string())?;
+    }
+    let _ = open_db(&app_handle)?;
+    Ok(())
+}
+
+#[tauri::command]
 fn open_workspace_dir(workspace_dir: String) -> Result<(), String> {
     let workspace = PathBuf::from(&workspace_dir);
     if !workspace.exists() || !workspace.is_dir() {
@@ -2158,6 +2224,77 @@ fn open_path_with_default(path: String) -> Result<(), String> {
 
     cmd.spawn().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir_all(destination).map_err(|e| e.to_string())?;
+    for entry in fs::read_dir(source).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let src_path = entry.path();
+        let dst_path = destination.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+            continue;
+        }
+        if file_type.is_file() {
+            fs::copy(&src_path, &dst_path).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+fn non_conflicting_folder_path(destination_root: &Path, folder_name: &str) -> PathBuf {
+    let normalized = folder_name.trim();
+    let candidate = destination_root.join(normalized);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let mut index: u32 = 2;
+    loop {
+        let next = destination_root.join(format!("{normalized} ({index})"));
+        if !next.exists() {
+            return next;
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+#[tauri::command]
+fn copy_treatment_folder_to_destination(
+    workspace_dir: String,
+    patient_folder: String,
+    treatment_folder: String,
+    destination_dir: String,
+) -> Result<String, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+
+    let treatment_folder = treatment_folder.trim();
+    if treatment_folder.is_empty() {
+        return Err("treatment folder is required".to_string());
+    }
+
+    let destination_root = PathBuf::from(destination_dir.trim());
+    if !destination_root.exists() || !destination_root.is_dir() {
+        return Err("destination directory does not exist".to_string());
+    }
+
+    let source_folder = workspace.join(patient_folder).join(treatment_folder);
+    if !source_folder.exists() || !source_folder.is_dir() {
+        return Err("source treatment folder does not exist".to_string());
+    }
+
+    let destination_folder = non_conflicting_folder_path(&destination_root, treatment_folder);
+    copy_dir_recursive(&source_folder, &destination_folder)?;
+    Ok(destination_folder.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -2302,6 +2439,12 @@ fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) 
         }
 
         let folder_name = entry.file_name().to_string_lossy().into_owned();
+        if folder_name.starts_with('.') {
+            continue;
+        }
+        if !is_valid_patient_folder_name(&folder_name) {
+            continue;
+        }
         let patient_path = entry.path();
         let (last_name, first_name) = split_patient_name(&folder_name);
         let metadata = read_patient_metadata(&entry.path());
@@ -2449,6 +2592,48 @@ fn search_patients(
     }
 
     Ok(rows_out)
+}
+
+#[tauri::command]
+fn get_invalid_patient_folders(workspace_dir: String) -> Result<InvalidPatientFoldersRow, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Ok(InvalidPatientFoldersRow {
+            invalid_count: 0,
+            invalid_folders: Vec::new(),
+            invalid_files: Vec::new(),
+        });
+    }
+
+    let mut invalid_folders: Vec<String> = Vec::new();
+    let mut invalid_files: Vec<String> = Vec::new();
+    for entry in fs::read_dir(&workspace).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let folder_name = entry.file_name().to_string_lossy().into_owned();
+        if folder_name.starts_with('.') {
+            continue;
+        }
+        if file_type.is_dir() {
+            if !is_valid_patient_folder_name(&folder_name) {
+                invalid_folders.push(folder_name);
+            }
+            continue;
+        }
+        if file_type.is_file() {
+            invalid_files.push(folder_name);
+        }
+    }
+
+    invalid_folders.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    invalid_files.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    let invalid_count = (invalid_folders.len() + invalid_files.len()) as u64;
+
+    Ok(InvalidPatientFoldersRow {
+        invalid_count,
+        invalid_folders,
+        invalid_files,
+    })
 }
 
 #[tauri::command]
@@ -3448,9 +3633,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             save_workspace,
             clear_workspace,
+            delete_database,
             open_workspace_dir,
             open_preview_cache_dir,
             open_path_with_default,
+            copy_treatment_folder_to_destination,
             list_patient_treatment_folders,
             list_patient_timeline_entries,
             list_treatment_files,
@@ -3462,6 +3649,7 @@ pub fn run() {
             is_patient_id_taken,
             reindex_patient_folders,
             search_patients,
+            get_invalid_patient_folders,
             get_image_preview_kinds,
             get_image_previews,
             get_quick_image_previews,

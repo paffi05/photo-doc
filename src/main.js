@@ -18,7 +18,12 @@ const openBtn = document.getElementById("openSettings");
 const closeBtn = document.getElementById("closeSettings");
 const overlay = document.getElementById("overlay");
 const panel = document.getElementById("settingsPanel");
+const settingsBody = panel?.querySelector(".settings-body") ?? null;
 const addPatientBtn = document.getElementById("addPatientBtn");
+const invalidPatientFoldersBtn = document.getElementById("invalidPatientFoldersBtn");
+const invalidPatientFoldersPanel = document.getElementById("invalidPatientFoldersPanel");
+const invalidPatientFoldersList = document.getElementById("invalidPatientFoldersList");
+const invalidPatientFoldersTitle = document.getElementById("invalidPatientFoldersTitle");
 
 const changeWorkspaceBtn = document.getElementById("changeWorkspaceBtn");
 const workspacePathEl = document.getElementById("workspacePath");
@@ -29,6 +34,8 @@ const showFrontendDebugToggle = document.getElementById("showFrontendDebug");
 const alwaysShowTimelineNamesToggle = document.getElementById("alwaysShowTimelineNames");
 const deleteWorkspaceBtn = document.getElementById("deleteWorkspaceBtn");
 const deleteWorkspaceRow = document.getElementById("deleteWorkspaceRow");
+const deleteDatabaseBtn = document.getElementById("deleteDatabaseBtn");
+const deleteDatabaseRow = document.getElementById("deleteDatabaseRow");
 const deleteLocalCacheBtn = document.getElementById("deleteLocalCacheBtn");
 const deleteLocalCacheRow = document.getElementById("deleteLocalCacheRow");
 const patientSearchInput = document.getElementById("patientSearchInput");
@@ -59,13 +66,170 @@ function setDebugState(state) {
   debugBadge.textContent = `debug: (${state})`;
 }
 
+function setInvalidPanelExpanded(expanded) {
+  if (!invalidPatientFoldersPanel) return;
+  if (invalidPanelHideTimerId !== null) {
+    clearTimeout(invalidPanelHideTimerId);
+    invalidPanelHideTimerId = null;
+  }
+
+  if (expanded) {
+    invalidPatientFoldersPanel.hidden = false;
+    requestAnimationFrame(() => {
+      invalidPatientFoldersPanel.classList.add("expanded");
+    });
+    return;
+  }
+
+  invalidPatientFoldersPanel.classList.remove("expanded");
+  invalidPanelHideTimerId = setTimeout(() => {
+    if (!invalidPatientFoldersPanel.classList.contains("expanded")) {
+      invalidPatientFoldersPanel.hidden = true;
+    }
+    invalidPanelHideTimerId = null;
+  }, PANEL_ANIM_MS);
+}
+
+function setAddPatientPanelExpanded(expanded) {
+  if (!addPatientForm) return;
+  if (addPatientFormHideTimerId !== null) {
+    clearTimeout(addPatientFormHideTimerId);
+    addPatientFormHideTimerId = null;
+  }
+
+  if (expanded) {
+    addPatientForm.hidden = false;
+    requestAnimationFrame(() => {
+      addPatientForm.classList.add("expanded");
+    });
+    return;
+  }
+
+  addPatientForm.classList.remove("expanded");
+  addPatientFormHideTimerId = setTimeout(() => {
+    if (!addPatientForm.classList.contains("expanded")) {
+      addPatientForm.hidden = true;
+    }
+    addPatientFormHideTimerId = null;
+  }, PANEL_ANIM_MS);
+}
+
+function renderInvalidPatientFoldersPanel() {
+  if (!invalidPatientFoldersPanel || !invalidPatientFoldersList) return;
+  const hasInvalidItems = Boolean(currentWorkspaceDir) &&
+    (invalidPatientFolderNames.length > 0 || invalidPatientFileNames.length > 0);
+  const expanded = hasInvalidItems && invalidPatientFoldersPanelExpanded;
+
+  setInvalidPanelExpanded(expanded);
+  invalidPatientFoldersPanel.setAttribute("aria-hidden", expanded ? "false" : "true");
+  invalidPatientFoldersBtn?.classList.toggle("active", expanded);
+
+  invalidPatientFoldersList.innerHTML = "";
+  if (!expanded) return;
+
+  const folderIcon = `
+    <svg class="invalid-patient-folder-icon" viewBox="0 0 100 100" fill="none" aria-hidden="true">
+      <path d="M10 30C10 26.6863 12.6863 24 16 24H35L42 32H84C87.3137 32 90 34.6863 90 38V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V30Z" fill="var(--folder-back)"/>
+      <path d="M10 40C10 36.6863 12.6863 34 16 34H84C87.3137 34 90 36.6863 90 40V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V40Z" fill="var(--folder-front)"/>
+    </svg>
+  `;
+
+  for (const folderName of invalidPatientFolderNames) {
+    const item = document.createElement("li");
+    item.className = "invalid-patient-folder-item";
+    item.innerHTML = `${folderIcon}<span class="invalid-patient-folder-name">${folderName}</span>`;
+    invalidPatientFoldersList.appendChild(item);
+  }
+
+  for (const fileName of invalidPatientFileNames) {
+    const item = document.createElement("li");
+    item.className = "invalid-patient-folder-item";
+    const ext = extractExt(fileName) || "FILE";
+    item.innerHTML = `
+      <span class="invalid-patient-file-ext">${ext}</span>
+      <span class="invalid-patient-folder-name">${fileName}</span>
+    `;
+    invalidPatientFoldersList.appendChild(item);
+  }
+}
+
+function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames = []) {
+  invalidPatientFolderCount = Math.max(0, Number(count) || 0);
+  invalidPatientFolderNames = Array.isArray(folderNames)
+    ? folderNames.filter((name) => typeof name === "string" && name.trim().length > 0)
+    : [];
+  invalidPatientFileNames = Array.isArray(fileNames)
+    ? fileNames.filter((name) => typeof name === "string" && name.trim().length > 0)
+    : [];
+
+  if (!invalidPatientFoldersBtn) return;
+  const totalIssues = invalidPatientFolderNames.length + invalidPatientFileNames.length;
+  if (invalidPatientFoldersTitle) {
+    invalidPatientFoldersTitle.textContent = `${totalIssues} invalid folders or Files`;
+  }
+  const showWarning = Boolean(currentWorkspaceDir) && totalIssues > 0;
+  invalidPatientFoldersBtn.hidden = !showWarning;
+  invalidPatientFoldersBtn.disabled = !showWarning;
+  if (showWarning) {
+    invalidPatientFoldersBtn.setAttribute(
+      "title",
+      `${totalIssues} invalid folder/file item(s) found in the main directory.`,
+    );
+  } else {
+    invalidPatientFoldersBtn.removeAttribute("title");
+    invalidPatientFoldersPanelExpanded = false;
+  }
+  renderInvalidPatientFoldersPanel();
+}
+
+async function refreshInvalidPatientFolderWarning(workspaceDir = currentWorkspaceDir) {
+  if (!workspaceDir) {
+    setInvalidPatientFolderWarningUi(0, [], []);
+    return 0;
+  }
+  try {
+    const row = await invoke("get_invalid_patient_folders", { workspaceDir });
+    const count = Number(row?.invalid_count ?? row?.invalidCount ?? 0) || 0;
+    const invalidFolders = Array.isArray(row?.invalid_folders ?? row?.invalidFolders)
+      ? (row?.invalid_folders ?? row?.invalidFolders)
+      : [];
+    const invalidFiles = Array.isArray(row?.invalid_files ?? row?.invalidFiles)
+      ? (row?.invalid_files ?? row?.invalidFiles)
+      : [];
+    setInvalidPatientFolderWarningUi(count, invalidFolders, invalidFiles);
+    return count;
+  } catch (err) {
+    console.error("get_invalid_patient_folders failed:", err);
+    setInvalidPatientFolderWarningUi(0, [], []);
+    return 0;
+  }
+}
+
+function syncSettingsHeaderScrollState() {
+  if (!panel || !settingsBody) return;
+  panel.classList.toggle("is-scrolled", settingsBody.scrollTop > 0);
+}
+
 function ts() {
   return new Date().toISOString();
+}
+
+function extractExt(name = "") {
+  const raw = String(name ?? "");
+  const dot = raw.lastIndexOf(".");
+  if (dot <= 0 || dot === raw.length - 1) return "";
+  return raw.slice(dot + 1).toUpperCase();
 }
 
 let isWorkspaceSetupInProgress = false;
 let onboardingReadyWorkspaceDir = null;
 let currentWorkspaceDir = null;
+let databaseDeleteLocked = false;
+let invalidPatientFolderCount = 0;
+let invalidPatientFolderNames = [];
+let invalidPatientFileNames = [];
+let invalidPatientFoldersPanelExpanded = false;
+let invalidPanelHideTimerId = null;
 let patientSearchDebounceId = null;
 let isDbUpdating = false;
 let isPreviewFillRunning = false;
@@ -97,6 +261,7 @@ let selectedPatientId = "";
 let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
+let addPatientFormHideTimerId = null;
 const importingPatientJobCounts = new Map();
 let lastRenderedPatientEntries = [];
 let lastRenderedFilterText = "";
@@ -108,6 +273,7 @@ const DEFAULT_PREVIEW_PERFORMANCE_MODE = "auto";
 const INDEXING_STATUS_POLL_MS = 2500;
 const LOCAL_CACHE_STATUS_POLL_MS = 3000;
 const MIN_MANUAL_CACHE_STATUS_MS = 1500;
+const PANEL_ANIM_MS = 230;
 const CACHE_RELOAD_ICON_UPDATE = `
   <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -218,6 +384,17 @@ function setDeleteWorkspaceAvailability(enabled) {
   deleteWorkspaceRow?.classList.toggle("inactive", !enabled);
 }
 
+function setDeleteDatabaseAvailability(enabled) {
+  const available = Boolean(enabled) && !isDbUpdating && !databaseDeleteLocked;
+  if (deleteDatabaseBtn) deleteDatabaseBtn.disabled = !available;
+  deleteDatabaseRow?.classList.toggle("inactive", !available);
+}
+
+function setDebugOnlyRowsVisibility(show) {
+  if (deleteWorkspaceRow) deleteWorkspaceRow.hidden = !show;
+  if (deleteDatabaseRow) deleteDatabaseRow.hidden = !show;
+}
+
 function readDebugVisibilityPref() {
   try {
     const raw = localStorage.getItem(DEBUG_PREF_KEY);
@@ -269,7 +446,9 @@ function initTimelineNamesSetting() {
 function initDebugVisibilitySetting() {
   const show = readDebugVisibilityPref();
   setDebugVisibility(show);
+  setDebugOnlyRowsVisibility(show);
   setDeleteWorkspaceAvailability(show);
+  setDeleteDatabaseAvailability(show);
   if (showFrontendDebugToggle) showFrontendDebugToggle.checked = show;
 }
 
@@ -760,6 +939,7 @@ function setDbStatusUpdating() {
   if (dbStatusText) dbStatusText.textContent = "updating...";
   if (dbStatusSpinner) dbStatusSpinner.hidden = false;
   if (dbReloadBtn) dbReloadBtn.disabled = true;
+  setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
 }
 
 function setDbStatusUpToDate(date = new Date()) {
@@ -768,6 +948,7 @@ function setDbStatusUpToDate(date = new Date()) {
   if (dbStatusTime) dbStatusTime.textContent = formatDateTime(date);
   if (dbStatusSpinner) dbStatusSpinner.hidden = true;
   if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
+  setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
 }
 
 function setDbStatusIdle() {
@@ -776,6 +957,7 @@ function setDbStatusIdle() {
   if (dbStatusTime) dbStatusTime.textContent = "never updated";
   if (dbStatusSpinner) dbStatusSpinner.hidden = true;
   if (dbReloadBtn) dbReloadBtn.disabled = true;
+  setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
 }
 
 function splitPatientName(folderName) {
@@ -818,6 +1000,10 @@ function normalizePatientFieldValue(value) {
   return (value ?? "").trim();
 }
 
+function normalizePatientNameForCreate(value) {
+  return String(value ?? "").replace(/\s+$/u, "");
+}
+
 function isNumericPatientId(value) {
   return /^\d+$/.test(value);
 }
@@ -840,10 +1026,12 @@ async function isPatientIdTaken(patientId, { excludeFolderName = null } = {}) {
 }
 
 function isAddPatientFormValid() {
+  const lastName = normalizePatientNameForCreate(newPatientLastName?.value);
+  const firstName = normalizePatientNameForCreate(newPatientFirstName?.value);
   const patientId = normalizePatientFieldValue(newPatientId?.value);
   return Boolean(
-    normalizePatientFieldValue(newPatientLastName?.value) &&
-    normalizePatientFieldValue(newPatientFirstName?.value) &&
+    lastName.trim() &&
+    firstName.trim() &&
     patientId &&
     isNumericPatientId(patientId)
   );
@@ -893,7 +1081,8 @@ function resetAddPatientForm() {
 
 function setAddPatientFormVisible(visible) {
   if (!addPatientForm) return;
-  addPatientForm.hidden = !visible;
+  setAddPatientPanelExpanded(visible);
+  addPatientForm.setAttribute("aria-hidden", visible ? "false" : "true");
   addPatientBtn?.classList.toggle("active", visible);
   if (visible) {
     updateAddPatientFormState();
@@ -908,11 +1097,18 @@ function renderPatientList(entries, filterText = "") {
   lastRenderedFilterText = filterText;
 
   patientList.innerHTML = "";
+  patientList.classList.remove("is-empty-state");
 
   if (entries.length === 0) {
     const empty = document.createElement("li");
     empty.className = "patient-empty";
-    empty.textContent = filterText ? "No patients match your search." : "No patient folders found.";
+    if (filterText) {
+      empty.textContent = "No patients match your search.";
+    } else {
+      empty.classList.add("no-patient-folders");
+      empty.textContent = "No patient folders found";
+      patientList.classList.add("is-empty-state");
+    }
     patientList.appendChild(empty);
     return;
   }
@@ -1013,16 +1209,19 @@ async function loadPatients(workspaceDir, options = {}) {
     if (dbStatusSpinner) dbStatusSpinner.hidden = true;
     if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
   } else {
+    databaseDeleteLocked = false;
     setDbStatusUpToDate(new Date());
   }
 
   await searchPatients(query);
+  await refreshInvalidPatientFolderWarning(workspaceDir);
   await mainContent.refreshTimelineForSelection();
   await refreshIndexingDebugCounts();
 }
 
 function clearPatients() {
   currentWorkspaceDir = null;
+  databaseDeleteLocked = false;
   selectedPatient = null;
   selectedPatientId = "";
   importingPatientJobCounts.clear();
@@ -1035,6 +1234,7 @@ function clearPatients() {
     patientSearchDebounceId = null;
   }
   if (patientSearchInput) patientSearchInput.value = "";
+  setInvalidPatientFolderWarningUi(0, [], []);
   setAddPatientFormVisible(false);
   resetAddPatientForm();
   mainContent.clearSelectedPatientHeader();
@@ -1344,7 +1544,9 @@ changeWorkspaceBtn?.addEventListener("click", pickWorkspaceAndSave);
 showFrontendDebugToggle?.addEventListener("change", (e) => {
   const show = Boolean(e.target?.checked);
   setDebugVisibility(show);
+  setDebugOnlyRowsVisibility(show);
   setDeleteWorkspaceAvailability(show);
+  setDeleteDatabaseAvailability(show);
   writeDebugVisibilityPref(show);
   void refreshIndexingDebugCounts();
 });
@@ -1368,6 +1570,28 @@ deleteWorkspaceBtn?.addEventListener("click", async () => {
   } catch (err) {
     console.error("clear_workspace failed:", err);
     setDebugState("error: clear workspace");
+  }
+});
+deleteDatabaseBtn?.addEventListener("click", async () => {
+  if (deleteDatabaseBtn.disabled) return;
+  try {
+    await invoke("delete_database");
+    databaseDeleteLocked = true;
+    setDbStatusIdle();
+    if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
+    setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
+    selectedPatient = null;
+    selectedPatientId = "";
+    mainContent.clearSelectedPatientHeader();
+    await searchPatients(patientSearchInput?.value ?? "");
+    await mainContent.refreshTimelineForSelection();
+    await refreshIndexingDebugCounts();
+    if (currentWorkspaceDir) {
+      await refreshInvalidPatientFolderWarning(currentWorkspaceDir);
+    }
+  } catch (err) {
+    console.error("delete_database failed:", err);
+    setDebugState("error: delete database");
   }
 });
 deleteLocalCacheBtn?.addEventListener("click", async () => {
@@ -1509,12 +1733,18 @@ addPatientBtn?.addEventListener("click", () => {
     sidebarLayout.setPatientSidebarHidden(false);
     return;
   }
-  setAddPatientFormVisible(addPatientForm?.hidden ?? true);
+  const isExpanded = addPatientForm?.classList.contains("expanded") ?? false;
+  setAddPatientFormVisible(!isExpanded);
+});
+invalidPatientFoldersBtn?.addEventListener("click", () => {
+  if (invalidPatientFolderNames.length + invalidPatientFileNames.length <= 0) return;
+  invalidPatientFoldersPanelExpanded = !invalidPatientFoldersPanelExpanded;
+  renderInvalidPatientFoldersPanel();
 });
 confirmAddPatientBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || !isAddPatientFormValid() || confirmAddPatientBtn.disabled) return;
-  const lastName = normalizePatientFieldValue(newPatientLastName?.value);
-  const firstName = normalizePatientFieldValue(newPatientFirstName?.value);
+  const lastName = normalizePatientNameForCreate(newPatientLastName?.value);
+  const firstName = normalizePatientNameForCreate(newPatientFirstName?.value);
   const patientId = normalizePatientFieldValue(newPatientId?.value);
 
   if (await isPatientIdTaken(patientId)) {
@@ -1563,6 +1793,16 @@ openCacheFolderBtn?.addEventListener("click", async () => {
   } catch (err) {
     console.error("open_preview_cache_dir failed:", err);
   }
+});
+settingsBody?.addEventListener("scroll", syncSettingsHeaderScrollState);
+openBtn?.addEventListener("click", () => {
+  setTimeout(syncSettingsHeaderScrollState, 0);
+});
+closeBtn?.addEventListener("click", () => {
+  panel?.classList.remove("is-scrolled");
+});
+overlay?.addEventListener("click", () => {
+  panel?.classList.remove("is-scrolled");
 });
 
 window.addEventListener("keydown", (e) => {
@@ -1620,6 +1860,7 @@ void listen("preview-fill-progress", (event) => {
 void (async () => {
   updateCacheReloadButtonState();
   updateLocalCacheDeleteButtonState();
+  syncSettingsHeaderScrollState();
   await refreshLocalCacheCopyStatus();
   await refreshIndexingStatus();
 })();

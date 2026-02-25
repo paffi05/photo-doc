@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TauriEvent } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import { createMainHeaderTimeline } from "./main-content-header";
 import { createImportPanel } from "./main-content-import";
 import { createTreatmentFilesPanel } from "./main-content-treatment-files";
@@ -121,7 +122,7 @@ export function initMainContent({
         <text x="155" y="45" font-size="10" class="z z3">z</text>
       </g>
     </svg>
-      <div class="main-empty-label">No patient selected.</div>
+      <div class="main-empty-label">No patient selected</div>
     </div>
   `;
   mainCanvas.appendChild(emptyState);
@@ -140,6 +141,7 @@ export function initMainContent({
   let sleepTimer = null;
   let dragDepth = 0;
   let dragHideTimerId = null;
+  let internalDragInProgress = false;
   let hasPatientSelection = false;
   let lastDroppedPaths = [];
   let idleDotBaseX = 0;
@@ -161,9 +163,66 @@ export function initMainContent({
   let missingPatientIdTaken = false;
   let missingPatientIdChecking = false;
   let missingPatientIdCheckToken = 0;
+  let timelineFolderDragHoldTimerId = null;
+  let timelineFolderDragArmedPoint = null;
+  let timelineFolderDragSourcePoint = null;
+  let timelineFolderDragSourceExport = null;
+
+  const TIMELINE_FOLDER_DRAG_HOLD_MS = 420;
+  const TIMELINE_FOLDER_DRAG_MOVE_CANCEL_PX = 12;
+  const drawRoundRect = (ctx, x, y, w, h, r) => {
+    if (typeof ctx.roundRect === "function") {
+      ctx.roundRect(x, y, w, h, r);
+      return;
+    }
+    const radius = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+    ctx.moveTo(x + radius, y);
+    ctx.lineTo(x + w - radius, y);
+    ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+    ctx.lineTo(x + w, y + h - radius);
+    ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+    ctx.lineTo(x + radius, y + h);
+    ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+    ctx.lineTo(x, y + radius);
+    ctx.quadraticCurveTo(x, y, x + radius, y);
+  };
+  const timelineFolderDragGhost = document.createElement("canvas");
+  timelineFolderDragGhost.className = "timeline-folder-drag-ghost";
+  timelineFolderDragGhost.setAttribute("aria-hidden", "true");
+  timelineFolderDragGhost.width = 33;
+  timelineFolderDragGhost.height = 30;
+  {
+    const ctx = timelineFolderDragGhost.getContext("2d");
+    if (ctx) {
+      ctx.clearRect(0, 0, 33, 30);
+      ctx.shadowColor = "rgba(249,115,22,0.55)";
+      ctx.shadowBlur = 7;
+      ctx.fillStyle = "#f97316";
+      ctx.beginPath();
+      drawRoundRect(ctx, 4, 9, 25, 18, 4);
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = "#f97316";
+      ctx.beginPath();
+      drawRoundRect(ctx, 18, 6, 10, 4, 2);
+      ctx.fill();
+    }
+  }
+  mainCanvas.appendChild(timelineFolderDragGhost);
 
   function normalizeFieldValue(value) {
     return (value ?? "").trim();
+  }
+
+  function normalizeFsPath(path = "") {
+    return String(path ?? "").replace(/\\/g, "/");
+  }
+
+  function fsPathToFileUri(path = "") {
+    const normalized = normalizeFsPath(path);
+    if (!normalized) return "";
+    const withPrefix = normalized.startsWith("/") ? normalized : `/${normalized}`;
+    return `file://${encodeURI(withPrefix)}`;
   }
 
   function isNumericPatientId(value) {
@@ -312,9 +371,20 @@ export function initMainContent({
     return (
       types.includes("Files") ||
       types.includes("public.file-url") ||
-      types.includes("application/x-moz-file") ||
-      types.includes("text/uri-list")
+      types.includes("application/x-moz-file")
     );
+  }
+
+  function normalizeFsPathForCompare(path = "") {
+    const normalized = normalizeFsPath(String(path ?? "").trim());
+    return normalized.replace(/\/+$/, "");
+  }
+
+  function getParentFsPath(path = "") {
+    const normalized = normalizeFsPathForCompare(path);
+    const idx = normalized.lastIndexOf("/");
+    if (idx <= 0) return "";
+    return normalized.slice(0, idx);
   }
 
   function showDropOverlay() {
@@ -872,6 +942,151 @@ export function initMainContent({
     prefetchNeighborTreatmentPreviews();
   }
 
+  function resetTimelineFolderDragArmedPoint() {
+    if (timelineFolderDragArmedPoint) {
+      timelineFolderDragArmedPoint.classList.remove("folder-drag-armed", "folder-dragging");
+    }
+    timelineFolderDragArmedPoint = null;
+  }
+
+  function clearTimelineFolderDragHoldTimer() {
+    if (timelineFolderDragHoldTimerId !== null) {
+      clearTimeout(timelineFolderDragHoldTimerId);
+      timelineFolderDragHoldTimerId = null;
+    }
+  }
+
+  function beginTimelineFolderDragHold(point) {
+    clearTimelineFolderDragHoldTimer();
+    resetTimelineFolderDragArmedPoint();
+    timelineFolderDragHoldTimerId = setTimeout(() => {
+      timelineFolderDragHoldTimerId = null;
+      timelineFolderDragArmedPoint = point;
+      timelineFolderDragArmedPoint.classList.add("folder-drag-armed");
+      setSelectedTimelinePoint(point);
+    }, TIMELINE_FOLDER_DRAG_HOLD_MS);
+  }
+
+  function attachTimelineFolderDragExportHandlers(point) {
+    const dot = point?.querySelector(".main-timeline-dot");
+    if (!dot) return;
+    dot.draggable = true;
+    let holdPointerId = null;
+    let holdStartX = 0;
+    let holdStartY = 0;
+
+    const clearHold = () => {
+      holdPointerId = null;
+      clearTimelineFolderDragHoldTimer();
+      if (!timelineFolderDragSourcePoint) {
+        resetTimelineFolderDragArmedPoint();
+      }
+    };
+
+    dot.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      holdPointerId = event.pointerId;
+      holdStartX = Number(event.clientX) || 0;
+      holdStartY = Number(event.clientY) || 0;
+      beginTimelineFolderDragHold(point);
+    });
+
+    dot.addEventListener("pointermove", (event) => {
+      if (holdPointerId !== event.pointerId) return;
+      const currentX = Number(event.clientX) || 0;
+      const currentY = Number(event.clientY) || 0;
+      const moved = Math.hypot(currentX - holdStartX, currentY - holdStartY);
+      if (timelineFolderDragArmedPoint === point) return;
+      if (moved > TIMELINE_FOLDER_DRAG_MOVE_CANCEL_PX) {
+        clearHold();
+      }
+    });
+
+    dot.addEventListener("pointerup", (event) => {
+      if (holdPointerId !== event.pointerId) return;
+      clearHold();
+    });
+    dot.addEventListener("pointercancel", clearHold);
+
+    dot.addEventListener("dragstart", (event) => {
+      if (timelineFolderDragArmedPoint !== point) {
+        event.preventDefault();
+        return;
+      }
+      const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
+      const folderName = String(point.dataset.folderName ?? "").trim();
+      if (!context?.workspaceDir || !context?.patientFolder || !folderName) {
+        event.preventDefault();
+        resetTimelineFolderDragArmedPoint();
+        return;
+      }
+      const folderPath = `${context.workspaceDir}/${context.patientFolder}/${folderName}`;
+      const folderUri = fsPathToFileUri(folderPath);
+      if (!folderUri) {
+        event.preventDefault();
+        resetTimelineFolderDragArmedPoint();
+        return;
+      }
+
+      timelineFolderDragSourcePoint = point;
+      timelineFolderDragSourceExport = {
+        workspaceDir: context.workspaceDir,
+        patientFolder: context.patientFolder,
+        treatmentFolder: folderName,
+      };
+      point.classList.remove("folder-drag-armed");
+      point.classList.add("folder-dragging");
+      const dt = event.dataTransfer;
+      if (!dt) {
+        event.preventDefault();
+        point.classList.remove("folder-dragging");
+        resetTimelineFolderDragArmedPoint();
+        return;
+      }
+      dt.effectAllowed = "copy";
+      // Keep drag purely visual; actual export copy runs on dragend via backend command.
+      // Using only an app-specific MIME avoids OS creating .fileloc/.webloc artifacts.
+      dt.setData("application/x-mpm-folder-export", folderUri);
+      dt.setDragImage(timelineFolderDragGhost, 17, 15);
+    });
+
+    dot.addEventListener("dragend", () => {
+      const exportPayload = timelineFolderDragSourceExport;
+      point.classList.remove("folder-dragging");
+      timelineFolderDragSourcePoint = null;
+      timelineFolderDragSourceExport = null;
+      resetTimelineFolderDragArmedPoint();
+      clearTimelineFolderDragHoldTimer();
+
+      if (!exportPayload) return;
+      void (async () => {
+        try {
+          const selected = await open({
+            directory: true,
+            multiple: false,
+            title: "Choose destination folder",
+          });
+          const destinationDir = Array.isArray(selected) ? String(selected[0] ?? "").trim() : String(selected ?? "").trim();
+          if (!destinationDir) return;
+          await invoke("copy_treatment_folder_to_destination", {
+            workspaceDir: exportPayload.workspaceDir,
+            patientFolder: exportPayload.patientFolder,
+            treatmentFolder: exportPayload.treatmentFolder,
+            destinationDir,
+          });
+          if (typeof onImportDebugStateChange === "function") {
+            onImportDebugStateChange(`folder copied: ${exportPayload.treatmentFolder}`);
+          }
+        } catch (err) {
+          console.error("copy_treatment_folder_to_destination failed:", err);
+          if (typeof onImportDebugStateChange === "function") {
+            onImportDebugStateChange("error: copy folder");
+          }
+        }
+      })();
+    });
+  }
+
   function animateTimelineScrollTo(targetScrollLeft, durationMs = 300) {
     if (!timelineScroll) return;
     const maxScroll = Math.max(0, timelineScroll.scrollWidth - timelineScroll.clientWidth);
@@ -959,6 +1174,7 @@ export function initMainContent({
       pointsAdded += 1;
       const timelineKey = folderName || `${date} ${treatment}`.trim();
       const point = buildTimelinePoint({ date, treatment, timelineKey, folderName });
+      attachTimelineFolderDragExportHandlers(point);
       point.addEventListener("mouseenter", () => ensureTimelinePointVisible(point));
       point.addEventListener("click", () => {
         setSelectedTimelinePoint(point);
@@ -1023,7 +1239,18 @@ export function initMainContent({
       return;
     }
 
-    const incomingPaths = Array.isArray(droppedPaths) ? droppedPaths : [];
+    let incomingPaths = Array.isArray(droppedPaths) ? droppedPaths : [];
+    const selectedFolder = getSelectedTimelineFolderName().trim();
+    if (selectedFolder) {
+      const selectedFolderPath = normalizeFsPathForCompare(
+        `${context.workspaceDir}/${context.patientFolder}/${selectedFolder}`
+      );
+      incomingPaths = incomingPaths.filter((path) => {
+        const parentPath = getParentFsPath(path);
+        return !parentPath || parentPath !== selectedFolderPath;
+      });
+    }
+
     const dedupePaths = (paths) => {
       const seen = new Set();
       const unique = [];
@@ -1040,6 +1267,10 @@ export function initMainContent({
       lastDroppedPaths = dedupePaths([...lastDroppedPaths, ...incomingPaths]);
     } else {
       lastDroppedPaths = dedupePaths(incomingPaths);
+    }
+    if (!lastDroppedPaths.length) {
+      setImportPanelVisible(false);
+      return;
     }
     if (!append) {
       isImportFilesListExpanded = false;
@@ -1160,6 +1391,7 @@ export function initMainContent({
 
   function onDragEnter(e) {
     if (!hasPatientSelection) return;
+    if (internalDragInProgress) return;
     if (!hasFiles(e)) return;
     e.preventDefault();
     dragDepth += 1;
@@ -1168,6 +1400,7 @@ export function initMainContent({
 
   function onDragOver(e) {
     if (!hasPatientSelection) return;
+    if (internalDragInProgress) return;
     if (!hasFiles(e)) return;
     e.preventDefault();
     if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
@@ -1183,14 +1416,24 @@ export function initMainContent({
 
   function onDrop(e) {
     if (!hasPatientSelection) return;
-    if (hasFiles(e)) e.preventDefault();
+    if (!hasFiles(e)) return;
+    e.preventDefault();
     dragDepth = 0;
     hideDropOverlay();
     const dropped = Array.from(e?.dataTransfer?.files ?? []).map((f) => f.path || f.name);
+    if (!dropped.length) return;
     void prepareImportPanel(dropped);
   }
 
   // Capture listeners at document/window level for reliable external file drags.
+  document.addEventListener("dragstart", () => {
+    internalDragInProgress = true;
+  }, true);
+  document.addEventListener("dragend", () => {
+    internalDragInProgress = false;
+    dragDepth = 0;
+    hideDropOverlay();
+  }, true);
   window.addEventListener("dragenter", onDragEnter, true);
   window.addEventListener("dragover", onDragOver, true);
   window.addEventListener("dragleave", onDragLeave, true);
@@ -1204,11 +1447,13 @@ export function initMainContent({
   const appWindow = getCurrentWindow();
   appWindow.listen(TauriEvent.DRAG_ENTER, () => {
     if (!hasPatientSelection) return;
+    if (internalDragInProgress) return;
     dragDepth = Math.max(dragDepth, 1);
     showDropOverlay();
   });
   appWindow.listen(TauriEvent.DRAG_OVER, () => {
     if (!hasPatientSelection) return;
+    if (internalDragInProgress) return;
     showDropOverlay();
   });
   appWindow.listen(TauriEvent.DRAG_LEAVE, () => {
@@ -1218,9 +1463,16 @@ export function initMainContent({
   });
   appWindow.listen(TauriEvent.DRAG_DROP, (event) => {
     if (!hasPatientSelection) return;
+    if (internalDragInProgress) {
+      internalDragInProgress = false;
+      dragDepth = 0;
+      hideDropOverlay();
+      return;
+    }
     dragDepth = 0;
     hideDropOverlay();
     const dropped = Array.isArray(event?.payload?.paths) ? event.payload.paths : [];
+    if (!dropped.length) return;
     void prepareImportPanel(dropped);
   });
 
