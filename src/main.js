@@ -251,6 +251,26 @@ function normalizeDialogPathSelection(selected) {
   return path;
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function withTimeout(promise, timeoutMs, label = "operation") {
+  let timerId = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timerId = setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timerId !== null) clearTimeout(timerId);
+  }
+}
+
 let isWorkspaceSetupInProgress = false;
 let onboardingReadyWorkspaceDir = null;
 let currentWorkspaceDir = null;
@@ -312,6 +332,8 @@ const importWizardCleanupByJobId = new Map();
 const importingPatientJobCounts = new Map();
 let lastRenderedPatientEntries = [];
 let lastRenderedFilterText = "";
+let isPatientListLoading = false;
+let patientListRenderToken = 0;
 
 const DEBUG_PREF_KEY = "showFrontendDebug";
 const TIMELINE_NAMES_PREF_KEY = "alwaysShowTimelineNames";
@@ -321,6 +343,12 @@ const INDEXING_STATUS_POLL_MS = 2500;
 const LOCAL_CACHE_STATUS_POLL_MS = 3000;
 const MIN_MANUAL_CACHE_STATUS_MS = 1500;
 const PANEL_ANIM_MS = 230;
+const PATIENT_LIST_RENDER_BATCH_SIZE = 160;
+const WORKSPACE_REINDEX_START_TIMEOUT_MS = 6000;
+const WORKSPACE_REINDEX_STATUS_TIMEOUT_MS = 3500;
+const WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS = 45000;
+const WORKSPACE_LOAD_OVERALL_TIMEOUT_MS = 90000;
+const SEARCH_PATIENTS_TIMEOUT_MS = 20000;
 const CACHE_RELOAD_ICON_UPDATE = `
   <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -1038,17 +1066,58 @@ function setSystemUpdateUi({
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
-  if (!systemUpdateStatusText) return;
-
-  if (busy) {
-    systemUpdateStatusText.textContent = "Updating...";
-    return;
+  const nextStatus = (() => {
+    if (busy) return "Updating...";
+    if (Number.isFinite(Number(checkedAtMs)) && Number(checkedAtMs) > 0) {
+      return `Up to date (${formatDateTime(new Date(Number(checkedAtMs)))})`;
+    }
+    return "Up to date (never checked)";
+  })();
+  if (systemUpdateStatusText) {
+    systemUpdateStatusText.textContent = nextStatus;
   }
+}
 
-  if (Number.isFinite(Number(checkedAtMs)) && Number(checkedAtMs) > 0) {
-    systemUpdateStatusText.textContent = `Up to date (${formatDateTime(new Date(Number(checkedAtMs)))})`;
-  } else {
-    systemUpdateStatusText.textContent = "Up to date (never checked)";
+function setSystemUpdateStatusText(text) {
+  const value = String(text ?? "").trim();
+  if (!value) return;
+  if (systemUpdateStatusText) systemUpdateStatusText.textContent = value;
+}
+
+async function runSystemUpdateNow() {
+  if (systemUpdateBusy) return;
+  systemUpdateBusy = true;
+  setSystemUpdateUi({ busy: true });
+  let updateFailed = false;
+  try {
+    const result = await invoke("run_system_update");
+    const updated = Boolean(result?.updated);
+    const nextVersion = String(result?.version ?? "").trim();
+    if (!updated) {
+      systemUpdateCheckedAtMs = Date.now();
+      return;
+    }
+
+    setSystemUpdateStatusText("Update installed. Restart app to apply.");
+    if (nextVersion) {
+      systemAppVersion = nextVersion;
+    }
+    systemUpdateCheckedAtMs = Date.now();
+  } catch (err) {
+    updateFailed = true;
+    console.error("system update failed:", err);
+    setSystemUpdateStatusText("Update failed. Check updater config.");
+  } finally {
+    systemUpdateBusy = false;
+    if (!updateFailed) {
+      setSystemUpdateUi({ busy: false });
+    } else {
+      if (systemUpdateBtn) {
+        systemUpdateBtn.disabled = false;
+        systemUpdateBtn.setAttribute("title", "System update");
+      }
+      if (systemUpdateSpinner) systemUpdateSpinner.hidden = true;
+    }
   }
 }
 
@@ -1594,13 +1663,131 @@ function setAddPatientFormVisible(visible) {
   }
 }
 
+function setPatientListLoading(loading) {
+  const next = Boolean(loading);
+  if (isPatientListLoading === next) return;
+  isPatientListLoading = next;
+  renderPatientList(lastRenderedPatientEntries, lastRenderedFilterText);
+}
+
+function buildPatientListItem(entry, entries, filterText) {
+  const { folderName, patientId } = normalizePatientEntry(entry);
+  if (!folderName) return null;
+  const { lastName, firstName } = splitPatientName(folderName);
+  const item = document.createElement("li");
+  item.className = "patient-item";
+  const wizardLockActive = Boolean(importWizardLinkedPatient && String(importWizardLinkedPatient).trim());
+  const isWizardTargetPatient = wizardLockActive && folderName === importWizardLinkedPatient;
+  item.draggable = true;
+  let dragged = false;
+  if (folderName === selectedPatient) {
+    item.classList.add("selected");
+  }
+
+  if (isWizardTargetPatient) {
+    const wizardSpinner = document.createElement("span");
+    wizardSpinner.className = "patient-wizard-spinner";
+    wizardSpinner.setAttribute("aria-hidden", "true");
+    item.appendChild(wizardSpinner);
+  }
+
+  if ((importingPatientJobCounts.get(folderName) ?? 0) > 0) {
+    const importSpinner = document.createElement("span");
+    importSpinner.className = "patient-import-spinner";
+    importSpinner.setAttribute("aria-hidden", "true");
+    item.appendChild(importSpinner);
+  }
+
+  const last = document.createElement("span");
+  last.className = "patient-last";
+  last.textContent = lastName || folderName;
+  item.appendChild(last);
+
+  if (firstName) {
+    const first = document.createElement("span");
+    first.className = "patient-first";
+    first.textContent = `, ${firstName}`;
+    item.appendChild(first);
+  }
+
+  if (patientId) {
+    const id = document.createElement("span");
+    id.className = "patient-id";
+    id.textContent = patientId;
+    item.appendChild(id);
+  }
+
+  item.addEventListener("click", () => {
+    if (dragged) {
+      dragged = false;
+      return;
+    }
+    selectedPatient = folderName;
+    selectedPatientId = patientId;
+    mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
+    renderPatientList(entries, filterText);
+    updateImportWizardButtonState();
+    sidebarLayout.scheduleAutoHidePatientSidebar();
+  });
+
+  item.addEventListener("dragstart", (event) => {
+    dragged = true;
+    const dt = event?.dataTransfer;
+    if (!dt) return;
+    dt.effectAllowed = "copy";
+    dt.setData("application/x-mpm-patient-folder-export", folderName);
+    dt.setDragImage(patientDragGhost, 17, 15);
+  });
+
+  item.addEventListener("dragend", () => {
+    if (!currentWorkspaceDir || !folderName) {
+      dragged = false;
+      return;
+    }
+    void (async () => {
+      try {
+        const selected = await open({
+          directory: true,
+          multiple: false,
+          title: "Choose destination folder",
+        });
+        const destinationDir = normalizeDialogPathSelection(selected);
+        if (!destinationDir) {
+          dragged = false;
+          return;
+        }
+        await invoke("copy_patient_folder_to_destination", {
+          workspaceDir: currentWorkspaceDir,
+          patientFolder: folderName,
+          destinationDir,
+        });
+      } catch (err) {
+        console.error("copy_patient_folder_to_destination failed:", err);
+      } finally {
+        dragged = false;
+      }
+    })();
+  });
+
+  return item;
+}
+
 function renderPatientList(entries, filterText = "") {
   if (!patientList) return;
+  const renderToken = ++patientListRenderToken;
   lastRenderedPatientEntries = entries;
   lastRenderedFilterText = filterText;
 
   patientList.innerHTML = "";
   patientList.classList.remove("is-empty-state");
+
+  if (isPatientListLoading && !filterText) {
+    const loading = document.createElement("li");
+    loading.className = "patient-empty";
+    loading.textContent = "Loading patients...";
+    patientList.appendChild(loading);
+    return;
+  }
 
   if (entries.length === 0) {
     const empty = document.createElement("li");
@@ -1616,107 +1803,22 @@ function renderPatientList(entries, filterText = "") {
     return;
   }
 
-  for (const entry of entries) {
-    const { folderName, patientId } = normalizePatientEntry(entry);
-    if (!folderName) continue;
-    const { lastName, firstName } = splitPatientName(folderName);
-    const item = document.createElement("li");
-    item.className = "patient-item";
-    const wizardLockActive = Boolean(importWizardLinkedPatient && String(importWizardLinkedPatient).trim());
-    const isWizardTargetPatient = wizardLockActive && folderName === importWizardLinkedPatient;
-    item.draggable = true;
-    let dragged = false;
-    if (folderName === selectedPatient) {
-      item.classList.add("selected");
+  let index = 0;
+  const appendBatch = () => {
+    if (!patientList || renderToken !== patientListRenderToken) return;
+    const fragment = document.createDocumentFragment();
+    const nextEnd = Math.min(entries.length, index + PATIENT_LIST_RENDER_BATCH_SIZE);
+    while (index < nextEnd) {
+      const item = buildPatientListItem(entries[index], entries, filterText);
+      index += 1;
+      if (item) fragment.appendChild(item);
     }
-
-    if (isWizardTargetPatient) {
-      const wizardSpinner = document.createElement("span");
-      wizardSpinner.className = "patient-wizard-spinner";
-      wizardSpinner.setAttribute("aria-hidden", "true");
-      item.appendChild(wizardSpinner);
+    patientList.appendChild(fragment);
+    if (index < entries.length) {
+      requestAnimationFrame(appendBatch);
     }
-
-    if ((importingPatientJobCounts.get(folderName) ?? 0) > 0) {
-      const importSpinner = document.createElement("span");
-      importSpinner.className = "patient-import-spinner";
-      importSpinner.setAttribute("aria-hidden", "true");
-      item.appendChild(importSpinner);
-    }
-
-    const last = document.createElement("span");
-    last.className = "patient-last";
-    last.textContent = lastName || folderName;
-    item.appendChild(last);
-
-    if (firstName) {
-      const first = document.createElement("span");
-      first.className = "patient-first";
-      first.textContent = `, ${firstName}`;
-      item.appendChild(first);
-    }
-
-    if (patientId) {
-      const id = document.createElement("span");
-      id.className = "patient-id";
-      id.textContent = patientId;
-      item.appendChild(id);
-    }
-
-    item.addEventListener("click", () => {
-      if (dragged) {
-        dragged = false;
-        return;
-      }
-      selectedPatient = folderName;
-      selectedPatientId = patientId;
-      mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
-      renderPatientList(entries, filterText);
-      updateImportWizardButtonState();
-      sidebarLayout.scheduleAutoHidePatientSidebar();
-    });
-
-    item.addEventListener("dragstart", (event) => {
-      dragged = true;
-      const dt = event?.dataTransfer;
-      if (!dt) return;
-      dt.effectAllowed = "copy";
-      dt.setData("application/x-mpm-patient-folder-export", folderName);
-      dt.setDragImage(patientDragGhost, 17, 15);
-    });
-
-    item.addEventListener("dragend", () => {
-      if (!currentWorkspaceDir || !folderName) {
-        dragged = false;
-        return;
-      }
-      void (async () => {
-        try {
-          const selected = await open({
-            directory: true,
-            multiple: false,
-            title: "Choose destination folder",
-          });
-          const destinationDir = normalizeDialogPathSelection(selected);
-          if (!destinationDir) {
-            dragged = false;
-            return;
-          }
-          await invoke("copy_patient_folder_to_destination", {
-            workspaceDir: currentWorkspaceDir,
-            patientFolder: folderName,
-            destinationDir,
-          });
-        } catch (err) {
-          console.error("copy_patient_folder_to_destination failed:", err);
-        } finally {
-          dragged = false;
-        }
-      })();
-    });
-
-    patientList.appendChild(item);
-  }
+  };
+  appendBatch();
 }
 
 async function searchPatients(query = "") {
@@ -1726,28 +1828,99 @@ async function searchPatients(query = "") {
   }
 
   try {
-    const patients = await invoke("search_patients", {
-      workspaceDir: currentWorkspaceDir,
-      query,
-    });
+    const patients = await withTimeout(
+      invoke("search_patients", {
+        workspaceDir: currentWorkspaceDir,
+        query,
+      }),
+      SEARCH_PATIENTS_TIMEOUT_MS,
+      "search_patients",
+    );
     const entries = Array.isArray(patients) ? patients : [];
     renderPatientList(entries, query.trim());
   } catch (err) {
     console.error("search_patients failed:", err);
-    renderPatientList([], query.trim());
+    // Keep app responsive even if patient query is slow or fails.
+    renderPatientList(lastRenderedPatientEntries, query.trim());
   }
 }
 
 async function loadPatients(workspaceDir, options = {}) {
   const minStatusMs = options?.minStatusMs ?? 0;
+  const onReindexProgress = typeof options?.onReindexProgress === "function"
+    ? options.onReindexProgress
+    : null;
   currentWorkspaceDir = workspaceDir;
   const query = patientSearchInput?.value ?? "";
+  setPatientListLoading(true);
   setDbStatusUpdating();
   const startedAt = Date.now();
+  const loadDeadline = startedAt + WORKSPACE_LOAD_OVERALL_TIMEOUT_MS;
   let reindexFailed = false;
 
   try {
-    const indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
+    let startAccepted = await withTimeout(
+      invoke("start_workspace_reindex", { workspaceDir }),
+      WORKSPACE_REINDEX_START_TIMEOUT_MS,
+      "start_workspace_reindex",
+    ).catch(() => false);
+    let indexedCount = 0;
+    while (true) {
+      if (Date.now() > loadDeadline) {
+        throw new Error("workspace loading exceeded fail-safe timeout");
+      }
+      const status = await withTimeout(
+        invoke("get_workspace_reindex_status"),
+        WORKSPACE_REINDEX_STATUS_TIMEOUT_MS,
+        "get_workspace_reindex_status",
+      ).catch(() => null);
+      if (!status) {
+        if (!startAccepted) {
+          indexedCount = await withTimeout(
+            invoke("reindex_patient_folders", { workspaceDir }),
+            WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
+            "reindex_patient_folders fallback",
+          );
+          if (onReindexProgress) onReindexProgress(100);
+          break;
+        }
+        await delay(180);
+        continue;
+      }
+      const statusWorkspaceDir = String(status?.workspace_dir ?? status?.workspaceDir ?? "").trim();
+      const running = Boolean(status?.running);
+      if (statusWorkspaceDir && statusWorkspaceDir !== workspaceDir) {
+        if (!running && !startAccepted) {
+          startAccepted = await withTimeout(
+            invoke("start_workspace_reindex", { workspaceDir }),
+            WORKSPACE_REINDEX_START_TIMEOUT_MS,
+            "retry start_workspace_reindex",
+          ).catch(() => false);
+        }
+        await delay(120);
+        continue;
+      }
+
+      const completed = Number(status?.completed ?? 0) || 0;
+      const total = Number(status?.total ?? 0) || 0;
+      if (!statusWorkspaceDir && !running && !startAccepted) {
+        indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
+        if (onReindexProgress) onReindexProgress(100);
+        break;
+      }
+      const rawPercent = total > 0 ? (completed / total) * 100 : (running ? 0 : 100);
+      if (onReindexProgress) onReindexProgress(rawPercent);
+
+      const errorMessage = String(status?.error ?? "").trim();
+      if (!running) {
+        if (errorMessage) {
+          throw new Error(errorMessage);
+        }
+        indexedCount = Number(status?.indexed_count ?? status?.indexedCount ?? completed) || 0;
+        break;
+      }
+      await delay(120);
+    }
     console.log(`[patients ${ts()}] indexed ${indexedCount} folders`);
   } catch (err) {
     console.error("reindex_patient_folders failed:", err);
@@ -1757,7 +1930,7 @@ async function loadPatients(workspaceDir, options = {}) {
   const elapsedMs = Date.now() - startedAt;
   const remainingMs = minStatusMs - elapsedMs;
   if (remainingMs > 0) {
-    await new Promise((resolve) => setTimeout(resolve, remainingMs));
+    await delay(remainingMs);
   }
 
   if (reindexFailed) {
@@ -1771,15 +1944,39 @@ async function loadPatients(workspaceDir, options = {}) {
     setDbStatusUpToDate(new Date());
   }
 
-  await searchPatients(query);
-  await refreshInvalidPatientFolderWarning(workspaceDir);
-  await mainContent.refreshTimelineForSelection();
-  await refreshIndexingDebugCounts();
+  try {
+    await searchPatients(query);
+    await withTimeout(
+      refreshInvalidPatientFolderWarning(workspaceDir),
+      12000,
+      "refreshInvalidPatientFolderWarning",
+    ).catch((err) => {
+      console.error("refreshInvalidPatientFolderWarning failed:", err);
+      return 0;
+    });
+    await withTimeout(
+      mainContent.refreshTimelineForSelection(),
+      20000,
+      "refreshTimelineForSelection",
+    ).catch((err) => {
+      console.error("refreshTimelineForSelection failed:", err);
+    });
+    await withTimeout(
+      refreshIndexingDebugCounts(),
+      12000,
+      "refreshIndexingDebugCounts",
+    ).catch((err) => {
+      console.error("refreshIndexingDebugCounts failed:", err);
+    });
+  } finally {
+    setPatientListLoading(false);
+  }
 }
 
 function clearPatients() {
   void setImportWizardCompactMode(false);
   currentWorkspaceDir = null;
+  setPatientListLoading(false);
   databaseDeleteLocked = false;
   setImportWizardLinkedPatient(null);
   selectedPatient = null;
@@ -1885,10 +2082,20 @@ function replaceFolderWithLoadingSpinner() {
   if (!folderIconContainer) return;
 
   folderIconContainer.innerHTML = `
-    <svg class="setup-spinner-svg" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
-      <circle class="setup-spinner-ring" cx="120" cy="120" r="96"/>
-    </svg>
+    <div class="setup-spinner-wrap">
+      <svg class="setup-spinner-svg" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
+        <circle class="setup-spinner-ring" cx="120" cy="120" r="96"/>
+      </svg>
+      <span class="setup-spinner-percent" id="setupSpinnerPercent">0%</span>
+    </div>
   `;
+}
+
+function setOnboardingSetupProgress(percent = 0) {
+  const percentEl = document.getElementById("setupSpinnerPercent");
+  if (!percentEl) return;
+  const safe = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  percentEl.textContent = `${safe}%`;
 }
 
 function restoreOnboardingFolderIcon() {
@@ -2006,8 +2213,31 @@ async function pickWorkspaceAndSave() {
     }
 
     replaceFolderWithLoadingSpinner();
+    setOnboardingSetupProgress(0);
     setOnboardingCopy("Setting Up Database", "Please wait while we complete indexing.");
-    await loadPatients(workspaceDir, { minStatusMs: 3000 });
+    let setupTimedOut = false;
+    await withTimeout(
+      loadPatients(workspaceDir, {
+        minStatusMs: 3000,
+        onReindexProgress: (percent) => {
+          setOnboardingSetupProgress(percent);
+        },
+      }),
+      WORKSPACE_LOAD_OVERALL_TIMEOUT_MS + 5000,
+      "initial workspace setup",
+    ).catch((err) => {
+      setupTimedOut = true;
+      console.error("initial workspace setup fallback:", err);
+    });
+
+    if (setupTimedOut) {
+      setDebugState("ready (setup fallback)");
+      showMainScreenWithOptions(workspaceDir, { skipLoadPatients: true });
+      void loadPatients(workspaceDir);
+      isWorkspaceSetupInProgress = false;
+      setOnboardingBusyState(false);
+      return;
+    }
 
     // ONLY change the folder icon -> checkmark animation
     replaceFolderWithCheckmark();
@@ -2448,45 +2678,8 @@ openCacheFolderBtn?.addEventListener("click", async () => {
     console.error("open_preview_cache_dir failed:", err);
   }
 });
-systemUpdateBtn?.addEventListener("click", async () => {
-  if (systemUpdateBusy) return;
-  systemUpdateBusy = true;
-  setSystemUpdateUi({ busy: true });
-  let updateFailed = false;
-  try {
-    const result = await invoke("run_system_update");
-    const updated = Boolean(result?.updated);
-    const nextVersion = String(result?.version ?? "").trim();
-    if (!updated) {
-      systemUpdateCheckedAtMs = Date.now();
-      return;
-    }
-
-    if (systemUpdateStatusText) {
-      systemUpdateStatusText.textContent = "Update installed. Restart app to apply.";
-    }
-    if (nextVersion) {
-      systemAppVersion = nextVersion;
-    }
-    systemUpdateCheckedAtMs = Date.now();
-  } catch (err) {
-    updateFailed = true;
-    console.error("system update failed:", err);
-    if (systemUpdateStatusText) {
-      systemUpdateStatusText.textContent = "Update failed. Check updater config.";
-    }
-  } finally {
-    systemUpdateBusy = false;
-    if (!updateFailed) {
-      setSystemUpdateUi({ busy: false });
-    } else {
-      if (systemUpdateBtn) {
-        systemUpdateBtn.disabled = false;
-        systemUpdateBtn.setAttribute("title", "System update");
-      }
-      if (systemUpdateSpinner) systemUpdateSpinner.hidden = true;
-    }
-  }
+systemUpdateBtn?.addEventListener("click", () => {
+  void runSystemUpdateNow();
 });
 settingsBody?.addEventListener("scroll", syncSettingsHeaderScrollState);
 openBtn?.addEventListener("click", () => {

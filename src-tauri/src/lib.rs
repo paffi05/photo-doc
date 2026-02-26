@@ -422,6 +422,17 @@ struct PreviewFillProgressEvent {
     total: u64,
 }
 
+#[derive(Serialize, Clone, Default)]
+struct WorkspaceReindexStatus {
+    running: bool,
+    workspace_dir: String,
+    completed: u64,
+    total: u64,
+    indexed_count: u64,
+    message: String,
+    error: Option<String>,
+}
+
 static IMPORT_JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static IMPORT_ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static PREVIEW_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -431,6 +442,8 @@ static LOCAL_CACHE_COPY_RUNTIME: OnceLock<Mutex<LocalCacheCopyRuntime>> = OnceLo
 static LOCAL_CACHE_COPY_RUNNING: AtomicBool = AtomicBool::new(false);
 static LOCAL_CACHE_COPY_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static IMPORT_WIZARD_PREVIEW_PATH: OnceLock<Mutex<String>> = OnceLock::new();
+static WORKSPACE_REINDEX_RUNNING: AtomicBool = AtomicBool::new(false);
+static WORKSPACE_REINDEX_STATUS: OnceLock<Mutex<WorkspaceReindexStatus>> = OnceLock::new();
 
 const PREVIEW_CACHE_DIM: u32 = 200;
 const PREVIEW_CACHE_QUALITY: u8 = 52;
@@ -691,6 +704,10 @@ fn local_cache_copy_runtime() -> &'static Mutex<LocalCacheCopyRuntime> {
         state: "up_to_date".to_string(),
         last_sync_ms: None,
     }))
+}
+
+fn workspace_reindex_status_store() -> &'static Mutex<WorkspaceReindexStatus> {
+    WORKSPACE_REINDEX_STATUS.get_or_init(|| Mutex::new(WorkspaceReindexStatus::default()))
 }
 
 fn set_local_cache_copy_runtime_state(state: &str, last_sync_ms: Option<u64>) {
@@ -1378,6 +1395,31 @@ fn emit_preview_fill_progress(
             total,
         },
     );
+}
+
+fn set_workspace_reindex_status(
+    app_handle: &tauri::AppHandle,
+    running: bool,
+    workspace_dir: &str,
+    completed: u64,
+    total: u64,
+    indexed_count: u64,
+    message: impl Into<String>,
+    error: Option<String>,
+) {
+    let status = WorkspaceReindexStatus {
+        running,
+        workspace_dir: workspace_dir.to_string(),
+        completed,
+        total,
+        indexed_count,
+        message: message.into(),
+        error,
+    };
+    if let Ok(mut current) = workspace_reindex_status_store().lock() {
+        *current = status.clone();
+    }
+    let _ = app_handle.emit("workspace-reindex-progress", status);
 }
 
 fn run_preview_cache_cleanup(app_handle: &tauri::AppHandle) {
@@ -3189,35 +3231,43 @@ fn list_patient_timeline_entries(
     Ok(out)
 }
 
-#[tauri::command]
-fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) -> Result<usize, String> {
-    let workspace = PathBuf::from(workspace_dir);
-
+fn reindex_patient_folders_internal<F>(
+    app_handle: &tauri::AppHandle,
+    workspace: &Path,
+    mut on_progress: F,
+) -> Result<usize, String>
+where
+    F: FnMut(u64, u64),
+{
     if !workspace.exists() || !workspace.is_dir() {
+        on_progress(0, 0);
         return Ok(0);
     }
 
-    let mut folders: Vec<(String, String, String, String, String)> = Vec::new();
-    let mut treatment_rows: Vec<(String, String, String, String)> = Vec::new();
-
-    for entry in fs::read_dir(&workspace).map_err(|e| e.to_string())? {
+    let mut patient_dirs: Vec<(String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(workspace).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         if !file_type.is_dir() {
             continue;
         }
-
         let folder_name = entry.file_name().to_string_lossy().into_owned();
-        if folder_name.starts_with('.') {
+        if folder_name.starts_with('.') || !is_valid_patient_folder_name(&folder_name) {
             continue;
         }
-        if !is_valid_patient_folder_name(&folder_name) {
-            continue;
-        }
-        let patient_path = entry.path();
+        patient_dirs.push((folder_name, entry.path()));
+    }
+
+    let total = patient_dirs.len() as u64;
+    on_progress(0, total);
+
+    let mut folders: Vec<(String, String, String, String, String)> = Vec::new();
+    let mut treatment_rows: Vec<(String, String, String, String)> = Vec::new();
+
+    for (index, (folder_name, patient_path)) in patient_dirs.into_iter().enumerate() {
         let (last_name, first_name) = split_patient_name(&folder_name);
-        let metadata = read_patient_metadata(&entry.path());
-        let metadata_value = read_patient_metadata_value(&entry.path());
+        let metadata = read_patient_metadata(&patient_path);
+        let metadata_value = read_patient_metadata_value(&patient_path);
         let mut patient_id = String::new();
         let mut metadata_tokens = Vec::new();
         if let Some(meta) = metadata {
@@ -3248,22 +3298,26 @@ fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) 
                 treatment_rows.push((folder_name.clone(), child_name, folder_date, treatment_name));
             }
         }
+
+        let completed = (index + 1) as u64;
+        on_progress(completed, total);
     }
 
     folders.sort_by_key(|(_, last_name, first_name, _, _)| {
         (last_name.to_lowercase(), first_name.to_lowercase())
     });
 
-    let mut conn = open_db(&app_handle)?;
+    let workspace_dir = workspace.to_string_lossy().to_string();
+    let mut conn = open_db(app_handle)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM patient_index WHERE workspace_dir = ?1",
-        params![workspace.to_string_lossy().to_string()],
+        params![workspace_dir.clone()],
     )
     .map_err(|e| e.to_string())?;
     tx.execute(
         "DELETE FROM patient_treatment_index WHERE workspace_dir = ?1",
-        params![workspace.to_string_lossy().to_string()],
+        params![workspace_dir.clone()],
     )
     .map_err(|e| e.to_string())?;
 
@@ -3273,7 +3327,7 @@ fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) 
             "INSERT INTO patient_index (workspace_dir, folder_name, last_name, first_name, patient_id, search_text)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                workspace.to_string_lossy().to_string(),
+                workspace_dir.clone(),
                 folder_name,
                 last_name,
                 first_name,
@@ -3289,7 +3343,7 @@ fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) 
             "INSERT INTO patient_treatment_index (workspace_dir, patient_folder, folder_name, folder_date, treatment_name)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                workspace.to_string_lossy().to_string(),
+                workspace_dir.clone(),
                 patient_folder,
                 folder_name,
                 folder_date,
@@ -3301,6 +3355,118 @@ fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) 
 
     tx.commit().map_err(|e| e.to_string())?;
     Ok(folders.len())
+}
+
+#[tauri::command]
+fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) -> Result<usize, String> {
+    let workspace = PathBuf::from(workspace_dir);
+    reindex_patient_folders_internal(&app_handle, &workspace, |_completed, _total| {})
+}
+
+#[tauri::command]
+fn get_workspace_reindex_status() -> Result<WorkspaceReindexStatus, String> {
+    workspace_reindex_status_store()
+        .lock()
+        .map(|status| status.clone())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn start_workspace_reindex(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<bool, String> {
+    let workspace_dir = workspace_dir.trim().to_string();
+    if workspace_dir.is_empty() {
+        return Err("workspace directory is required".to_string());
+    }
+    let workspace = PathBuf::from(&workspace_dir);
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    if WORKSPACE_REINDEX_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    set_workspace_reindex_status(
+        &app_handle,
+        true,
+        &workspace_dir,
+        0,
+        0,
+        0,
+        "Preparing",
+        None,
+    );
+
+    let app_handle_clone = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut last_emitted_completed = 0_u64;
+        let mut last_emitted_total = 0_u64;
+        let result = reindex_patient_folders_internal(
+            &app_handle_clone,
+            &workspace,
+            |completed, total| {
+                // Avoid flooding the frontend with progress events for very large directories.
+                let should_emit = total == 0
+                    || completed == total
+                    || completed <= 2
+                    || completed.saturating_sub(last_emitted_completed) >= 20
+                    || total != last_emitted_total;
+                if !should_emit {
+                    return;
+                }
+                last_emitted_completed = completed;
+                last_emitted_total = total;
+                set_workspace_reindex_status(
+                    &app_handle_clone,
+                    true,
+                    &workspace_dir,
+                    completed,
+                    total,
+                    completed,
+                    "Indexing folders",
+                    None,
+                );
+            },
+        );
+
+        match result {
+            Ok(indexed_count) => {
+                let total = last_emitted_total.max(indexed_count as u64);
+                set_workspace_reindex_status(
+                    &app_handle_clone,
+                    false,
+                    &workspace_dir,
+                    total,
+                    total,
+                    indexed_count as u64,
+                    "Complete",
+                    None,
+                );
+            }
+            Err(err) => {
+                set_workspace_reindex_status(
+                    &app_handle_clone,
+                    false,
+                    &workspace_dir,
+                    last_emitted_completed,
+                    last_emitted_total,
+                    0,
+                    "Failed",
+                    Some(err),
+                );
+            }
+        }
+
+        WORKSPACE_REINDEX_RUNNING.store(false, Ordering::Relaxed);
+    });
+
+    Ok(true)
 }
 
 #[tauri::command]
@@ -4522,6 +4688,8 @@ pub fn run() {
             save_patient_keywords,
             is_patient_id_taken,
             reindex_patient_folders,
+            start_workspace_reindex,
+            get_workspace_reindex_status,
             search_patients,
             get_invalid_patient_folders,
             get_image_preview_kinds,

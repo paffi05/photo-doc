@@ -2426,12 +2426,31 @@ body{
   animation: setupSpin 0.95s linear infinite;
 }
 
+.setup-spinner-wrap{
+  width: 130px;
+  height: 130px;
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
 .setup-spinner-ring{
   stroke: #2563eb;
   stroke-width: 19;
   fill: none;
   stroke-linecap: round;
   stroke-dasharray: 420 220;
+}
+
+.setup-spinner-percent{
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 1.03rem;
+  font-weight: 700;
+  color: #2563eb;
+  line-height: 1;
 }
 
 @keyframes setupSpin {
