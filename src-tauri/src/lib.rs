@@ -262,6 +262,7 @@ struct InvalidPatientFoldersRow {
     invalid_count: u64,
     invalid_folders: Vec<String>,
     invalid_files: Vec<String>,
+    has_more: bool,
 }
 
 #[derive(Serialize)]
@@ -293,6 +294,19 @@ struct TreatmentFileRow {
     created_ms: u64,
     modified_ms: u64,
     is_image: bool,
+}
+
+#[derive(Serialize)]
+struct TreatmentFilePageRow {
+    total_count: u64,
+    has_more: bool,
+    rows: Vec<TreatmentFileRow>,
+}
+
+#[derive(Serialize)]
+struct PatientSearchPageRow {
+    rows: Vec<PatientSearchRow>,
+    has_more: bool,
 }
 
 #[derive(Serialize)]
@@ -351,10 +365,17 @@ struct PreviewCacheStatsRow {
     used_percent: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Default)]
 struct PreviewDebugCountsRow {
     db_image_count: u64,
     cache_image_count: u64,
+}
+
+#[derive(Clone, Default)]
+struct PreviewDebugCountsCacheEntry {
+    row: PreviewDebugCountsRow,
+    updated_ms: u64,
+    running: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -444,6 +465,9 @@ static LOCAL_CACHE_COPY_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static IMPORT_WIZARD_PREVIEW_PATH: OnceLock<Mutex<String>> = OnceLock::new();
 static WORKSPACE_REINDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static WORKSPACE_REINDEX_STATUS: OnceLock<Mutex<WorkspaceReindexStatus>> = OnceLock::new();
+static PREVIEW_DEBUG_COUNTS_CACHE: OnceLock<Mutex<HashMap<String, PreviewDebugCountsCacheEntry>>> =
+    OnceLock::new();
+static HEAVY_IO_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const PREVIEW_CACHE_DIM: u32 = 200;
 const PREVIEW_CACHE_QUALITY: u8 = 52;
@@ -454,6 +478,7 @@ const PREVIEW_PREFETCH_FOLDERS: usize = 3;
 const PREVIEW_PREFETCH_IMAGES_PER_FOLDER: usize = 40;
 const LOCAL_CACHE_COPY_DIR_NAME: &str = ".preview-cache";
 const IMPORT_PREVIEW_MICROBATCH_SIZE: usize = 2;
+const PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS: u64 = 15_000;
 const PREVIEW_PERF_GENTLE: &str = "gentle";
 const PREVIEW_PERF_AUTO: &str = "auto";
 const PREVIEW_PERF_FAST: &str = "fast";
@@ -710,6 +735,31 @@ fn workspace_reindex_status_store() -> &'static Mutex<WorkspaceReindexStatus> {
     WORKSPACE_REINDEX_STATUS.get_or_init(|| Mutex::new(WorkspaceReindexStatus::default()))
 }
 
+fn preview_debug_counts_store() -> &'static Mutex<HashMap<String, PreviewDebugCountsCacheEntry>> {
+    PREVIEW_DEBUG_COUNTS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct HeavyIoTaskGuard;
+
+impl HeavyIoTaskGuard {
+    fn acquire() -> Option<Self> {
+        if HEAVY_IO_TASK_RUNNING
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for HeavyIoTaskGuard {
+    fn drop(&mut self) {
+        HEAVY_IO_TASK_RUNNING.store(false, Ordering::Relaxed);
+    }
+}
+
 fn set_local_cache_copy_runtime_state(state: &str, last_sync_ms: Option<u64>) {
     if let Ok(mut runtime) = local_cache_copy_runtime().lock() {
         runtime.state = state.to_string();
@@ -759,6 +809,12 @@ fn paths_point_to_same_location(left: &Path, right: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => left == right,
     }
+}
+
+fn path_is_inside_dir(path: &Path, dir: &Path) -> bool {
+    let path_canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir_canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    path_canon.starts_with(&dir_canon)
 }
 
 fn import_wizard_cache_dir_is_protected(app_handle: &tauri::AppHandle, folder: &Path) -> bool {
@@ -2726,6 +2782,34 @@ fn list_treatment_files(
     patient_folder: String,
     treatment_folder: String,
 ) -> Result<Vec<TreatmentFileRow>, String> {
+    let mut offset = 0usize;
+    let mut out = Vec::new();
+    loop {
+        let page = list_treatment_files_page(
+            workspace_dir.clone(),
+            patient_folder.clone(),
+            treatment_folder.clone(),
+            offset,
+            500,
+        )?;
+        let batch_len = page.rows.len();
+        out.extend(page.rows);
+        if !page.has_more || batch_len < 1 {
+            break;
+        }
+        offset = offset.saturating_add(batch_len);
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn list_treatment_files_page(
+    workspace_dir: String,
+    patient_folder: String,
+    treatment_folder: String,
+    offset: usize,
+    limit: usize,
+) -> Result<TreatmentFilePageRow, String> {
     let workspace = PathBuf::from(workspace_dir.trim());
     if !workspace.exists() || !workspace.is_dir() {
         return Err("workspace directory does not exist".to_string());
@@ -2745,16 +2829,43 @@ fn list_treatment_files(
         return Err("treatment folder does not exist".to_string());
     }
 
-    let mut out = Vec::new();
+    let page_size = limit.clamp(1, 500);
+    let mut scanned_count = 0usize;
+    let mut out = Vec::with_capacity(page_size.saturating_add(1));
     for entry in fs::read_dir(&treatment_path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
-        if let Some(row) = treatment_file_row_from_entry(entry)? {
-            out.push(row);
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if !file_type.is_file() {
+            continue;
+        }
+        scanned_count = scanned_count.saturating_add(1);
+        if scanned_count <= offset {
+            continue;
+        }
+        let row = match treatment_file_row_from_entry(entry)? {
+            Some(v) => v,
+            None => continue,
+        };
+        out.push(row);
+        if out.len() > page_size {
+            break;
         }
     }
+    let has_more = out.len() > page_size;
+    if has_more {
+        out.truncate(page_size);
+    }
+    let total_count = if has_more {
+        offset.saturating_add(out.len()).saturating_add(1)
+    } else {
+        offset.saturating_add(out.len())
+    };
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    Ok(out)
+    Ok(TreatmentFilePageRow {
+        total_count: total_count as u64,
+        has_more,
+        rows: out,
+    })
 }
 
 #[tauri::command]
@@ -3475,9 +3586,23 @@ fn search_patients(
     workspace_dir: String,
     query: String,
 ) -> Result<Vec<PatientSearchRow>, String> {
+    let page = search_patients_page(app_handle, workspace_dir, query, 0, 250)?;
+    Ok(page.rows)
+}
+
+#[tauri::command]
+fn search_patients_page(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    query: String,
+    offset: usize,
+    limit: usize,
+) -> Result<PatientSearchPageRow, String> {
     let conn = open_db(&app_handle)?;
     let q = query.trim().to_lowercase();
     let mut rows_out: Vec<PatientSearchRow> = Vec::new();
+    let page_size = limit.clamp(1, 500);
+    let fetch_limit = page_size.saturating_add(1);
 
     if q.is_empty() {
         let mut stmt = conn
@@ -3485,12 +3610,13 @@ fn search_patients(
                 "SELECT folder_name, patient_id
                  FROM patient_index
                  WHERE workspace_dir = ?1
-                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE",
+                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+                 LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
-            .query_map(params![workspace_dir], |row| {
+            .query_map(params![workspace_dir, fetch_limit as i64, offset as i64], |row| {
                 Ok(PatientSearchRow {
                     folder_name: row.get::<_, String>(0)?,
                     patient_id: row.get::<_, String>(1)?,
@@ -3508,12 +3634,13 @@ fn search_patients(
                 "SELECT folder_name, patient_id
                  FROM patient_index
                  WHERE workspace_dir = ?1 AND search_text LIKE ?2
-                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE",
+                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+                 LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
-            .query_map(params![workspace_dir, pattern], |row| {
+            .query_map(params![workspace_dir, pattern, fetch_limit as i64, offset as i64], |row| {
                 Ok(PatientSearchRow {
                     folder_name: row.get::<_, String>(0)?,
                     patient_id: row.get::<_, String>(1)?,
@@ -3526,22 +3653,37 @@ fn search_patients(
         }
     }
 
-    Ok(rows_out)
+    let has_more = rows_out.len() > page_size;
+    if has_more {
+        rows_out.truncate(page_size);
+    }
+    Ok(PatientSearchPageRow { rows: rows_out, has_more })
 }
 
 #[tauri::command]
 fn get_invalid_patient_folders(workspace_dir: String) -> Result<InvalidPatientFoldersRow, String> {
+    get_invalid_patient_folders_page(workspace_dir, 0, 250)
+}
+
+#[tauri::command]
+fn get_invalid_patient_folders_page(
+    workspace_dir: String,
+    offset: usize,
+    limit: usize,
+) -> Result<InvalidPatientFoldersRow, String> {
     let workspace = PathBuf::from(workspace_dir.trim());
     if !workspace.exists() || !workspace.is_dir() {
         return Ok(InvalidPatientFoldersRow {
             invalid_count: 0,
             invalid_folders: Vec::new(),
             invalid_files: Vec::new(),
+            has_more: false,
         });
     }
 
-    let mut invalid_folders: Vec<String> = Vec::new();
-    let mut invalid_files: Vec<String> = Vec::new();
+    let page_size = limit.clamp(1, 500);
+    let mut seen_count = 0usize;
+    let mut rows: Vec<(bool, String)> = Vec::with_capacity(page_size.saturating_add(1));
     for entry in fs::read_dir(&workspace).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
@@ -3550,24 +3692,49 @@ fn get_invalid_patient_folders(workspace_dir: String) -> Result<InvalidPatientFo
             continue;
         }
         if file_type.is_dir() {
-            if !is_valid_patient_folder_name(&folder_name) {
-                invalid_folders.push(folder_name);
+            if is_valid_patient_folder_name(&folder_name) {
+                continue;
             }
-            continue;
+            seen_count = seen_count.saturating_add(1);
+            if seen_count <= offset {
+                continue;
+            }
+            rows.push((true, folder_name));
+        } else if file_type.is_file() {
+            seen_count = seen_count.saturating_add(1);
+            if seen_count <= offset {
+                continue;
+            }
+            rows.push((false, folder_name));
         }
-        if file_type.is_file() {
-            invalid_files.push(folder_name);
+        if rows.len() > page_size {
+            break;
+        }
+    }
+    let has_more = rows.len() > page_size;
+    if has_more {
+        rows.truncate(page_size);
+    }
+    let invalid_count = if has_more {
+        offset.saturating_add(rows.len()).saturating_add(1) as u64
+    } else {
+        offset.saturating_add(rows.len()) as u64
+    };
+    let mut shown_folders = Vec::new();
+    let mut shown_files = Vec::new();
+    for (is_folder, name) in rows {
+        if is_folder {
+            shown_folders.push(name);
+        } else {
+            shown_files.push(name);
         }
     }
 
-    invalid_folders.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    invalid_files.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    let invalid_count = (invalid_folders.len() + invalid_files.len()) as u64;
-
     Ok(InvalidPatientFoldersRow {
         invalid_count,
-        invalid_folders,
-        invalid_files,
+        invalid_folders: shown_folders,
+        invalid_files: shown_files,
+        has_more,
     })
 }
 
@@ -3968,6 +4135,7 @@ fn start_import_files(
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>();
     let target_dir_clone = target_dir.clone();
+    let workspace_root_for_delete_guard = workspace_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         struct ImportActiveGuard;
@@ -4028,7 +4196,10 @@ fn start_import_files(
             match fs::copy(&src_path, &dst_path) {
                 Ok(written) => {
                     if delete_origin {
-                        let _ = fs::remove_file(&src_path);
+                        // Safety guard: never delete originals that are inside workspace.
+                        if !path_is_inside_dir(&src_path, &workspace_root_for_delete_guard) {
+                            let _ = fs::remove_file(&src_path);
+                        }
                     }
 
                     if is_supported_preview_image(&dst_path) {
@@ -4214,10 +4385,17 @@ async fn sync_local_cache_copy(
     }
     LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
     PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    let Some(io_guard) = HeavyIoTaskGuard::acquire() else {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime));
+    };
 
     let app_handle_clone = app_handle.clone();
     let workspace_clone = workspace.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let _io_guard = io_guard;
         run_local_cache_copy_sync(&app_handle_clone, &workspace_clone, false)
     })
     .await
@@ -4332,11 +4510,61 @@ fn get_preview_debug_counts(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
 ) -> Result<PreviewDebugCountsRow, String> {
+    let workspace_key = workspace_dir.trim().to_string();
+    if workspace_key.is_empty() {
+        return Ok(PreviewDebugCountsRow::default());
+    }
+
+    let now = now_ms();
+    let mut row = PreviewDebugCountsRow::default();
+    let mut should_start_refresh = false;
+
+    if let Ok(mut cache) = preview_debug_counts_store().lock() {
+        let entry = cache
+            .entry(workspace_key.clone())
+            .or_insert_with(PreviewDebugCountsCacheEntry::default);
+        row = entry.row.clone();
+        let stale = now.saturating_sub(entry.updated_ms) > PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS;
+        if (entry.updated_ms == 0 || stale) && !entry.running {
+            entry.running = true;
+            should_start_refresh = true;
+        }
+    }
+
+    if should_start_refresh {
+        let app_handle_clone = app_handle.clone();
+        let workspace_key_clone = workspace_key.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            let result = if let Some(_io_guard) = HeavyIoTaskGuard::acquire() {
+                compute_preview_debug_counts(&app_handle_clone, &workspace_key_clone)
+            } else {
+                Err("heavy io busy".to_string())
+            };
+            if let Ok(mut cache) = preview_debug_counts_store().lock() {
+                let entry = cache
+                    .entry(workspace_key_clone.clone())
+                    .or_insert_with(PreviewDebugCountsCacheEntry::default);
+                if let Ok(next_row) = result {
+                    entry.row = next_row;
+                    entry.updated_ms = now_ms();
+                }
+                entry.running = false;
+            }
+        });
+    }
+
+    Ok(row)
+}
+
+fn compute_preview_debug_counts(
+    app_handle: &tauri::AppHandle,
+    workspace_dir: &str,
+) -> Result<PreviewDebugCountsRow, String> {
     let workspace = PathBuf::from(workspace_dir.trim());
     let mut db_image_count = 0_u64;
 
     if workspace.exists() && workspace.is_dir() {
-        let conn = open_db(&app_handle)?;
+        let conn = open_db(app_handle)?;
         let mut stmt = conn
             .prepare(
                 "SELECT patient_folder, folder_name
@@ -4371,9 +4599,9 @@ fn get_preview_debug_counts(
         }
     }
 
-    let cache_dir = get_active_preview_cache_dir(&app_handle);
+    let cache_dir = get_active_preview_cache_dir(app_handle);
     let cache_image_count = if workspace.exists() && workspace.is_dir() {
-        let conn = open_db(&app_handle)?;
+        let conn = open_db(app_handle)?;
         let mut mapped_count = 0_u64;
         let mut stmt = conn
             .prepare(
@@ -4506,6 +4734,10 @@ fn start_background_preview_fill(
     {
         return Ok(false);
     }
+    let Some(io_guard) = HeavyIoTaskGuard::acquire() else {
+        PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
+        return Ok(false);
+    };
     PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
     LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 
@@ -4515,85 +4747,119 @@ fn start_background_preview_fill(
     );
     let app_handle_clone = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
+        let _io_guard = io_guard;
         const BATCH_SIZE: usize = 18;
+        const QUEUE_CAPACITY: usize = 220;
         let workspace_dir_value = workspace.to_string_lossy().to_string();
-        let mut stack = vec![workspace];
-        let mut all_images: Vec<String> = Vec::new();
-
-        while let Some(dir) = stack.pop() {
-            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
-                break;
-            }
-            let entries = match fs::read_dir(&dir) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            for entry in entries {
-                let Ok(entry) = entry else {
-                    continue;
-                };
-                let path = entry.path();
-                let Ok(file_type) = entry.file_type() else {
-                    continue;
+        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(QUEUE_CAPACITY);
+        let discovered_total = Arc::new(AtomicU64::new(0));
+        let discovered_total_clone = Arc::clone(&discovered_total);
+        let producer = std::thread::spawn(move || {
+            let mut stack = vec![workspace];
+            while let Some(dir) = stack.pop() {
+                if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                    || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                {
+                    break;
+                }
+                let entries = match fs::read_dir(&dir) {
+                    Ok(v) => v,
+                    Err(_) => continue,
                 };
 
-                if file_type.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !file_type.is_file() || !is_supported_preview_image(&path) {
-                    continue;
-                }
+                for entry in entries {
+                    let Ok(entry) = entry else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
 
-                all_images.push(path.to_string_lossy().to_string());
+                    if file_type.is_dir() {
+                        stack.push(path);
+                        continue;
+                    }
+                    if !file_type.is_file() || !is_supported_preview_image(&path) {
+                        continue;
+                    }
+
+                    discovered_total_clone.fetch_add(1, Ordering::Relaxed);
+                    if tx.send(path.to_string_lossy().to_string()).is_err() {
+                        break;
+                    }
+                }
             }
-        }
+        });
 
-        let total = all_images.len() as u64;
         let mut completed = 0_u64;
-        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
-            PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
-            PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-            emit_preview_fill_progress(&app_handle_clone, false, "Paused", completed, total);
-            let _ = app_handle_clone.emit(
-                "preview-fill-status",
-                PreviewFillStatusEvent { running: false },
-            );
-            return;
-        } else if total > 0 {
-            emit_preview_fill_progress(
-                &app_handle_clone,
-                true,
-                format!("Creating new previews ({completed}/{total})"),
-                completed,
-                total,
-            );
-        } else {
-            emit_preview_fill_progress(&app_handle_clone, true, "Creating new previews (0/0)", 0, 0);
-        }
+        let mut producer_finished = false;
+        let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
+        let mut total_hint = 0_u64;
+        emit_preview_fill_progress(&app_handle_clone, true, "Creating new previews (0/0)", 0, 0);
 
-        for chunk in all_images.chunks(BATCH_SIZE) {
-            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+        loop {
+            if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            {
                 break;
             }
-            let batch: Vec<String> = chunk.to_vec();
-            let _ = resolve_cached_previews(&app_handle_clone, &batch, false, true);
-            completed = completed.saturating_add(batch.len() as u64);
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(path) => batch.push(path),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    producer_finished = true;
+                }
+            }
+
+            if batch.len() >= BATCH_SIZE || (producer_finished && !batch.is_empty()) {
+                let chunk = std::mem::take(&mut batch);
+                let chunk_len = chunk.len() as u64;
+                let _ = resolve_cached_previews(&app_handle_clone, &chunk, false, true);
+                completed = completed.saturating_add(chunk_len);
+                let discovered_now = discovered_total.load(Ordering::Relaxed);
+                total_hint = total_hint.max(discovered_now).max(completed);
+                emit_preview_fill_progress(
+                    &app_handle_clone,
+                    true,
+                    format!("Creating new previews ({completed}/{total_hint})"),
+                    completed,
+                    total_hint,
+                );
+                std::thread::sleep(Duration::from_millis(16));
+            }
+
+            if producer_finished && batch.is_empty() {
+                break;
+            }
+        }
+
+        let _ = producer.join();
+        if !batch.is_empty() {
+            let chunk = std::mem::take(&mut batch);
+            let chunk_len = chunk.len() as u64;
+            let _ = resolve_cached_previews(&app_handle_clone, &chunk, false, true);
+            completed = completed.saturating_add(chunk_len);
+            let discovered_now = discovered_total.load(Ordering::Relaxed);
+            total_hint = total_hint.max(discovered_now).max(completed);
             emit_preview_fill_progress(
                 &app_handle_clone,
                 true,
-                format!("Creating new previews ({completed}/{total})"),
+                format!("Creating new previews ({completed}/{total_hint})"),
                 completed,
-                total,
+                total_hint,
             );
-            std::thread::sleep(Duration::from_millis(24));
         }
 
-        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed) {
+        let final_total = total_hint
+            .max(discovered_total.load(Ordering::Relaxed))
+            .max(completed);
+        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
             PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
             PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-            emit_preview_fill_progress(&app_handle_clone, false, "Paused", completed, total);
+            emit_preview_fill_progress(&app_handle_clone, false, "Paused", completed, final_total);
             let _ = app_handle_clone.emit(
                 "preview-fill-status",
                 PreviewFillStatusEvent { running: false },
@@ -4610,18 +4876,18 @@ fn start_background_preview_fill(
                 true,
                 "Cleanup on hold (import in progress)",
                 completed,
-                total,
+                final_total,
             );
         } else {
-            emit_preview_fill_progress(&app_handle_clone, true, "Removing old files", completed, total);
+            emit_preview_fill_progress(&app_handle_clone, true, "Removing old files", completed, final_total);
             run_preview_cache_cleanup(&app_handle_clone);
-            emit_preview_fill_progress(&app_handle_clone, true, "Clearing duplicates", completed, total);
+            emit_preview_fill_progress(&app_handle_clone, true, "Clearing duplicates", completed, final_total);
             run_preview_cache_cleanup(&app_handle_clone);
         }
 
         PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
         PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-        emit_preview_fill_progress(&app_handle_clone, false, "Up to date", completed, total);
+        emit_preview_fill_progress(&app_handle_clone, false, "Up to date", completed, final_total);
         let _ = app_handle_clone.emit(
             "preview-fill-status",
             PreviewFillStatusEvent { running: false },
@@ -4681,6 +4947,7 @@ pub fn run() {
             list_patient_timeline_entries,
             list_patient_overview,
             list_treatment_files,
+            list_treatment_files_page,
             create_patient_with_metadata,
             save_patient_metadata,
             save_patient_id,
@@ -4691,7 +4958,9 @@ pub fn run() {
             start_workspace_reindex,
             get_workspace_reindex_status,
             search_patients,
+            search_patients_page,
             get_invalid_patient_folders,
+            get_invalid_patient_folders_page,
             get_image_preview_kinds,
             get_image_previews,
             get_quick_image_previews,

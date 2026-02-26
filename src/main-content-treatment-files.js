@@ -10,6 +10,7 @@ const FILL_RUNNING_PREVIEW_CONCURRENCY = 2;
 const FILL_RUNNING_QUICK_BATCH_SIZE = 6;
 const FALLBACK_RECOVERY_BATCH_SIZE = 20;
 const THUMB_RECOVERY_RETRY_DELAYS_MS = [350, 900, 1800];
+const FILE_LIST_PAGE_SIZE = 220;
 
 function normalizePath(pathLike = "") {
   if (typeof pathLike === "string") return pathLike;
@@ -121,6 +122,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
       <div class="treatment-files-section-title">Other Files</div>
       <div class="treatment-files-other-list"></div>
     </div>
+    <button type="button" class="small-btn treatment-files-load-more" hidden>Load more</button>
   `;
   container.appendChild(panel);
 
@@ -139,6 +141,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
   const imagesGridEl = panel.querySelector(".treatment-files-images-grid");
   const otherWrapEl = panel.querySelector(".treatment-files-other-wrap");
   const otherListEl = panel.querySelector(".treatment-files-other-list");
+  const loadMoreBtn = panel.querySelector(".treatment-files-load-more");
 
   let activeContextKey = "";
   let activeContext = { workspaceDir: "", patientFolder: "", treatmentFolder: "" };
@@ -149,6 +152,8 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
   const cacheWarmupRequested = new Set();
   let activeCardsByPath = new Map();
   let activeImageFiles = [];
+  let activeLoadedFiles = [];
+  let activeFileOffset = 0;
 
   const VIEW_MODE_STORAGE_KEY = "mpm.treatmentFilesViewMode";
   const normalizeViewMode = (value) => (value === "list" ? "list" : "tile");
@@ -236,6 +241,8 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     cacheWarmupRequested.clear();
     activeCardsByPath = new Map();
     activeImageFiles = [];
+    activeLoadedFiles = [];
+    activeFileOffset = 0;
     panel.hidden = true;
     titleEl.textContent = "Treatment Files";
     folderEl.textContent = "";
@@ -247,6 +254,8 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
     otherWrapEl.hidden = true;
+    loadMoreBtn.hidden = true;
+    loadMoreBtn.disabled = false;
     foldersOverviewGridEl.innerHTML = "";
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
@@ -266,6 +275,9 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
     otherWrapEl.hidden = true;
+    loadMoreBtn.hidden = true;
+    loadMoreBtn.disabled = false;
+    loadMoreBtn.onclick = null;
     foldersOverviewGridEl.innerHTML = "";
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
@@ -375,6 +387,9 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
     otherWrapEl.hidden = true;
+    loadMoreBtn.hidden = true;
+    loadMoreBtn.disabled = false;
+    loadMoreBtn.onclick = null;
     foldersOverviewGridEl.innerHTML = "";
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
@@ -814,7 +829,10 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     await recoverFallbackThumbs(cardsByPath, imageFiles, requestId);
   }
 
-  async function setContext({ workspaceDir = "", patientFolder = "", treatmentFolder = "" } = {}) {
+  async function setContext(
+    { workspaceDir = "", patientFolder = "", treatmentFolder = "" } = {},
+    options = {}
+  ) {
     const w = String(workspaceDir ?? "").trim();
     const p = String(patientFolder ?? "").trim();
     const t = String(treatmentFolder ?? "").trim();
@@ -825,20 +843,36 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     }
 
     const contextKey = `${w}::${p}::${t}`;
+    const append = Boolean(options?.append) && contextKey === activeContextKey;
+    if (!append && contextKey !== activeContextKey) {
+      activeLoadedFiles = [];
+      activeFileOffset = 0;
+    }
     activeContext = { workspaceDir: w, patientFolder: p, treatmentFolder: t };
     activeContextKey = contextKey;
     const requestId = ++activeRequestId;
-    setLoadingState(t);
+    if (!append) {
+      setLoadingState(t);
+    }
 
     let files = [];
+    let totalCount = 0;
+    let hasMore = false;
     try {
-      const rows = await invoke("list_treatment_files", {
+      const page = await invoke("list_treatment_files_page", {
         workspaceDir: w,
         patientFolder: p,
         treatmentFolder: t,
+        offset: append ? activeFileOffset : 0,
+        limit: FILE_LIST_PAGE_SIZE,
       });
       if (requestId !== activeRequestId || contextKey !== activeContextKey) return;
-      files = Array.isArray(rows) ? rows : [];
+      const pageRows = Array.isArray(page?.rows) ? page.rows : [];
+      files = append ? [...activeLoadedFiles, ...pageRows] : pageRows;
+      totalCount = Number(page?.total_count ?? page?.totalCount ?? files.length) || files.length;
+      hasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
+      activeLoadedFiles = files;
+      activeFileOffset = files.length;
     } catch {
       if (requestId !== activeRequestId) return;
       loadingEl.hidden = true;
@@ -852,7 +886,8 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
 
     loadingEl.hidden = true;
     emptyEl.hidden = files.length > 0;
-    countsEl.textContent = `${imageFiles.length} images, ${otherFiles.length} other files`;
+    const totalLabel = hasMore ? `${totalCount}+` : `${totalCount}`;
+    countsEl.textContent = `${imageFiles.length} images, ${otherFiles.length} other files (loaded ${files.length}/${totalLabel})`;
     const useListView = currentViewMode === "list";
     listWrapEl.hidden = !useListView || files.length < 1;
     imagesWrapEl.hidden = useListView || imageFiles.length < 1;
@@ -863,6 +898,17 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     otherListEl.innerHTML = "";
 
     if (files.length < 1) return;
+
+    loadMoreBtn.hidden = !hasMore;
+    loadMoreBtn.disabled = false;
+    if (hasMore) {
+      loadMoreBtn.onclick = () => {
+        loadMoreBtn.disabled = true;
+        void setContext(activeContext, { append: true });
+      };
+    } else {
+      loadMoreBtn.onclick = null;
+    }
 
     const cardsByPath = new Map();
     if (useListView) {

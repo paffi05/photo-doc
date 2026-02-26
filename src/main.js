@@ -12,6 +12,7 @@ import { initMainContent } from "./main-content";
 // ---------- DOM ----------
 const onboardingView = document.getElementById("onboardingView");
 const appView = document.getElementById("appView");
+const startupView = document.getElementById("startupView");
 
 const pickBtn = document.getElementById("pickWorkspaceBtn");
 const pickIcon = document.getElementById("pickWorkspaceIcon");
@@ -59,6 +60,7 @@ const deleteLocalCacheBtn = document.getElementById("deleteLocalCacheBtn");
 const deleteLocalCacheRow = document.getElementById("deleteLocalCacheRow");
 const patientSearchInput = document.getElementById("patientSearchInput");
 const patientList = document.getElementById("patientList");
+const patientListWrap = document.querySelector(".patient-list-wrap");
 const addPatientForm = document.getElementById("addPatientForm");
 const newPatientLastName = document.getElementById("newPatientLastName");
 const newPatientFirstName = document.getElementById("newPatientFirstName");
@@ -136,7 +138,7 @@ function setAddPatientPanelExpanded(expanded) {
 function renderInvalidPatientFoldersPanel() {
   if (!invalidPatientFoldersPanel || !invalidPatientFoldersList) return;
   const hasInvalidItems = Boolean(currentWorkspaceDir) &&
-    (invalidPatientFolderNames.length > 0 || invalidPatientFileNames.length > 0);
+    invalidPatientFolderCount > 0;
   const expanded = hasInvalidItems && invalidPatientFoldersPanelExpanded;
 
   setInvalidPanelExpanded(expanded);
@@ -170,9 +172,23 @@ function renderInvalidPatientFoldersPanel() {
     `;
     invalidPatientFoldersList.appendChild(item);
   }
+
+  if (invalidPatientHasMore) {
+    const action = document.createElement("li");
+    action.className = "invalid-patient-folder-item";
+    const moreBtn = document.createElement("button");
+    moreBtn.type = "button";
+    moreBtn.className = "small-btn";
+    moreBtn.textContent = "Load more";
+    moreBtn.addEventListener("click", () => {
+      void refreshInvalidPatientFolderWarning(currentWorkspaceDir, { append: true });
+    });
+    action.appendChild(moreBtn);
+    invalidPatientFoldersList.appendChild(action);
+  }
 }
 
-function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames = []) {
+function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames = [], hasMore = false) {
   invalidPatientFolderCount = Math.max(0, Number(count) || 0);
   invalidPatientFolderNames = Array.isArray(folderNames)
     ? folderNames.filter((name) => typeof name === "string" && name.trim().length > 0)
@@ -180,11 +196,13 @@ function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames
   invalidPatientFileNames = Array.isArray(fileNames)
     ? fileNames.filter((name) => typeof name === "string" && name.trim().length > 0)
     : [];
+  invalidPatientHasMore = Boolean(hasMore);
 
   if (!invalidPatientFoldersBtn) return;
-  const totalIssues = invalidPatientFolderNames.length + invalidPatientFileNames.length;
+  const totalIssues = invalidPatientFolderCount;
+  const totalLabel = invalidPatientHasMore ? `${totalIssues}+` : `${totalIssues}`;
   if (invalidPatientFoldersTitle) {
-    invalidPatientFoldersTitle.textContent = `${totalIssues} invalid folders or Files`;
+    invalidPatientFoldersTitle.textContent = `${totalLabel} invalid folders or Files`;
   }
   const showWarning = Boolean(currentWorkspaceDir) && totalIssues > 0;
   invalidPatientFoldersBtn.hidden = !showWarning;
@@ -201,25 +219,35 @@ function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames
   renderInvalidPatientFoldersPanel();
 }
 
-async function refreshInvalidPatientFolderWarning(workspaceDir = currentWorkspaceDir) {
+async function refreshInvalidPatientFolderWarning(workspaceDir = currentWorkspaceDir, { append = false } = {}) {
   if (!workspaceDir) {
-    setInvalidPatientFolderWarningUi(0, [], []);
+    invalidPatientOffset = 0;
+    setInvalidPatientFolderWarningUi(0, [], [], false);
     return 0;
   }
+  const offset = append ? invalidPatientOffset : 0;
   try {
-    const row = await invoke("get_invalid_patient_folders", { workspaceDir });
+    const row = await invoke("get_invalid_patient_folders_page", {
+      workspaceDir,
+      offset,
+      limit: INVALID_ITEMS_PAGE_SIZE,
+    });
     const count = Number(row?.invalid_count ?? row?.invalidCount ?? 0) || 0;
-    const invalidFolders = Array.isArray(row?.invalid_folders ?? row?.invalidFolders)
+    const pageFolders = Array.isArray(row?.invalid_folders ?? row?.invalidFolders)
       ? (row?.invalid_folders ?? row?.invalidFolders)
       : [];
-    const invalidFiles = Array.isArray(row?.invalid_files ?? row?.invalidFiles)
+    const pageFiles = Array.isArray(row?.invalid_files ?? row?.invalidFiles)
       ? (row?.invalid_files ?? row?.invalidFiles)
       : [];
-    setInvalidPatientFolderWarningUi(count, invalidFolders, invalidFiles);
+    const hasMore = Boolean(row?.has_more ?? row?.hasMore ?? false);
+    const invalidFolders = append ? [...invalidPatientFolderNames, ...pageFolders] : pageFolders;
+    const invalidFiles = append ? [...invalidPatientFileNames, ...pageFiles] : pageFiles;
+    invalidPatientOffset = invalidFolders.length + invalidFiles.length;
+    setInvalidPatientFolderWarningUi(count, invalidFolders, invalidFiles, hasMore);
     return count;
   } catch (err) {
-    console.error("get_invalid_patient_folders failed:", err);
-    setInvalidPatientFolderWarningUi(0, [], []);
+    console.error("get_invalid_patient_folders_page failed:", err);
+    setInvalidPatientFolderWarningUi(0, [], [], false);
     return 0;
   }
 }
@@ -251,6 +279,14 @@ function normalizeDialogPathSelection(selected) {
   return path;
 }
 
+function isLikelySlowWorkspacePath(path = "") {
+  const p = String(path ?? "").trim();
+  if (!p) return false;
+  if (p.startsWith("\\\\") || p.startsWith("//")) return true;
+  if (p.startsWith("/Volumes/")) return true;
+  return false;
+}
+
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -278,6 +314,8 @@ let databaseDeleteLocked = false;
 let invalidPatientFolderCount = 0;
 let invalidPatientFolderNames = [];
 let invalidPatientFileNames = [];
+let invalidPatientHasMore = false;
+let invalidPatientOffset = 0;
 let invalidPatientFoldersPanelExpanded = false;
 let invalidPanelHideTimerId = null;
 let patientSearchDebounceId = null;
@@ -304,15 +342,15 @@ let localCacheStatusState = "up_to_date";
 let localCacheStatusRunning = false;
 let localCacheFolderExists = false;
 let localCacheFileCount = 0;
-let creatingProgressBaseCacheCount = null;
-let creatingProgressExpectedCount = 0;
+let previewFillIdleTimerId = null;
+let previewFillLastAttemptMs = 0;
 let selectedPatient = null;
 let selectedPatientId = "";
 let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "0.9.1";
+let systemAppVersion = "0.9.4";
 let systemUpdateBusy = false;
 let systemUpdateCheckedAtMs = null;
 let importWizardDir = null;
@@ -334,21 +372,31 @@ let lastRenderedPatientEntries = [];
 let lastRenderedFilterText = "";
 let isPatientListLoading = false;
 let patientListRenderToken = 0;
+let patientSearchOffset = 0;
+let patientSearchHasMore = false;
+let patientSearchInFlight = false;
+let activePatientSearchQuery = "";
+let slowWorkspaceMode = false;
 
 const DEBUG_PREF_KEY = "showFrontendDebug";
 const TIMELINE_NAMES_PREF_KEY = "alwaysShowTimelineNames";
 const DEFAULT_CACHE_SIZE_GB = 5;
 const DEFAULT_PREVIEW_PERFORMANCE_MODE = "auto";
 const INDEXING_STATUS_POLL_MS = 2500;
+const INDEXING_STATUS_POLL_SLOW_MS = 5000;
 const LOCAL_CACHE_STATUS_POLL_MS = 3000;
 const MIN_MANUAL_CACHE_STATUS_MS = 1500;
 const PANEL_ANIM_MS = 230;
 const PATIENT_LIST_RENDER_BATCH_SIZE = 160;
+const PATIENT_LIST_PAGE_SIZE = 250;
+const INVALID_ITEMS_PAGE_SIZE = 200;
 const WORKSPACE_REINDEX_START_TIMEOUT_MS = 6000;
 const WORKSPACE_REINDEX_STATUS_TIMEOUT_MS = 3500;
 const WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS = 45000;
 const WORKSPACE_LOAD_OVERALL_TIMEOUT_MS = 90000;
 const SEARCH_PATIENTS_TIMEOUT_MS = 20000;
+const PREVIEW_FILL_IDLE_DELAY_MS = 2600;
+const PREVIEW_FILL_ATTEMPT_COOLDOWN_MS = 12000;
 const CACHE_RELOAD_ICON_UPDATE = `
   <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
     <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -516,10 +564,10 @@ function setDebugOnlyRowsVisibility(show) {
 function readDebugVisibilityPref() {
   try {
     const raw = localStorage.getItem(DEBUG_PREF_KEY);
-    if (raw === null) return true;
+    if (raw === null) return false;
     return raw === "true";
   } catch {
-    return true;
+    return false;
   }
 }
 
@@ -761,11 +809,40 @@ function setIndexingCustomSuffixUi(suffix = "") {
 }
 
 function shouldShowIndexingDebugCounts() {
-  return Boolean(currentWorkspaceDir);
+  return Boolean(currentWorkspaceDir) && Boolean(showFrontendDebugToggle?.checked);
 }
 
 function hasActiveImportJobs() {
   return importingPatientJobCounts.size > 0;
+}
+
+function isIdleForBackgroundPreviewFill() {
+  if (!currentWorkspaceDir) return false;
+  if (slowWorkspaceMode) return false;
+  if (isWorkspaceSetupInProgress) return false;
+  if (isDbUpdating || isPatientListLoading || patientSearchInFlight) return false;
+  if (importWizardIsImporting || hasActiveImportJobs()) return false;
+  if (isPreviewFillRunning || isPreviewFillStopInFlight || previewFillPausedByUser) return false;
+  if (isStoppingCacheProcesses || isCacheMaintenanceRunning) return false;
+  if (localCacheSyncInFlight || localCacheStatusRunning) return false;
+  return true;
+}
+
+function clearPreviewFillIdleStartTimer() {
+  if (previewFillIdleTimerId === null) return;
+  clearTimeout(previewFillIdleTimerId);
+  previewFillIdleTimerId = null;
+}
+
+function scheduleBackgroundPreviewFillWhenIdle() {
+  if (previewFillIdleTimerId !== null) return;
+  if (!currentWorkspaceDir) return;
+  if (previewFillPausedByUser || cacheMarkedNotSynchronized) return;
+
+  previewFillIdleTimerId = setTimeout(() => {
+    previewFillIdleTimerId = null;
+    void ensureBackgroundPreviewFill();
+  }, PREVIEW_FILL_IDLE_DELAY_MS);
 }
 
 function setCacheReloadButtonMode(mode = "update") {
@@ -820,16 +897,9 @@ async function refreshIndexingStatus() {
   if (!currentWorkspaceDir || indexingStatusInFlight) return;
   indexingStatusInFlight = true;
   try {
-    const [runningRaw, counts] = await Promise.all([
-      invoke("get_preview_fill_status"),
-      invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir }),
-    ]);
-
+    const runningRaw = await invoke("get_preview_fill_status");
     const running = Boolean(runningRaw);
-    const dbImageCount = Number(counts?.db_image_count ?? counts?.dbImageCount ?? 0) || 0;
-    const cacheImageCount = Number(counts?.cache_image_count ?? counts?.cacheImageCount ?? 0) || 0;
     const importingActive = hasActiveImportJobs();
-    const pendingCacheItems = dbImageCount > cacheImageCount;
     const manualHoldActive = isCacheMaintenanceRunning;
     const progressText = previewFillProgressMessage.toLowerCase();
     const organizingByBackend =
@@ -846,11 +916,8 @@ async function refreshIndexingStatus() {
       localCacheStatusRunning ||
       localCacheSyncInFlight;
     const creatingActive =
-      creatingByManual ||
-      pendingCacheItems ||
-      importingActive ||
-      (running && !organizingByBackend);
-    const cacheWorkActive = running || importingActive || pendingCacheItems || manualHoldActive;
+      creatingByManual || importingActive || (running && !organizingByBackend);
+    const cacheWorkActive = running || importingActive || manualHoldActive;
     const localCopySyncActive = keepLocalCacheCopyEnabled && (localCacheStatusRunning || localCacheSyncInFlight);
     const localCopyStatusMessage = formatLocalCacheCopyStatusText(localCacheStatusState);
 
@@ -859,58 +926,55 @@ async function refreshIndexingStatus() {
       if (anyCacheTaskRunning) {
         setIndexingProgressUi({ running: true, message: "Stopping processes ..." });
         setIndexingCustomSuffixUi("");
-        setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+        setIndexingDebugCountsUi(0, 0, { show: false });
       } else {
         isStoppingCacheProcesses = false;
         cacheMarkedNotSynchronized = true;
         setIndexingProgressUi({ running: false, message: "Not synchronized" });
         setIndexingCustomSuffixUi("");
-        setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+        setIndexingDebugCountsUi(0, 0, { show: false });
       }
     } else if (cacheMarkedNotSynchronized && !anyCacheTaskRunning) {
       setIndexingProgressUi({ running: false, message: "Not synchronized" });
       setIndexingCustomSuffixUi("");
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+      setIndexingDebugCountsUi(0, 0, { show: false });
     } else if (creatingActive) {
-      if (creatingProgressBaseCacheCount === null) {
-        creatingProgressBaseCacheCount = cacheImageCount;
-        creatingProgressExpectedCount = Math.max(0, dbImageCount - cacheImageCount);
-      } else {
-        creatingProgressExpectedCount = Math.max(
-          creatingProgressExpectedCount,
-          Math.max(0, dbImageCount - creatingProgressBaseCacheCount)
-        );
-      }
-      const createdNow = Math.max(0, cacheImageCount - creatingProgressBaseCacheCount);
-      const expectedNow = Math.max(createdNow, creatingProgressExpectedCount);
+      const match = previewFillProgressMessage.match(/\((\d+)\s*\/\s*(\d+)\)/);
+      const createdNow = match ? (Number(match[1]) || 0) : 0;
+      const expectedNow = match ? (Number(match[2]) || 0) : 0;
       setIndexingProgressUi({ running: true, message: "Creating Previews" });
-      setIndexingCustomSuffixUi(`(${createdNow}/${expectedNow})`);
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+      setIndexingCustomSuffixUi(expectedNow > 0 ? `(${createdNow}/${expectedNow})` : "");
+      setIndexingDebugCountsUi(0, 0, { show: false });
       void refreshCacheUsageUi();
     } else if (localCopySyncActive && localCopyStatusMessage) {
       setIndexingProgressUi({ running: true, message: localCopyStatusMessage });
       setIndexingCustomSuffixUi("");
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+      setIndexingDebugCountsUi(0, 0, { show: false });
     } else if (paused) {
       setIndexingProgressUi({ running: false, message: "Paused" });
       setIndexingCustomSuffixUi("");
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+      setIndexingDebugCountsUi(0, 0, { show: false });
     } else if (!cacheWorkActive) {
-      creatingProgressBaseCacheCount = null;
-      creatingProgressExpectedCount = 0;
       setIndexingProgressUi({ running: false, message: "Up to date" });
       setIndexingCustomSuffixUi("");
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: shouldShowIndexingDebugCounts() });
+      if (shouldShowIndexingDebugCounts()) {
+        void refreshIndexingDebugCounts();
+      } else {
+        setIndexingDebugCountsUi(0, 0, { show: false });
+      }
+      scheduleBackgroundPreviewFillWhenIdle();
     } else if (organizingActive) {
-      creatingProgressBaseCacheCount = null;
-      creatingProgressExpectedCount = 0;
       setIndexingProgressUi({ running: true, message: "Organizing Cache ..." });
       setIndexingCustomSuffixUi("");
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: false });
+      setIndexingDebugCountsUi(0, 0, { show: false });
     } else {
       setIndexingProgressUi({ running: true, message: "Creating Previews" });
       setIndexingCustomSuffixUi("");
-      setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: shouldShowIndexingDebugCounts() });
+      if (shouldShowIndexingDebugCounts()) {
+        void refreshIndexingDebugCounts();
+      } else {
+        setIndexingDebugCountsUi(0, 0, { show: false });
+      }
     }
   } catch (err) {
     console.error("refreshIndexingStatus failed:", err);
@@ -921,9 +985,10 @@ async function refreshIndexingStatus() {
 
 function startIndexingStatusPolling() {
   if (indexingLivePollIntervalId !== null) return;
+  const intervalMs = slowWorkspaceMode ? INDEXING_STATUS_POLL_SLOW_MS : INDEXING_STATUS_POLL_MS;
   indexingLivePollIntervalId = setInterval(() => {
     void refreshIndexingStatus();
-  }, INDEXING_STATUS_POLL_MS);
+  }, intervalMs);
 }
 
 function stopIndexingStatusPolling() {
@@ -948,6 +1013,21 @@ function setPreviewFillRunning(running) {
 
 async function ensureBackgroundPreviewFill(cacheStats = null) {
   if (!currentWorkspaceDir || isPreviewFillRunning || previewFillPausedByUser) return;
+  if (!isIdleForBackgroundPreviewFill()) {
+    scheduleBackgroundPreviewFillWhenIdle();
+    return;
+  }
+  const now = Date.now();
+  if (now - previewFillLastAttemptMs < PREVIEW_FILL_ATTEMPT_COOLDOWN_MS) {
+    scheduleBackgroundPreviewFillWhenIdle();
+    return;
+  }
+  previewFillLastAttemptMs = now;
+  if (slowWorkspaceMode) {
+    setIndexingProgressUi({ running: false, message: "Not synchronized" });
+    setIndexingCustomSuffixUi("");
+    return;
+  }
   try {
     cacheMarkedNotSynchronized = false;
     const counts = await invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir });
@@ -961,6 +1041,7 @@ async function ensureBackgroundPreviewFill(cacheStats = null) {
         setPreviewFillRunning(true);
       } else {
         setIndexingProgressUi({ running: false, message: "Up to date" });
+        scheduleBackgroundPreviewFillWhenIdle();
       }
     } else {
       setIndexingProgressUi({ running: true, message: "Organizing Cache ..." });
@@ -972,6 +1053,7 @@ async function ensureBackgroundPreviewFill(cacheStats = null) {
   } catch (err) {
     console.error("startup preview check failed:", err);
     setIndexingProgressUi({ running: false, message: "Up to date" });
+    scheduleBackgroundPreviewFillWhenIdle();
   }
 }
 
@@ -1670,12 +1752,23 @@ function setPatientListLoading(loading) {
   renderPatientList(lastRenderedPatientEntries, lastRenderedFilterText);
 }
 
-function buildPatientListItem(entry, entries, filterText) {
+function updatePatientSelectionInList() {
+  if (!patientList) return;
+  const selected = String(selectedPatient ?? "").trim();
+  const items = patientList.querySelectorAll(".patient-item");
+  for (const item of items) {
+    const isSelected = selected && item.dataset.folderName === selected;
+    item.classList.toggle("selected", Boolean(isSelected));
+  }
+}
+
+function buildPatientListItem(entry) {
   const { folderName, patientId } = normalizePatientEntry(entry);
   if (!folderName) return null;
   const { lastName, firstName } = splitPatientName(folderName);
   const item = document.createElement("li");
   item.className = "patient-item";
+  item.dataset.folderName = folderName;
   const wizardLockActive = Boolean(importWizardLinkedPatient && String(importWizardLinkedPatient).trim());
   const isWizardTargetPatient = wizardLockActive && folderName === importWizardLinkedPatient;
   item.draggable = true;
@@ -1725,7 +1818,7 @@ function buildPatientListItem(entry, entries, filterText) {
     selectedPatient = folderName;
     selectedPatientId = patientId;
     mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
-    renderPatientList(entries, filterText);
+    updatePatientSelectionInList();
     updateImportWizardButtonState();
     sidebarLayout.scheduleAutoHidePatientSidebar();
   });
@@ -1772,6 +1865,23 @@ function buildPatientListItem(entry, entries, filterText) {
   return item;
 }
 
+function appendPatientListRows(rows) {
+  if (!patientList || !Array.isArray(rows) || rows.length < 1) return;
+  if (patientList.classList.contains("is-empty-state")) {
+    patientList.classList.remove("is-empty-state");
+  }
+  if (patientList.children.length === 1 && patientList.firstElementChild?.classList.contains("patient-empty")) {
+    patientList.innerHTML = "";
+  }
+
+  const fragment = document.createDocumentFragment();
+  for (const row of rows) {
+    const item = buildPatientListItem(row);
+    if (item) fragment.appendChild(item);
+  }
+  patientList.appendChild(fragment);
+}
+
 function renderPatientList(entries, filterText = "") {
   if (!patientList) return;
   const renderToken = ++patientListRenderToken;
@@ -1809,7 +1919,7 @@ function renderPatientList(entries, filterText = "") {
     const fragment = document.createDocumentFragment();
     const nextEnd = Math.min(entries.length, index + PATIENT_LIST_RENDER_BATCH_SIZE);
     while (index < nextEnd) {
-      const item = buildPatientListItem(entries[index], entries, filterText);
+      const item = buildPatientListItem(entries[index]);
       index += 1;
       if (item) fragment.appendChild(item);
     }
@@ -1821,27 +1931,53 @@ function renderPatientList(entries, filterText = "") {
   appendBatch();
 }
 
-async function searchPatients(query = "") {
+async function searchPatients(query = "", { append = false } = {}) {
   if (!currentWorkspaceDir) {
     renderPatientList([], query.trim());
     return;
   }
+  if (patientSearchInFlight) return;
+
+  const normalizedQuery = String(query ?? "").trim();
+  if (!append) {
+    patientSearchOffset = 0;
+    patientSearchHasMore = false;
+    activePatientSearchQuery = normalizedQuery;
+  } else {
+    if (!patientSearchHasMore) return;
+    if (normalizedQuery !== activePatientSearchQuery) return;
+  }
 
   try {
-    const patients = await withTimeout(
-      invoke("search_patients", {
+    patientSearchInFlight = true;
+    const page = await withTimeout(
+      invoke("search_patients_page", {
         workspaceDir: currentWorkspaceDir,
-        query,
+        query: normalizedQuery,
+        offset: patientSearchOffset,
+        limit: PATIENT_LIST_PAGE_SIZE,
       }),
       SEARCH_PATIENTS_TIMEOUT_MS,
-      "search_patients",
+      "search_patients_page",
     );
-    const entries = Array.isArray(patients) ? patients : [];
-    renderPatientList(entries, query.trim());
+    const rows = Array.isArray(page?.rows) ? page.rows : [];
+    patientSearchHasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
+    patientSearchOffset += rows.length;
+    if (append) {
+      const entries = [...lastRenderedPatientEntries, ...rows];
+      lastRenderedPatientEntries = entries;
+      lastRenderedFilterText = normalizedQuery;
+      appendPatientListRows(rows);
+      updatePatientSelectionInList();
+    } else {
+      renderPatientList(rows, normalizedQuery);
+    }
   } catch (err) {
-    console.error("search_patients failed:", err);
+    console.error("search_patients_page failed:", err);
     // Keep app responsive even if patient query is slow or fails.
-    renderPatientList(lastRenderedPatientEntries, query.trim());
+    renderPatientList(lastRenderedPatientEntries, normalizedQuery);
+  } finally {
+    patientSearchInFlight = false;
   }
 }
 
@@ -1851,6 +1987,8 @@ async function loadPatients(workspaceDir, options = {}) {
     ? options.onReindexProgress
     : null;
   currentWorkspaceDir = workspaceDir;
+  slowWorkspaceMode = isLikelySlowWorkspacePath(workspaceDir);
+  invalidPatientOffset = 0;
   const query = patientSearchInput?.value ?? "";
   setPatientListLoading(true);
   setDbStatusUpdating();
@@ -1976,6 +2114,7 @@ async function loadPatients(workspaceDir, options = {}) {
 function clearPatients() {
   void setImportWizardCompactMode(false);
   currentWorkspaceDir = null;
+  slowWorkspaceMode = false;
   setPatientListLoading(false);
   databaseDeleteLocked = false;
   setImportWizardLinkedPatient(null);
@@ -1992,12 +2131,19 @@ function clearPatients() {
     patientSearchDebounceId = null;
   }
   if (patientSearchInput) patientSearchInput.value = "";
-  setInvalidPatientFolderWarningUi(0, [], []);
+  patientSearchOffset = 0;
+  patientSearchHasMore = false;
+  patientSearchInFlight = false;
+  activePatientSearchQuery = "";
+  invalidPatientOffset = 0;
+  setInvalidPatientFolderWarningUi(0, [], [], false);
   setAddPatientFormVisible(false);
   resetAddPatientForm();
   mainContent.clearSelectedPatientHeader();
   renderPatientList([], "");
   stopLocalCacheStatusPolling();
+  clearPreviewFillIdleStartTimer();
+  previewFillLastAttemptMs = 0;
   localCacheFolderExists = false;
   localCacheFileCount = 0;
   applyLocalCacheCopyStatus({
@@ -2019,6 +2165,7 @@ function showMainScreen(workspaceDir) {
 function showMainScreenWithOptions(workspaceDir, options = {}) {
   const skipLoadPatients = options?.skipLoadPatients ?? false;
   console.log(`[transition ${ts()}] showing main screen`);
+  if (startupView) startupView.hidden = true;
   onboardingView.hidden = true;
   appView.hidden = false;
   void setImportWizardCompactMode(false);
@@ -2277,7 +2424,8 @@ async function pickImportWizardFolderAndSave() {
 // ---------- Boot ----------
 async function boot() {
   setDebugState("booting");
-  onboardingView.hidden = false;
+  if (startupView) startupView.hidden = false;
+  onboardingView.hidden = true;
   appView.hidden = true;
   await initSystemUpdateStatus();
 
@@ -2341,6 +2489,7 @@ async function boot() {
     console.log("workspaceDir:", workspaceDir);
 
     if (!workspaceDir) {
+      if (startupView) startupView.hidden = true;
       onboardingView.hidden = false;
       appView.hidden = true;
       restoreOnboardingIdleState();
@@ -2358,6 +2507,9 @@ async function boot() {
     setPreviewPerformanceUi(DEFAULT_PREVIEW_PERFORMANCE_MODE);
     setSystemUpdateUi({ busy: false });
     await refreshCacheUsageUi();
+    if (startupView) startupView.hidden = true;
+    onboardingView.hidden = false;
+    appView.hidden = true;
     setDebugState("error: load settings");
   }
 }
@@ -2578,7 +2730,7 @@ addPatientBtn?.addEventListener("click", () => {
   setAddPatientFormVisible(!isExpanded);
 });
 invalidPatientFoldersBtn?.addEventListener("click", () => {
-  if (invalidPatientFolderNames.length + invalidPatientFileNames.length <= 0) return;
+  if (invalidPatientFolderCount <= 0) return;
   invalidPatientFoldersPanelExpanded = !invalidPatientFoldersPanelExpanded;
   renderInvalidPatientFoldersPanel();
 });
@@ -2715,6 +2867,12 @@ patientSearchInput?.addEventListener("input", (e) => {
     searchPatients(query);
   }, 120);
 });
+patientListWrap?.addEventListener("scroll", () => {
+  if (!patientSearchHasMore || patientSearchInFlight) return;
+  const remaining = patientListWrap.scrollHeight - patientListWrap.scrollTop - patientListWrap.clientHeight;
+  if (remaining > 120) return;
+  void searchPatients(activePatientSearchQuery, { append: true });
+});
 [newPatientLastName, newPatientFirstName, newPatientId].forEach((el) => {
   el?.addEventListener("input", updateAddPatientFormState);
   el?.addEventListener("keydown", (e) => {
@@ -2746,7 +2904,14 @@ void listen("preview-fill-status", (event) => {
   }
 });
 void listen("preview-fill-progress", (event) => {
-  previewFillProgressMessage = String(event?.payload?.message ?? "").trim();
+  const payload = event?.payload ?? {};
+  const message = String(payload?.message ?? "").trim();
+  const completed = Number(payload?.completed ?? 0) || 0;
+  const total = Number(payload?.total ?? 0) || 0;
+  previewFillProgressMessage = message;
+  if (total > 0 && message.toLowerCase().includes("creating")) {
+    setIndexingCustomSuffixUi(`(${completed}/${total})`);
+  }
   void refreshIndexingStatus();
 });
 void listen("import-wizard-completed", async (event) => {
