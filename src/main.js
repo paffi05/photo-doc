@@ -1,6 +1,10 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { LogicalSize } from "@tauri-apps/api/dpi";
+import { getVersion } from "@tauri-apps/api/app";
 import confetti from "canvas-confetti";
 import { initSidebarLayout } from "./sidebar-layout";
 import { initMainContent } from "./main-content";
@@ -15,6 +19,15 @@ const onboardingTitle = document.getElementById("onboardingTitle");
 const onboardingSubtitle = document.getElementById("onboardingSubtitle");
 
 const openBtn = document.getElementById("openSettings");
+const openImportWizardBtn = document.getElementById("openImportWizard");
+const closeImportWizardBtn = document.getElementById("closeImportWizard");
+const importWizardPanel = document.getElementById("importWizardPanel");
+const importWizardLivePreviewToggle = document.getElementById("importWizardLivePreviewToggle");
+const importWizardPatientLabel = document.getElementById("importWizardPatientLabel");
+const importWizardList = document.getElementById("importWizardList");
+const importWizardEmpty = document.getElementById("importWizardEmpty");
+const importWizardTreatmentTitle = document.getElementById("importWizardTreatmentTitle");
+const importWizardConfirmBtn = document.getElementById("importWizardConfirmBtn");
 const closeBtn = document.getElementById("closeSettings");
 const overlay = document.getElementById("overlay");
 const panel = document.getElementById("settingsPanel");
@@ -27,11 +40,17 @@ const invalidPatientFoldersTitle = document.getElementById("invalidPatientFolder
 
 const changeWorkspaceBtn = document.getElementById("changeWorkspaceBtn");
 const workspacePathEl = document.getElementById("workspacePath");
+const changeImportWizardBtn = document.getElementById("changeImportWizardBtn");
+const importWizardPathEl = document.getElementById("importWizardPath");
 const folderIconContainer = document.getElementById("folderIconContainer");
 const debugBadge = document.getElementById("debugBadge");
 const debugWindowBadge = document.getElementById("debugWindowBadge");
 const showFrontendDebugToggle = document.getElementById("showFrontendDebug");
 const alwaysShowTimelineNamesToggle = document.getElementById("alwaysShowTimelineNames");
+const systemUpdateBtn = document.getElementById("systemUpdateBtn");
+const systemUpdateSpinner = document.getElementById("systemUpdateSpinner");
+const systemVersionText = document.getElementById("systemVersionText");
+const systemUpdateStatusText = document.getElementById("systemUpdateStatusText");
 const deleteWorkspaceBtn = document.getElementById("deleteWorkspaceBtn");
 const deleteWorkspaceRow = document.getElementById("deleteWorkspaceRow");
 const deleteDatabaseBtn = document.getElementById("deleteDatabaseBtn");
@@ -221,6 +240,17 @@ function extractExt(name = "") {
   return raw.slice(dot + 1).toUpperCase();
 }
 
+function normalizeDialogPathSelection(selected) {
+  const raw = Array.isArray(selected) ? selected[0] : selected;
+  let path = String(raw ?? "").trim();
+  if (!path) return "";
+  if (path.startsWith("file://")) {
+    path = decodeURIComponent(path.replace(/^file:\/\//, ""));
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+  }
+  return path;
+}
+
 let isWorkspaceSetupInProgress = false;
 let onboardingReadyWorkspaceDir = null;
 let currentWorkspaceDir = null;
@@ -262,6 +292,23 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
+let systemAppVersion = "0.9.1";
+let systemUpdateBusy = false;
+let systemUpdateCheckedAtMs = null;
+let importWizardDir = null;
+let importWizardWindowState = null;
+let importWizardPreviewWindowState = null;
+let importWizardCompactMode = false;
+let importWizardRestoreSize = null;
+let importWizardPollTimerId = null;
+let importWizardIsImporting = false;
+let importWizardKnownPaths = new Set();
+let importWizardPendingRows = [];
+let importWizardNewestProbe = { path: "", size: -1, unchangedTicks: 0 };
+let importWizardLastLivePreviewPath = "";
+let importWizardPreviewWindow = null;
+let importWizardLinkedPatient = null;
+const importWizardCleanupByJobId = new Map();
 const importingPatientJobCounts = new Map();
 let lastRenderedPatientEntries = [];
 let lastRenderedFilterText = "";
@@ -286,6 +333,49 @@ const CACHE_RELOAD_ICON_PAUSE = `
     <path d="M16 6V18" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
   </svg>
 `;
+const patientDragGhost = document.createElement("canvas");
+patientDragGhost.width = 33;
+patientDragGhost.height = 30;
+patientDragGhost.setAttribute("aria-hidden", "true");
+{
+  const ctx = patientDragGhost.getContext("2d");
+  if (ctx) {
+    const drawRoundRect = (x, y, w, h, r) => {
+      const radius = Math.max(0, Math.min(r, Math.min(w, h) / 2));
+      if (typeof ctx.roundRect === "function") {
+        ctx.roundRect(x, y, w, h, radius);
+        return;
+      }
+      ctx.moveTo(x + radius, y);
+      ctx.lineTo(x + w - radius, y);
+      ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+      ctx.lineTo(x + w, y + h - radius);
+      ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+      ctx.lineTo(x + radius, y + h);
+      ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+      ctx.lineTo(x, y + radius);
+      ctx.quadraticCurveTo(x, y, x + radius, y);
+    };
+    ctx.clearRect(0, 0, 33, 30);
+    ctx.shadowColor = "rgba(37,99,235,0.55)";
+    ctx.shadowBlur = 7;
+    ctx.fillStyle = "#2563eb";
+    ctx.beginPath();
+    drawRoundRect(4, 9, 25, 18, 4);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = "#2563eb";
+    ctx.beginPath();
+    drawRoundRect(18, 6, 10, 4, 2);
+    ctx.fill();
+  }
+}
+patientDragGhost.style.position = "fixed";
+patientDragGhost.style.left = "-9999px";
+patientDragGhost.style.top = "-9999px";
+patientDragGhost.style.pointerEvents = "none";
+patientDragGhost.style.opacity = "0.98";
+document.body.appendChild(patientDragGhost);
 const sidebarLayout = initSidebarLayout({
   appView,
   openBtn,
@@ -934,6 +1024,48 @@ function formatDateTime(date) {
   return date.toLocaleString();
 }
 
+function setSystemUpdateUi({
+  busy = false,
+  version = systemAppVersion,
+  checkedAtMs = systemUpdateCheckedAtMs,
+} = {}) {
+  if (systemUpdateBtn) {
+    systemUpdateBtn.disabled = busy;
+    systemUpdateBtn.setAttribute("title", busy ? "Updating..." : "System update");
+  }
+  if (systemUpdateSpinner) systemUpdateSpinner.hidden = !busy;
+  const safeVersion = String(version || "0.9.1").trim() || "0.9.1";
+  if (systemVersionText) {
+    systemVersionText.textContent = `Version ${safeVersion}`;
+  }
+  if (!systemUpdateStatusText) return;
+
+  if (busy) {
+    systemUpdateStatusText.textContent = "Updating...";
+    return;
+  }
+
+  if (Number.isFinite(Number(checkedAtMs)) && Number(checkedAtMs) > 0) {
+    systemUpdateStatusText.textContent = `Up to date (${formatDateTime(new Date(Number(checkedAtMs)))})`;
+  } else {
+    systemUpdateStatusText.textContent = "Up to date (never checked)";
+  }
+}
+
+async function initSystemUpdateStatus() {
+  try {
+    const version = await getVersion();
+    if (version && String(version).trim()) {
+      systemAppVersion = String(version).trim();
+    }
+  } catch (err) {
+    console.error("getVersion failed:", err);
+  } finally {
+    systemUpdateCheckedAtMs = Date.now();
+    setSystemUpdateUi({ busy: false });
+  }
+}
+
 function setDbStatusUpdating() {
   isDbUpdating = true;
   if (dbStatusText) dbStatusText.textContent = "updating...";
@@ -994,6 +1126,377 @@ function setWorkspacePathDisplay(workspaceDir) {
   }
   workspacePathEl.textContent = workspaceDir;
   workspacePathEl.title = workspaceDir;
+}
+
+function setImportWizardPathDisplay(pathValue) {
+  if (!importWizardPathEl) return;
+  const normalized = String(pathValue ?? "").trim();
+  if (!normalized) {
+    importWizardPathEl.textContent = "No folder selected";
+    importWizardPathEl.title = "";
+    importWizardPathEl.classList.add("no-path");
+    updateImportWizardButtonState();
+    return;
+  }
+  importWizardPathEl.textContent = normalized;
+  importWizardPathEl.title = normalized;
+  importWizardPathEl.classList.remove("no-path");
+  updateImportWizardButtonState();
+}
+
+function updateImportWizardButtonState() {
+  if (!openImportWizardBtn) return;
+  const wizardLockActive = Boolean(importWizardLinkedPatient && String(importWizardLinkedPatient).trim());
+  const lockPatient = wizardLockActive ? String(importWizardLinkedPatient).trim() : "";
+  const hasPatientSelection = Boolean(selectedPatient && String(selectedPatient).trim());
+  const hasImportWizardDir = Boolean(importWizardDir && String(importWizardDir).trim());
+  const isSelectedLockPatient = hasPatientSelection && String(selectedPatient).trim() === lockPatient;
+  openImportWizardBtn.hidden = !hasPatientSelection;
+  openImportWizardBtn.disabled =
+    !hasPatientSelection ||
+    !hasImportWizardDir ||
+    (wizardLockActive && !isSelectedLockPatient);
+  openImportWizardBtn.classList.toggle("active", wizardLockActive && isSelectedLockPatient);
+  if (importWizardPatientLabel) {
+    importWizardPatientLabel.textContent = formatWizardPatientLabel();
+  }
+}
+
+function setImportWizardLinkedPatient(folderName) {
+  const next = String(folderName ?? "").trim() || null;
+  if (importWizardLinkedPatient === next) return;
+  importWizardLinkedPatient = next;
+  renderPatientList(lastRenderedPatientEntries, lastRenderedFilterText);
+  updateImportWizardButtonState();
+}
+
+async function openImportWizardHelperWindow() {
+  if (!currentWorkspaceDir || !selectedPatient || !importWizardDir) return;
+  try {
+    try {
+      const settings = await invoke("load_settings");
+      const latestState =
+        settings?.import_wizard_window_state ??
+        settings?.importWizardWindowState ??
+        null;
+      importWizardWindowState =
+        latestState && typeof latestState === "object" ? latestState : importWizardWindowState;
+    } catch (err) {
+      console.error("load_settings for import wizard window state failed:", err);
+    }
+
+    const { lastName, firstName } = splitPatientName(String(selectedPatient));
+    const titleName = firstName ? `${lastName}, ${firstName}` : lastName;
+    const windowTitle = titleName;
+    const width = 300;
+    const height = 200;
+    const existing = await WebviewWindow.getByLabel("import_wizard_helper");
+    if (existing) {
+      await existing.close();
+    }
+    setImportWizardLinkedPatient(selectedPatient);
+    const wizard = new WebviewWindow("import_wizard_helper", {
+      title: windowTitle,
+      width,
+      height,
+      minWidth: width,
+      minHeight: height,
+      maxWidth: width,
+      maxHeight: height,
+      resizable: false,
+      center: true,
+      alwaysOnTop: true,
+      hiddenTitle: false,
+      titleBarStyle: "Visible",
+      theme: "Dark",
+      url: `import-wizard.html?workspaceDir=${encodeURIComponent(currentWorkspaceDir)}&patientFolder=${encodeURIComponent(selectedPatient)}&importWizardDir=${encodeURIComponent(importWizardDir)}`,
+    });
+    wizard.once("tauri://error", (event) => {
+      setImportWizardLinkedPatient(null);
+      console.error("failed to create import wizard window:", event);
+    });
+    wizard.once("tauri://destroyed", async () => {
+      try {
+        const stillOpen = await WebviewWindow.getByLabel("import_wizard_helper");
+        if (stillOpen) return;
+      } catch {
+        // ignore and clear lock below
+      }
+      setImportWizardLinkedPatient(null);
+    });
+  } catch (err) {
+    setImportWizardLinkedPatient(null);
+    console.error("open import wizard helper window failed:", err);
+  }
+}
+
+async function requestImportWizardHelperClose() {
+  try {
+    const helper = await WebviewWindow.getByLabel("import_wizard_helper");
+    if (!helper) {
+      setImportWizardLinkedPatient(null);
+      return false;
+    }
+    await helper.emit("import-wizard-request-close");
+    return true;
+  } catch (err) {
+    console.error("request import wizard helper close failed:", err);
+    return false;
+  }
+}
+
+function formatWizardPatientLabel() {
+  if (!selectedPatient) return "No patient selected";
+  const name = String(selectedPatient);
+  return selectedPatientId ? `${name} (${selectedPatientId})` : name;
+}
+
+function updateImportWizardConfirmState() {
+  if (!importWizardConfirmBtn) return;
+  const hasFiles = importWizardPendingRows.length > 0;
+  const hasTitle = Boolean(importWizardTreatmentTitle?.value?.trim());
+  importWizardConfirmBtn.disabled = !hasFiles || !hasTitle || importWizardIsImporting;
+}
+
+function renderImportWizardList() {
+  if (!importWizardList || !importWizardEmpty) return;
+  importWizardList.innerHTML = "";
+  for (const row of importWizardPendingRows) {
+    const li = document.createElement("li");
+    li.className = "import-wizard-file-item";
+    li.textContent = row?.name ? String(row.name) : String(row?.path ?? "");
+    li.title = String(row?.path ?? "");
+    importWizardList.appendChild(li);
+  }
+  importWizardEmpty.hidden = importWizardPendingRows.length > 0;
+  updateImportWizardConfirmState();
+}
+
+function getTodayDateString() {
+  const d = new Date();
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+async function closeImportWizardPreviewWindow() {
+  try {
+    if (importWizardPreviewWindow) {
+      await importWizardPreviewWindow.close();
+      importWizardPreviewWindow = null;
+    } else {
+      const existing = await WebviewWindow.getByLabel("import_wizard_preview");
+      if (existing) await existing.close();
+    }
+  } catch {
+    // Ignore close errors for already-closed windows.
+  } finally {
+    importWizardLastLivePreviewPath = "";
+  }
+}
+
+async function sendImportWizardPreviewPath(path) {
+  if (!path || !importWizardLivePreviewToggle?.checked) return;
+  try {
+    const existing = await WebviewWindow.getByLabel("import_wizard_preview");
+    if (existing) {
+      importWizardPreviewWindow = existing;
+    } else if (!importWizardPreviewWindow) {
+      const savedWidth = Number(importWizardPreviewWindowState?.width ?? 0);
+      const savedHeight = Number(importWizardPreviewWindowState?.height ?? 0);
+      const nextWidth = Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : 1024;
+      const nextHeight = Number.isFinite(savedHeight) && savedHeight > 0 ? savedHeight : 760;
+      importWizardPreviewWindow = new WebviewWindow("import_wizard_preview", {
+        title: "Import Live Preview",
+        width: nextWidth,
+        height: nextHeight,
+        minWidth: 520,
+        minHeight: 420,
+        resizable: true,
+        center: true,
+        url: "import-preview.html",
+      });
+    }
+    const win = importWizardPreviewWindow ?? await WebviewWindow.getByLabel("import_wizard_preview");
+    if (!win) return;
+    await win.show();
+    await win.emit("import-wizard-preview-file", { path });
+    importWizardLastLivePreviewPath = path;
+  } catch (err) {
+    console.error("import wizard preview window update failed:", err);
+  }
+}
+
+function stopImportWizardWatcher() {
+  if (importWizardPollTimerId !== null) {
+    clearInterval(importWizardPollTimerId);
+    importWizardPollTimerId = null;
+  }
+}
+
+async function pollImportWizardFolder() {
+  if (!importWizardCompactMode || !importWizardDir) return;
+  try {
+    const rows = await invoke("list_import_wizard_files", {
+      folderDir: importWizardDir,
+    });
+    const list = Array.isArray(rows) ? rows : [];
+
+    for (const row of list) {
+      const path = String(row?.path ?? "").trim();
+      if (!path) continue;
+      if (!importWizardKnownPaths.has(path)) {
+        importWizardKnownPaths.add(path);
+        importWizardPendingRows.unshift(row);
+      }
+    }
+
+    if (list.length > 0) {
+      const newest = list[0];
+      const newestPath = String(newest?.path ?? "").trim();
+      const newestSize = Number(newest?.size ?? -1);
+      const newestIsImage = Boolean(newest?.is_image ?? newest?.isImage ?? false);
+      if (
+        newestPath &&
+        newestPath === importWizardNewestProbe.path &&
+        newestSize === importWizardNewestProbe.size
+      ) {
+        importWizardNewestProbe.unchangedTicks += 1;
+      } else {
+        importWizardNewestProbe = { path: newestPath, size: newestSize, unchangedTicks: 0 };
+      }
+
+      if (
+        importWizardLivePreviewToggle?.checked &&
+        importWizardNewestProbe.path &&
+        importWizardNewestProbe.unchangedTicks >= 1 &&
+        newestIsImage &&
+        importWizardLastLivePreviewPath !== importWizardNewestProbe.path
+      ) {
+        await sendImportWizardPreviewPath(importWizardNewestProbe.path);
+      }
+    } else {
+      importWizardNewestProbe = { path: "", size: -1, unchangedTicks: 0 };
+    }
+
+    renderImportWizardList();
+  } catch (err) {
+    console.error("list_import_wizard_files failed:", err);
+  }
+}
+
+async function startImportWizardWatcher() {
+  stopImportWizardWatcher();
+  importWizardKnownPaths = new Set();
+  importWizardPendingRows = [];
+  importWizardNewestProbe = { path: "", size: -1, unchangedTicks: 0 };
+  importWizardLastLivePreviewPath = "";
+  renderImportWizardList();
+  if (!importWizardDir) return;
+
+  try {
+    const rows = await invoke("list_import_wizard_files", {
+      folderDir: importWizardDir,
+    });
+    const baseline = Array.isArray(rows) ? rows : [];
+    importWizardKnownPaths = new Set(
+      baseline
+        .map((row) => String(row?.path ?? "").trim())
+        .filter(Boolean),
+    );
+  } catch (err) {
+    console.error("import wizard baseline scan failed:", err);
+  }
+
+  importWizardPollTimerId = setInterval(() => {
+    void pollImportWizardFolder();
+  }, 900);
+}
+
+async function confirmImportWizard() {
+  if (!currentWorkspaceDir || !selectedPatient || !importWizardDir) return;
+  if (!importWizardTreatmentTitle) return;
+  const treatmentName = importWizardTreatmentTitle.value.trim();
+  if (!treatmentName || importWizardPendingRows.length < 1) return;
+
+  const filePaths = importWizardPendingRows
+    .map((row) => String(row?.path ?? "").trim())
+    .filter(Boolean);
+  if (filePaths.length < 1) return;
+
+  try {
+    importWizardIsImporting = true;
+    updateImportWizardConfirmState();
+    await invoke("start_import_files", {
+      workspaceDir: currentWorkspaceDir,
+      patientFolder: selectedPatient,
+      existingFolder: null,
+      date: getTodayDateString(),
+      treatmentName,
+      filePaths,
+      deleteOrigin: false,
+    });
+    await setImportWizardCompactMode(false);
+  } catch (err) {
+    console.error("import wizard start_import_files failed:", err);
+  } finally {
+    importWizardIsImporting = false;
+    updateImportWizardConfirmState();
+  }
+}
+
+async function setImportWizardCompactMode(enabled) {
+  if (!appView) return;
+  if (importWizardCompactMode === enabled) return;
+
+  const appWindow = getCurrentWindow();
+  if (enabled) {
+    importWizardCompactMode = true;
+    sidebarLayout.closeSettings();
+    appView.classList.add("import-wizard-window");
+    if (importWizardPanel) importWizardPanel.hidden = false;
+    if (importWizardPatientLabel) importWizardPatientLabel.textContent = formatWizardPatientLabel();
+    if (importWizardTreatmentTitle) {
+      importWizardTreatmentTitle.value = "";
+      importWizardTreatmentTitle.focus();
+    }
+    importWizardIsImporting = false;
+    updateImportWizardConfirmState();
+    await startImportWizardWatcher();
+    if (closeImportWizardBtn) closeImportWizardBtn.hidden = false;
+    try {
+      const size = await appWindow.innerSize();
+      importWizardRestoreSize = {
+        width: Number(size?.width ?? 0),
+        height: Number(size?.height ?? 0),
+      };
+      await appWindow.setSize(new LogicalSize(100, 175));
+    } catch (err) {
+      console.error("enable import wizard compact mode failed:", err);
+    }
+    return;
+  }
+
+  importWizardCompactMode = false;
+  appView.classList.remove("import-wizard-window");
+  if (importWizardPanel) importWizardPanel.hidden = true;
+  if (importWizardTreatmentTitle) importWizardTreatmentTitle.value = "";
+  stopImportWizardWatcher();
+  importWizardPendingRows = [];
+  renderImportWizardList();
+  await closeImportWizardPreviewWindow();
+  if (closeImportWizardBtn) closeImportWizardBtn.hidden = true;
+  if (importWizardRestoreSize?.width && importWizardRestoreSize?.height) {
+    try {
+      await appWindow.setSize(
+        new LogicalSize(importWizardRestoreSize.width, importWizardRestoreSize.height),
+      );
+    } catch (err) {
+      console.error("restore window size after import wizard compact mode failed:", err);
+    }
+  }
+  importWizardRestoreSize = null;
 }
 
 function normalizePatientFieldValue(value) {
@@ -1119,8 +1622,19 @@ function renderPatientList(entries, filterText = "") {
     const { lastName, firstName } = splitPatientName(folderName);
     const item = document.createElement("li");
     item.className = "patient-item";
+    const wizardLockActive = Boolean(importWizardLinkedPatient && String(importWizardLinkedPatient).trim());
+    const isWizardTargetPatient = wizardLockActive && folderName === importWizardLinkedPatient;
+    item.draggable = true;
+    let dragged = false;
     if (folderName === selectedPatient) {
       item.classList.add("selected");
+    }
+
+    if (isWizardTargetPatient) {
+      const wizardSpinner = document.createElement("span");
+      wizardSpinner.className = "patient-wizard-spinner";
+      wizardSpinner.setAttribute("aria-hidden", "true");
+      item.appendChild(wizardSpinner);
     }
 
     if ((importingPatientJobCounts.get(folderName) ?? 0) > 0) {
@@ -1150,11 +1664,55 @@ function renderPatientList(entries, filterText = "") {
     }
 
     item.addEventListener("click", () => {
+      if (dragged) {
+        dragged = false;
+        return;
+      }
       selectedPatient = folderName;
       selectedPatientId = patientId;
       mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
       renderPatientList(entries, filterText);
+      updateImportWizardButtonState();
       sidebarLayout.scheduleAutoHidePatientSidebar();
+    });
+
+    item.addEventListener("dragstart", (event) => {
+      dragged = true;
+      const dt = event?.dataTransfer;
+      if (!dt) return;
+      dt.effectAllowed = "copy";
+      dt.setData("application/x-mpm-patient-folder-export", folderName);
+      dt.setDragImage(patientDragGhost, 17, 15);
+    });
+
+    item.addEventListener("dragend", () => {
+      if (!currentWorkspaceDir || !folderName) {
+        dragged = false;
+        return;
+      }
+      void (async () => {
+        try {
+          const selected = await open({
+            directory: true,
+            multiple: false,
+            title: "Choose destination folder",
+          });
+          const destinationDir = normalizeDialogPathSelection(selected);
+          if (!destinationDir) {
+            dragged = false;
+            return;
+          }
+          await invoke("copy_patient_folder_to_destination", {
+            workspaceDir: currentWorkspaceDir,
+            patientFolder: folderName,
+            destinationDir,
+          });
+        } catch (err) {
+          console.error("copy_patient_folder_to_destination failed:", err);
+        } finally {
+          dragged = false;
+        }
+      })();
     });
 
     patientList.appendChild(item);
@@ -1220,10 +1778,13 @@ async function loadPatients(workspaceDir, options = {}) {
 }
 
 function clearPatients() {
+  void setImportWizardCompactMode(false);
   currentWorkspaceDir = null;
   databaseDeleteLocked = false;
+  setImportWizardLinkedPatient(null);
   selectedPatient = null;
   selectedPatientId = "";
+  updateImportWizardButtonState();
   importingPatientJobCounts.clear();
   updateCacheReloadButtonState();
   updateLocalCacheDeleteButtonState();
@@ -1263,6 +1824,7 @@ function showMainScreenWithOptions(workspaceDir, options = {}) {
   console.log(`[transition ${ts()}] showing main screen`);
   onboardingView.hidden = true;
   appView.hidden = false;
+  void setImportWizardCompactMode(false);
   currentWorkspaceDir = workspaceDir;
   updateCacheReloadButtonState();
   updateLocalCacheDeleteButtonState();
@@ -1465,11 +2027,29 @@ async function pickWorkspaceAndSave() {
   }
 }
 
+async function pickImportWizardFolderAndSave() {
+  try {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title: "Select Import Wizard Folder",
+    });
+    const nextPath = normalizeDialogPathSelection(selected);
+    if (!nextPath) return;
+    await invoke("save_import_wizard_dir", { importWizardDir: nextPath });
+    importWizardDir = nextPath;
+    setImportWizardPathDisplay(importWizardDir);
+  } catch (err) {
+    console.error("Failed to pick import wizard folder:", err);
+  }
+}
+
 // ---------- Boot ----------
 async function boot() {
   setDebugState("booting");
   onboardingView.hidden = false;
   appView.hidden = true;
+  await initSystemUpdateStatus();
 
   try {
     const settings = await invoke("load_settings");
@@ -1479,6 +2059,18 @@ async function boot() {
     const workspaceDir =
       settings?.workspace_dir ??
       settings?.workspaceDir ??
+      null;
+    const importWizardDirFromSettings =
+      settings?.import_wizard_dir ??
+      settings?.importWizardDir ??
+      null;
+    const importWizardWindowStateFromSettings =
+      settings?.import_wizard_window_state ??
+      settings?.importWizardWindowState ??
+      null;
+    const importWizardPreviewWindowStateFromSettings =
+      settings?.import_wizard_preview_window_state ??
+      settings?.importWizardPreviewWindowState ??
       null;
     const cacheSizeGb =
       settings?.cache_size_gb ??
@@ -1498,6 +2090,21 @@ async function boot() {
     if (keepLocalCacheCopyToggle) keepLocalCacheCopyToggle.checked = keepLocalCopy;
     setCacheSizeUi(cacheSizeGb);
     setPreviewPerformanceUi(previewPerformanceMode);
+    importWizardDir = typeof importWizardDirFromSettings === "string"
+      ? importWizardDirFromSettings.trim() || null
+      : null;
+    importWizardWindowState =
+      importWizardWindowStateFromSettings &&
+      typeof importWizardWindowStateFromSettings === "object"
+        ? importWizardWindowStateFromSettings
+        : null;
+    importWizardPreviewWindowState =
+      importWizardPreviewWindowStateFromSettings &&
+      typeof importWizardPreviewWindowStateFromSettings === "object"
+        ? importWizardPreviewWindowStateFromSettings
+        : null;
+    setImportWizardPathDisplay(importWizardDir);
+    updateImportWizardButtonState();
     await refreshCacheUsageUi();
     await refreshIndexingDebugCounts();
     await refreshLocalCacheCopyStatus();
@@ -1519,6 +2126,7 @@ async function boot() {
     console.error("load_settings failed:", err);
     setCacheSizeUi(DEFAULT_CACHE_SIZE_GB);
     setPreviewPerformanceUi(DEFAULT_PREVIEW_PERFORMANCE_MODE);
+    setSystemUpdateUi({ busy: false });
     await refreshCacheUsageUi();
     setDebugState("error: load settings");
   }
@@ -1541,6 +2149,7 @@ pickIcon?.addEventListener("click", async () => {
 });
 
 changeWorkspaceBtn?.addEventListener("click", pickWorkspaceAndSave);
+changeImportWizardBtn?.addEventListener("click", pickImportWizardFolderAndSave);
 showFrontendDebugToggle?.addEventListener("change", (e) => {
   const show = Boolean(e.target?.checked);
   setDebugVisibility(show);
@@ -1580,8 +2189,10 @@ deleteDatabaseBtn?.addEventListener("click", async () => {
     setDbStatusIdle();
     if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
     setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
+    setImportWizardLinkedPatient(null);
     selectedPatient = null;
     selectedPatientId = "";
+    updateImportWizardButtonState();
     mainContent.clearSelectedPatientHeader();
     await searchPatients(patientSearchInput?.value ?? "");
     await mainContent.refreshTimelineForSelection();
@@ -1771,6 +2382,7 @@ confirmAddPatientBtn?.addEventListener("click", async () => {
     if (patientSearchInput) patientSearchInput.value = "";
     selectedPatient = (createdFolderName ?? `${lastName}, ${firstName}`).toString();
     selectedPatientId = patientId;
+    updateImportWizardButtonState();
     mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
     await loadPatients(currentWorkspaceDir);
   } catch (err) {
@@ -1787,11 +2399,93 @@ workspacePathEl?.addEventListener("click", async () => {
     console.error("open_workspace_dir failed:", err);
   }
 });
+importWizardPathEl?.addEventListener("click", async () => {
+  if (!importWizardDir) return;
+  try {
+    await invoke("open_workspace_dir", { workspaceDir: importWizardDir });
+  } catch (err) {
+    console.error("open_workspace_dir (import wizard) failed:", err);
+  }
+});
+importWizardLivePreviewToggle?.addEventListener("change", async () => {
+  if (!importWizardLivePreviewToggle.checked) {
+    await closeImportWizardPreviewWindow();
+    return;
+  }
+  if (importWizardNewestProbe.path && importWizardNewestProbe.unchangedTicks >= 1) {
+    await sendImportWizardPreviewPath(importWizardNewestProbe.path);
+  }
+});
+importWizardTreatmentTitle?.addEventListener("input", updateImportWizardConfirmState);
+importWizardTreatmentTitle?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  void confirmImportWizard();
+});
+importWizardConfirmBtn?.addEventListener("click", () => {
+  void confirmImportWizard();
+});
+openImportWizardBtn?.addEventListener("click", async () => {
+  if (!selectedPatient || !importWizardDir || openImportWizardBtn.disabled) return;
+  const isActiveForSelectedPatient = Boolean(
+    importWizardLinkedPatient &&
+    String(importWizardLinkedPatient).trim() === String(selectedPatient).trim(),
+  );
+  if (isActiveForSelectedPatient) {
+    await requestImportWizardHelperClose();
+    return;
+  }
+  await openImportWizardHelperWindow();
+});
+closeImportWizardBtn?.addEventListener("click", async () => {
+  await requestImportWizardHelperClose();
+  await setImportWizardCompactMode(false);
+});
 openCacheFolderBtn?.addEventListener("click", async () => {
   try {
     await invoke("open_preview_cache_dir", { workspaceDir: currentWorkspaceDir });
   } catch (err) {
     console.error("open_preview_cache_dir failed:", err);
+  }
+});
+systemUpdateBtn?.addEventListener("click", async () => {
+  if (systemUpdateBusy) return;
+  systemUpdateBusy = true;
+  setSystemUpdateUi({ busy: true });
+  let updateFailed = false;
+  try {
+    const result = await invoke("run_system_update");
+    const updated = Boolean(result?.updated);
+    const nextVersion = String(result?.version ?? "").trim();
+    if (!updated) {
+      systemUpdateCheckedAtMs = Date.now();
+      return;
+    }
+
+    if (systemUpdateStatusText) {
+      systemUpdateStatusText.textContent = "Update installed. Restart app to apply.";
+    }
+    if (nextVersion) {
+      systemAppVersion = nextVersion;
+    }
+    systemUpdateCheckedAtMs = Date.now();
+  } catch (err) {
+    updateFailed = true;
+    console.error("system update failed:", err);
+    if (systemUpdateStatusText) {
+      systemUpdateStatusText.textContent = "Update failed. Check updater config.";
+    }
+  } finally {
+    systemUpdateBusy = false;
+    if (!updateFailed) {
+      setSystemUpdateUi({ busy: false });
+    } else {
+      if (systemUpdateBtn) {
+        systemUpdateBtn.disabled = false;
+        systemUpdateBtn.setAttribute("title", "System update");
+      }
+      if (systemUpdateSpinner) systemUpdateSpinner.hidden = true;
+    }
   }
 });
 settingsBody?.addEventListener("scroll", syncSettingsHeaderScrollState);
@@ -1806,7 +2500,12 @@ overlay?.addEventListener("click", () => {
 });
 
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && sidebarLayout.isSettingsOpen()) sidebarLayout.closeSettings();
+  if (e.key !== "Escape") return;
+  if (importWizardCompactMode) {
+    void setImportWizardCompactMode(false);
+    return;
+  }
+  if (sidebarLayout.isSettingsOpen()) sidebarLayout.closeSettings();
 });
 window.addEventListener("resize", updateWindowDebugSize);
 window.addEventListener("resize", () => {
@@ -1856,6 +2555,57 @@ void listen("preview-fill-status", (event) => {
 void listen("preview-fill-progress", (event) => {
   previewFillProgressMessage = String(event?.payload?.message ?? "").trim();
   void refreshIndexingStatus();
+});
+void listen("import-wizard-completed", async (event) => {
+  const workspace = String(event?.payload?.workspace_dir ?? event?.payload?.workspaceDir ?? "").trim();
+  const patient = String(event?.payload?.patient_folder ?? event?.payload?.patientFolder ?? "").trim();
+  const targetFolder = String(event?.payload?.target_folder ?? event?.payload?.targetFolder ?? "").trim();
+  const jobId = Number(event?.payload?.job_id ?? event?.payload?.jobId ?? 0) || null;
+  const wizardDir = String(
+    event?.payload?.import_wizard_dir ??
+    event?.payload?.importWizardDir ??
+    "",
+  ).trim();
+  if (!workspace || !patient) return;
+  if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
+
+  selectedPatient = patient;
+  selectedPatientId = "";
+  await searchPatients(patientSearchInput?.value ?? "");
+  const selectedEntry = (lastRenderedPatientEntries ?? [])
+    .map((entry) => normalizePatientEntry(entry))
+    .find((entry) => entry.folderName === patient);
+  selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
+  const { lastName, firstName } = splitPatientName(patient);
+  mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
+  updateImportWizardButtonState();
+  if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
+    if (wizardDir) {
+      importWizardCleanupByJobId.set(jobId, wizardDir);
+    }
+    mainContent.registerExternalImportJob({
+      jobId,
+      targetFolder,
+      workspaceDir: workspace,
+      patientFolder: patient,
+    });
+    return;
+  }
+  await mainContent.refreshTimelineForSelection();
+});
+void listen("import-progress", async (event) => {
+  const payload = event?.payload ?? {};
+  const jobId = Number(payload?.job_id ?? payload?.jobId ?? 0) || null;
+  if (!jobId) return;
+  if (!Boolean(payload?.done)) return;
+  const wizardDir = importWizardCleanupByJobId.get(jobId);
+  if (!wizardDir) return;
+  importWizardCleanupByJobId.delete(jobId);
+  try {
+    await invoke("clear_import_wizard_preview_cache", { folderDir: wizardDir });
+  } catch (err) {
+    console.error("clear_import_wizard_preview_cache after import failed:", err);
+  }
 });
 void (async () => {
   updateCacheReloadButtonState();

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Import Wizard</title>
+    <link rel="stylesheet" href="./import-wizard.css" />
+    <script type="module" src="./import-wizard.js"></script>
+  </head>
+  <body>
+    <div class="wizard-shell">
+      <div class="wizard-files-count-bg" id="wizardFilesCountBg" aria-hidden="true">0</div>
+      <div class="wizard-import-panel" id="wizardImportPanel" hidden>
+        <div class="wizard-import-header">
+          <button class="wizard-import-toggle" id="wizardImportToggle" type="button" aria-expanded="false">
+            <svg class="wizard-import-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path d="M6 4L14 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+              <path d="M14 12L6 20" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+            </svg>
+            <span id="wizardImportCountText">0 Files</span>
+          </button>
+          <div class="wizard-top-actions">
+            <input
+              id="wizardTreatmentInput"
+              class="wizard-treatment-input"
+              type="text"
+              placeholder="Treatment"
+              autocomplete="off"
+              hidden
+            />
+            <button id="wizardActionBtn" class="wizard-action-btn" type="button">Import</button>
+          </div>
+        </div>
+        <div class="wizard-import-list-wrap" id="wizardImportListWrap">
+          <ul class="wizard-import-list" id="wizardImportList"></ul>
+        </div>
+      </div>
+      <div class="doctor-wrap">
+        <label class="wizard-live-toggle" for="wizardLivePreviewToggle">
+          <span class="toggle-switch">
+            <input type="checkbox" id="wizardLivePreviewToggle" />
+            <span class="toggle-slider" aria-hidden="true"></span>
+          </span>
+          <span class="wizard-live-label">Live Preview</span>
+        </label>
+        <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" id="doctor-svg">
+          <path d="M60,150 L140,150 L130,120 Q100,110 70,120 Z" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" />
+          <path d="M90,120 L100,150 L110,120" fill="none" stroke="#cbd5e1" stroke-width="1" />
+          <path d="M80,120 Q80,145 100,145 Q120,145 120,120" fill="none" stroke="#475569" stroke-width="2" />
+          <circle cx="100" cy="145" r="5" fill="#94a3b8" stroke="#475569" stroke-width="1" />
+
+          <g transform="rotate(-10, 100, 100)">
+            <circle cx="100" cy="95" r="30" fill="#ffdbac" />
+            <path d="M70,95 A30,30 0 0,1 130,95 L130,85 Q100,70 70,85 Z" fill="#4b2c20" />
+
+            <g id="eye-l">
+              <path class="eye-closed" d="M85,100 Q90,105 95,100" stroke="#8d5524" fill="none" stroke-width="2" />
+              <g class="eye-open">
+                <circle cx="90" cy="100" r="5" fill="white" />
+                <circle id="pupil-l" cx="90" cy="100" r="2.5" fill="#1e293b" />
+              </g>
+            </g>
+            <g id="eye-r">
+              <path class="eye-closed" d="M105,100 Q110,105 115,100" stroke="#8d5524" fill="none" stroke-width="2" />
+              <g class="eye-open">
+                <circle cx="110" cy="100" r="5" fill="white" />
+                <circle id="pupil-r" cx="110" cy="100" r="2.5" fill="#1e293b" />
+              </g>
+            </g>
+
+            <circle cx="90" cy="100" r="9" fill="none" stroke="#1e293b" stroke-width="1.5" />
+            <circle cx="110" cy="100" r="9" fill="none" stroke="#1e293b" stroke-width="1.5" />
+            <line x1="99" y1="100" x2="101" y2="100" stroke="#1e293b" stroke-width="1.5" />
+          </g>
+        </svg>
+      </div>
+      <div class="wizard-close-confirm" id="wizardCloseConfirm" hidden>
+        <div class="wizard-close-confirm-title">Are you sure?</div>
+        <div class="wizard-close-confirm-text">Selected Files will not be imported</div>
+        <div class="wizard-close-confirm-actions">
+          <button id="wizardDiscardBtn" class="wizard-close-confirm-btn discard" type="button">Discard</button>
+          <button id="wizardConfirmBtn" class="wizard-close-confirm-btn confirm" type="button">Confirm</button>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

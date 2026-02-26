@@ -1,4 +1,5 @@
 use tauri::{Emitter, Manager};
+use tauri_plugin_updater::UpdaterExt;
 use base64::Engine;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,11 @@ struct WindowState {
 #[serde(default)]
 struct Settings {
     workspace_dir: Option<String>,
+    import_wizard_dir: Option<String>,
+    import_wizard_live_preview: Option<bool>,
     window_state: Option<WindowState>,
+    import_wizard_window_state: Option<WindowState>,
+    import_wizard_preview_window_state: Option<WindowState>,
     cache_size_gb: Option<u8>,
     keep_local_cache_copy: Option<bool>,
     preview_performance_mode: Option<String>,
@@ -73,9 +78,22 @@ fn snapshot_window_state(window: &tauri::Window) -> Result<WindowState, String> 
     })
 }
 
-fn persist_window_state(app_handle: &tauri::AppHandle, window: &tauri::Window) -> Result<(), String> {
+fn persist_window_state(window: &tauri::Window) -> Result<WindowState, String> {
+    snapshot_window_state(window)
+}
+
+fn persist_main_window_state(app_handle: &tauri::AppHandle, window: &tauri::Window) -> Result<(), String> {
     let mut settings = read_settings(app_handle)?;
-    settings.window_state = Some(snapshot_window_state(window)?);
+    settings.window_state = Some(persist_window_state(window)?);
+    write_settings(app_handle, &settings)
+}
+
+fn persist_import_wizard_preview_window_state(
+    app_handle: &tauri::AppHandle,
+    window: &tauri::Window,
+) -> Result<(), String> {
+    let mut settings = read_settings(app_handle)?;
+    settings.import_wizard_preview_window_state = Some(persist_window_state(window)?);
     write_settings(app_handle, &settings)
 }
 
@@ -254,10 +272,35 @@ struct PatientTreatmentRow {
 }
 
 #[derive(Serialize)]
+struct PatientFolderOverviewRow {
+    folder_name: String,
+    folder_date: String,
+    treatment_name: String,
+    preview_paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PatientOverviewRow {
+    treatment_folders: Vec<PatientFolderOverviewRow>,
+    root_files: Vec<TreatmentFileRow>,
+}
+
+#[derive(Serialize)]
 struct TreatmentFileRow {
     path: String,
     name: String,
     size: u64,
+    created_ms: u64,
+    modified_ms: u64,
+    is_image: bool,
+}
+
+#[derive(Serialize)]
+struct ImportWizardFileRow {
+    path: String,
+    name: String,
+    size: u64,
+    created_ms: u64,
     modified_ms: u64,
     is_image: bool,
 }
@@ -337,6 +380,12 @@ struct StartImportResponse {
     created_new_folder: bool,
 }
 
+#[derive(Serialize)]
+struct SystemUpdateResult {
+    updated: bool,
+    version: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 struct ImportProgressEvent {
     job_id: u64,
@@ -349,6 +398,15 @@ struct ImportProgressEvent {
 struct ImportPreviewReadyEvent {
     path: String,
     preview_path: String,
+}
+
+#[derive(Serialize, Clone)]
+struct ImportWizardCompletedEvent {
+    workspace_dir: String,
+    patient_folder: String,
+    target_folder: String,
+    job_id: Option<u64>,
+    import_wizard_dir: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -372,6 +430,7 @@ static PREVIEW_FILL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LOCAL_CACHE_COPY_RUNTIME: OnceLock<Mutex<LocalCacheCopyRuntime>> = OnceLock::new();
 static LOCAL_CACHE_COPY_RUNNING: AtomicBool = AtomicBool::new(false);
 static LOCAL_CACHE_COPY_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+static IMPORT_WIZARD_PREVIEW_PATH: OnceLock<Mutex<String>> = OnceLock::new();
 
 const PREVIEW_CACHE_DIM: u32 = 200;
 const PREVIEW_CACHE_QUALITY: u8 = 52;
@@ -623,6 +682,10 @@ fn preview_cache_lock() -> &'static Mutex<()> {
     PREVIEW_CACHE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn import_wizard_preview_path_store() -> &'static Mutex<String> {
+    IMPORT_WIZARD_PREVIEW_PATH.get_or_init(|| Mutex::new(String::new()))
+}
+
 fn local_cache_copy_runtime() -> &'static Mutex<LocalCacheCopyRuntime> {
     LOCAL_CACHE_COPY_RUNTIME.get_or_init(|| Mutex::new(LocalCacheCopyRuntime {
         state: "up_to_date".to_string(),
@@ -672,6 +735,43 @@ fn get_active_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
 
 fn get_local_cache_copy_dir(workspace: &Path) -> PathBuf {
     workspace.join(LOCAL_CACHE_COPY_DIR_NAME)
+}
+
+fn paths_point_to_same_location(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => left == right,
+    }
+}
+
+fn import_wizard_cache_dir_is_protected(app_handle: &tauri::AppHandle, folder: &Path) -> bool {
+    let candidate = folder.join(".preview-cache");
+    let _ = fs::create_dir_all(&candidate);
+
+    let active_cache_dir = get_active_preview_cache_dir(app_handle);
+    if paths_point_to_same_location(&candidate, &active_cache_dir) {
+        return true;
+    }
+
+    let local_cache_dir = preview_cache_dir_path(app_handle);
+    let _ = fs::create_dir_all(&local_cache_dir);
+    if paths_point_to_same_location(&candidate, &local_cache_dir) {
+        return true;
+    }
+
+    let settings = read_settings(app_handle).unwrap_or_default();
+    if let Some(workspace_dir) = settings.workspace_dir {
+        let workspace = PathBuf::from(workspace_dir.trim());
+        if workspace.exists() && workspace.is_dir() {
+            let workspace_main_cache_dir = get_local_cache_copy_dir(&workspace);
+            let _ = fs::create_dir_all(&workspace_main_cache_dir);
+            if paths_point_to_same_location(&candidate, &workspace_main_cache_dir) {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 fn is_cache_preview_jpeg(path: &Path) -> bool {
@@ -1180,6 +1280,88 @@ fn resolve_existing_cache_file_path(cache_dir: &Path, path_buf: &Path, file_size
     cache_file_path
 }
 
+fn is_valid_cached_preview_bytes(bytes: &[u8]) -> bool {
+    // Cache previews are written as JPEG files.
+    if bytes.len() < 4 {
+        return false;
+    }
+    bytes[0] == 0xFF
+        && bytes[1] == 0xD8
+        && bytes[bytes.len() - 2] == 0xFF
+        && bytes[bytes.len() - 1] == 0xD9
+}
+
+fn is_valid_cached_preview_file(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    is_valid_cached_preview_bytes(&bytes)
+}
+
+fn seed_active_preview_cache_from_import_wizard_cache(
+    app_handle: &tauri::AppHandle,
+    import_wizard_cache_dir: &Path,
+    source_path: &Path,
+    target_path: &Path,
+) -> Result<(), String> {
+    if !import_wizard_cache_dir.exists() || !import_wizard_cache_dir.is_dir() {
+        return Ok(());
+    }
+    if !is_supported_preview_image(source_path) || !is_supported_preview_image(target_path) {
+        return Ok(());
+    }
+
+    let src_meta = fs::metadata(source_path).map_err(|e| e.to_string())?;
+    let src_size = src_meta.len();
+    let src_modified_ms = src_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let src_preview_path = resolve_existing_cache_file_path(
+        import_wizard_cache_dir,
+        source_path,
+        src_size,
+        src_modified_ms,
+    );
+    if !src_preview_path.exists() {
+        return Ok(());
+    }
+
+    let dst_meta = fs::metadata(target_path).map_err(|e| e.to_string())?;
+    let dst_size = dst_meta.len();
+    let dst_modified_ms = dst_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let dst_key = build_preview_cache_key(target_path, dst_size, dst_modified_ms);
+    let file_name = format!("{dst_key}.jpg");
+    let active_cache_dir = get_active_preview_cache_dir(app_handle);
+    fs::create_dir_all(&active_cache_dir).map_err(|e| e.to_string())?;
+    let dst_preview_path = active_cache_dir.join(&file_name);
+    if !dst_preview_path.exists() {
+        fs::copy(&src_preview_path, &dst_preview_path).map_err(|e| e.to_string())?;
+    }
+
+    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+    let mut index = load_preview_cache_index(&active_cache_dir);
+    let cached_size = fs::metadata(&dst_preview_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    index.entries.insert(
+        dst_key,
+        PreviewCacheEntry {
+            file_name,
+            size: cached_size,
+            last_access_ms: now_ms(),
+        },
+    );
+    save_preview_cache_index(&active_cache_dir, &index)
+}
+
 fn emit_preview_fill_progress(
     app_handle: &tauri::AppHandle,
     running: bool,
@@ -1412,17 +1594,43 @@ fn resolve_cached_previews(
     include_data_url: bool,
     generate_if_missing: bool,
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
-    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
     let settings = read_settings(app_handle).unwrap_or_default();
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let mut index = load_preview_cache_index(&cache_dir);
     let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
     let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let preview_perf_mode = normalize_preview_performance_mode(
+        settings
+            .preview_performance_mode
+            .as_deref()
+            .unwrap_or(PREVIEW_PERF_AUTO),
+    );
+    resolve_cached_previews_in_cache_dir(
+        paths,
+        include_data_url,
+        generate_if_missing,
+        &cache_dir,
+        max_cache_bytes,
+        &preview_perf_mode,
+    )
+}
+
+fn resolve_cached_previews_in_cache_dir(
+    paths: &[String],
+    include_data_url: bool,
+    generate_if_missing: bool,
+    cache_dir: &Path,
+    max_cache_bytes: u64,
+    preview_perf_mode: &str,
+) -> Result<Vec<CachedImagePreviewRow>, String> {
+    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+    fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
+    let mut index = load_preview_cache_index(cache_dir);
     let current_ms = now_ms();
     let mut index_changed = false;
 
     struct PlannedRow {
         path: String,
+        source_path: PathBuf,
         kind: String,
         cache_key: String,
         file_name: String,
@@ -1494,11 +1702,14 @@ fn resolve_cached_previews(
         if !cache_file_path.exists() && legacy_cache_file_path.exists() {
             let _ = fs::rename(&legacy_cache_file_path, &cache_file_path);
         }
+        if cache_file_path.exists() && !is_valid_cached_preview_file(&cache_file_path) {
+            let _ = fs::remove_file(&cache_file_path);
+        }
 
         if !cache_file_path.exists() && generate_if_missing {
             tasks.push(GenerateTask {
                 row_index: rows.len(),
-                source_path: path_buf,
+                source_path: path_buf.clone(),
                 cache_file_path: cache_file_path.clone(),
                 file_name: file_name.clone(),
             });
@@ -1506,6 +1717,7 @@ fn resolve_cached_previews(
 
         rows.push(RowState::Planned(PlannedRow {
             path,
+            source_path: path_buf,
             kind,
             cache_key,
             file_name,
@@ -1518,13 +1730,7 @@ fn resolve_cached_previews(
         let logical_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        let perf_mode = normalize_preview_performance_mode(
-            settings
-                .preview_performance_mode
-                .as_deref()
-                .unwrap_or(PREVIEW_PERF_AUTO),
-        );
-        let worker_count = preview_worker_count_for_mode(&perf_mode, logical_cores);
+        let worker_count = preview_worker_count_for_mode(preview_perf_mode, logical_cores);
         let (tx, rx) = std::sync::mpsc::channel::<(usize, u64)>();
         let mut handles = Vec::new();
 
@@ -1636,12 +1842,37 @@ fn resolve_cached_previews(
                     kind: planned.kind,
                     preview_path: Some(planned.cache_file_path.to_string_lossy().to_string()),
                     data_url: if include_data_url {
-                        fs::read(&planned.cache_file_path)
-                            .ok()
-                            .map(|bytes| format!(
+                        let mut bytes = fs::read(&planned.cache_file_path).ok().unwrap_or_default();
+                        let mut valid_cached_preview = is_valid_cached_preview_bytes(&bytes);
+
+                        // Self-heal corrupted cache files so broken-image placeholders disappear.
+                        if !valid_cached_preview && generate_if_missing {
+                            if let Ok(regenerated) = generate_preview_cache_bytes(&planned.source_path) {
+                                if fs::write(&planned.cache_file_path, &regenerated).is_ok() {
+                                    let regenerated_size = regenerated.len() as u64;
+                                    index.entries.insert(
+                                        planned.cache_key.clone(),
+                                        PreviewCacheEntry {
+                                            file_name: planned.file_name.clone(),
+                                            size: regenerated_size,
+                                            last_access_ms: current_ms,
+                                        },
+                                    );
+                                    index_changed = true;
+                                    bytes = regenerated;
+                                    valid_cached_preview = true;
+                                }
+                            }
+                        }
+
+                        if valid_cached_preview {
+                            Some(format!(
                                 "data:image/jpeg;base64,{}",
                                 base64::engine::general_purpose::STANDARD.encode(bytes)
                             ))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     },
@@ -1651,11 +1882,11 @@ fn resolve_cached_previews(
     }
 
     if generate_if_missing {
-        cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
+        cleanup_preview_cache(cache_dir, &mut index, max_cache_bytes);
         index_changed = true;
     }
     if index_changed {
-        let _ = save_preview_cache_index(&cache_dir, &index);
+        let _ = save_preview_cache_index(cache_dir, &index);
     }
     Ok(out)
 }
@@ -2091,6 +2322,33 @@ fn save_workspace(app_handle: tauri::AppHandle, workspace_dir: String) -> Result
 }
 
 #[tauri::command]
+fn save_import_wizard_dir(app_handle: tauri::AppHandle, import_wizard_dir: String) -> Result<(), String> {
+    let import_wizard_dir = import_wizard_dir.trim();
+    if import_wizard_dir.is_empty() {
+        return Err("import wizard directory is required".to_string());
+    }
+    let folder = PathBuf::from(import_wizard_dir);
+    if !folder.exists() || !folder.is_dir() {
+        return Err("import wizard directory does not exist".to_string());
+    }
+    if import_wizard_cache_dir_is_protected(&app_handle, &folder) {
+        return Err("import wizard folder conflicts with main/local preview cache".to_string());
+    }
+
+    let mut settings = read_settings(&app_handle)?;
+    settings.import_wizard_dir = Some(folder.to_string_lossy().to_string());
+    write_settings(&app_handle, &settings)
+}
+
+#[tauri::command]
+fn set_import_wizard_live_preview(app_handle: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    let mut settings = read_settings(&app_handle)?;
+    settings.import_wizard_live_preview = Some(enabled);
+    write_settings(&app_handle, &settings)?;
+    Ok(enabled)
+}
+
+#[tauri::command]
 fn clear_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
     let mut settings = read_settings(&app_handle)?;
     settings.workspace_dir = None;
@@ -2260,6 +2518,69 @@ fn non_conflicting_folder_path(destination_root: &Path, folder_name: &str) -> Pa
     }
 }
 
+fn non_conflicting_file_path(destination_root: &Path, file_name: &str) -> PathBuf {
+    let normalized = file_name.trim();
+    let candidate = destination_root.join(normalized);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let source_path = Path::new(normalized);
+    let stem = source_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = source_path
+        .extension()
+        .map(|e| e.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut index: u32 = 2;
+    loop {
+        let next_name = if ext.is_empty() {
+            format!("{stem} ({index})")
+        } else {
+            format!("{stem} ({index}).{ext}")
+        };
+        let next = destination_root.join(next_name);
+        if !next.exists() {
+            return next;
+        }
+        index = index.saturating_add(1);
+    }
+}
+
+fn treatment_file_row_from_entry(entry: fs::DirEntry) -> Result<Option<TreatmentFileRow>, String> {
+    let file_type = entry.file_type().map_err(|e| e.to_string())?;
+    if !file_type.is_file() {
+        return Ok(None);
+    }
+
+    let path_buf = entry.path();
+    let metadata = entry.metadata().map_err(|e| e.to_string())?;
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let created_ms = metadata
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(modified_ms);
+
+    Ok(Some(TreatmentFileRow {
+        path: path_buf.to_string_lossy().to_string(),
+        name: entry.file_name().to_string_lossy().to_string(),
+        size: metadata.len(),
+        created_ms,
+        modified_ms,
+        is_image: is_supported_preview_image(&path_buf),
+    }))
+}
+
 #[tauri::command]
 fn copy_treatment_folder_to_destination(
     workspace_dir: String,
@@ -2298,6 +2619,66 @@ fn copy_treatment_folder_to_destination(
 }
 
 #[tauri::command]
+fn copy_file_to_destination(source_path: String, destination_dir: String) -> Result<String, String> {
+    let source_path = source_path.trim();
+    if source_path.is_empty() {
+        return Err("source path is required".to_string());
+    }
+    let source = PathBuf::from(source_path);
+    if !source.exists() || !source.is_file() {
+        return Err("source file does not exist".to_string());
+    }
+
+    let destination_dir = destination_dir.trim();
+    if destination_dir.is_empty() {
+        return Err("destination directory is required".to_string());
+    }
+    let destination_root = PathBuf::from(destination_dir);
+    if !destination_root.exists() || !destination_root.is_dir() {
+        return Err("destination directory does not exist".to_string());
+    }
+
+    let file_name = source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "source file name is invalid".to_string())?;
+    let destination_path = non_conflicting_file_path(&destination_root, &file_name);
+    fs::copy(&source, &destination_path).map_err(|e| e.to_string())?;
+    Ok(destination_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn copy_patient_folder_to_destination(
+    workspace_dir: String,
+    patient_folder: String,
+    destination_dir: String,
+) -> Result<String, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+
+    let destination_root = PathBuf::from(destination_dir.trim());
+    if !destination_root.exists() || !destination_root.is_dir() {
+        return Err("destination directory does not exist".to_string());
+    }
+
+    let source_folder = workspace.join(patient_folder);
+    if !source_folder.exists() || !source_folder.is_dir() {
+        return Err("source patient folder does not exist".to_string());
+    }
+
+    let destination_folder = non_conflicting_folder_path(&destination_root, patient_folder);
+    copy_dir_recursive(&source_folder, &destination_folder)?;
+    Ok(destination_folder.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn list_treatment_files(
     workspace_dir: String,
     patient_folder: String,
@@ -2325,6 +2706,123 @@ fn list_treatment_files(
     let mut out = Vec::new();
     for entry in fs::read_dir(&treatment_path).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        if let Some(row) = treatment_file_row_from_entry(entry)? {
+            out.push(row);
+        }
+    }
+
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+#[tauri::command]
+fn list_patient_overview(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+) -> Result<PatientOverviewRow, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+
+    let patient_path = workspace.join(patient_folder);
+    if !patient_path.exists() || !patient_path.is_dir() {
+        return Err("patient folder does not exist".to_string());
+    }
+
+    let conn = open_db(&app_handle)?;
+    let mut folder_rows: Vec<PatientFolderOverviewRow> = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT folder_name, folder_date, treatment_name
+                 FROM patient_treatment_index
+                 WHERE workspace_dir = ?1 AND patient_folder = ?2
+                 ORDER BY folder_date DESC, folder_name DESC",
+            )
+            .map_err(|e| e.to_string())?;
+
+        let mapped = stmt
+            .query_map(params![workspace_dir, patient_folder], |row| {
+                Ok(PatientFolderOverviewRow {
+                    folder_name: row.get::<_, String>(0)?,
+                    folder_date: row.get::<_, String>(1)?,
+                    treatment_name: row.get::<_, String>(2)?,
+                    preview_paths: Vec::new(),
+                })
+            })
+            .map_err(|e| e.to_string())?;
+
+        for row in mapped {
+            folder_rows.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    for folder in &mut folder_rows {
+        let folder_name = folder.folder_name.trim().to_string();
+        if folder_name.is_empty() {
+            continue;
+        }
+        let folder_path = patient_path.join(&folder_name);
+        if !folder_path.exists() || !folder_path.is_dir() {
+            continue;
+        }
+        let mut image_paths: Vec<String> = Vec::new();
+        for entry in fs::read_dir(&folder_path).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let path_buf = entry.path();
+            if !is_supported_preview_image(&path_buf) {
+                continue;
+            }
+            image_paths.push(path_buf.to_string_lossy().to_string());
+        }
+        image_paths.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+        folder.preview_paths = image_paths.into_iter().take(3).collect();
+    }
+
+    let mut root_files: Vec<TreatmentFileRow> = Vec::new();
+    for entry in fs::read_dir(&patient_path).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if let Some(row) = treatment_file_row_from_entry(entry)? {
+            if row.name == ".mpm-metadata.json" {
+                continue;
+            }
+            root_files.push(row);
+        }
+    }
+    root_files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+
+    Ok(PatientOverviewRow {
+        treatment_folders: folder_rows,
+        root_files,
+    })
+}
+
+#[tauri::command]
+fn list_import_wizard_files(folder_dir: String) -> Result<Vec<ImportWizardFileRow>, String> {
+    let folder_dir = folder_dir.trim();
+    if folder_dir.is_empty() {
+        return Err("folder directory is required".to_string());
+    }
+
+    let folder = PathBuf::from(folder_dir);
+    if !folder.exists() || !folder.is_dir() {
+        return Err("folder directory does not exist".to_string());
+    }
+
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&folder).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
         let file_type = entry.file_type().map_err(|e| e.to_string())?;
         if !file_type.is_file() {
             continue;
@@ -2338,18 +2836,289 @@ fn list_treatment_files(
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        let created_ms = metadata
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(modified_ms);
 
-        out.push(TreatmentFileRow {
+        out.push(ImportWizardFileRow {
             path: path_buf.to_string_lossy().to_string(),
             name: entry.file_name().to_string_lossy().to_string(),
             size: metadata.len(),
+            created_ms,
             modified_ms,
             is_image: is_supported_preview_image(&path_buf),
         });
     }
 
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out.sort_by(|a, b| {
+        b.modified_ms
+            .cmp(&a.modified_ms)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     Ok(out)
+}
+
+#[tauri::command]
+fn ensure_import_wizard_preview_cache(app_handle: tauri::AppHandle, folder_dir: String) -> Result<String, String> {
+    let folder_dir = folder_dir.trim();
+    if folder_dir.is_empty() {
+        return Err("folder directory is required".to_string());
+    }
+
+    let folder = PathBuf::from(folder_dir);
+    if !folder.exists() || !folder.is_dir() {
+        return Err("folder directory does not exist".to_string());
+    }
+    if import_wizard_cache_dir_is_protected(&app_handle, &folder) {
+        return Err("import wizard folder conflicts with main/local preview cache".to_string());
+    }
+
+    let cache_dir = folder.join(".preview-cache");
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+    Ok(cache_dir.to_string_lossy().to_string())
+}
+
+fn clear_import_wizard_preview_cache_for_folder(folder: &Path) -> Result<(), String> {
+    let cache_dir = folder.join(".preview-cache");
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+
+    if let Ok(entries) = fs::read_dir(&cache_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                let _ = fs::remove_dir_all(&path);
+            } else {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    save_preview_cache_index(&cache_dir, &PreviewCacheIndex::default())
+}
+
+#[tauri::command]
+fn clear_import_wizard_preview_cache(app_handle: tauri::AppHandle, folder_dir: String) -> Result<bool, String> {
+    let folder_dir = folder_dir.trim();
+    if folder_dir.is_empty() {
+        return Err("folder directory is required".to_string());
+    }
+
+    let folder = PathBuf::from(folder_dir);
+    if !folder.exists() || !folder.is_dir() {
+        return Err("folder directory does not exist".to_string());
+    }
+    if import_wizard_cache_dir_is_protected(&app_handle, &folder) {
+        return Err("refusing to clear protected preview cache directory".to_string());
+    }
+
+    clear_import_wizard_preview_cache_for_folder(&folder)?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn open_import_wizard_preview_window(app_handle: tauri::AppHandle, path: String) -> Result<bool, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+    if let Ok(mut current) = import_wizard_preview_path_store().lock() {
+        *current = path.clone();
+    }
+
+    let label = "import_wizard_preview";
+    let window = if let Some(existing) = app_handle.get_webview_window(label) {
+        existing
+    } else {
+        let settings = read_settings(&app_handle).unwrap_or_default();
+        let state = settings.import_wizard_preview_window_state;
+        let (width, height) = match state {
+            Some(s) if !s.maximized => {
+                let w = s.width.max(420).min(1600);
+                let h = s.height.max(320).min(1200);
+                (w, h)
+            }
+            _ => (820, 620),
+        };
+
+        tauri::WebviewWindowBuilder::new(
+            &app_handle,
+            label,
+            tauri::WebviewUrl::App("import-preview.html".into()),
+        )
+        .title("Import Live Preview")
+        .inner_size(width as f64, height as f64)
+        .min_inner_size(520.0, 420.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?
+    };
+
+    window.show().map_err(|e| e.to_string())?;
+    window
+        .emit("import-wizard-preview-file", serde_json::json!({ "path": path }))
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn get_import_wizard_preview_data_url(path: String) -> Result<String, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime = match ext.as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        _ => "application/octet-stream",
+    };
+
+    let bytes = fs::read(&source).map_err(|e| e.to_string())?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
+#[tauri::command]
+fn close_import_wizard_preview_window(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    if let Ok(mut current) = import_wizard_preview_path_store().lock() {
+        current.clear();
+    }
+    let Some(window) = app_handle.get_webview_window("import_wizard_preview") else {
+        return Ok(false);
+    };
+    window.close().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn close_import_wizard_helper_window(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let Some(window) = app_handle.get_webview_window("import_wizard_helper") else {
+        return Ok(false);
+    };
+    window.close().map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn get_current_import_wizard_preview_path() -> Result<String, String> {
+    let current = import_wizard_preview_path_store()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(current.clone())
+}
+
+#[tauri::command]
+fn notify_import_wizard_completed(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+    target_folder: String,
+    job_id: Option<u64>,
+    import_wizard_dir: Option<String>,
+) -> Result<bool, String> {
+    app_handle
+        .emit(
+            "import-wizard-completed",
+            ImportWizardCompletedEvent {
+                workspace_dir: workspace_dir.trim().to_string(),
+                patient_folder: patient_folder.trim().to_string(),
+                target_folder: target_folder.trim().to_string(),
+                job_id,
+                import_wizard_dir: import_wizard_dir
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn remove_import_wizard_cached_preview(
+    app_handle: tauri::AppHandle,
+    folder_dir: String,
+    path: String,
+) -> Result<bool, String> {
+    let folder_dir = folder_dir.trim();
+    if folder_dir.is_empty() {
+        return Err("folder directory is required".to_string());
+    }
+    let folder = PathBuf::from(folder_dir);
+    if !folder.exists() || !folder.is_dir() {
+        return Err("folder directory does not exist".to_string());
+    }
+    if import_wizard_cache_dir_is_protected(&app_handle, &folder) {
+        return Err("refusing to modify protected preview cache directory".to_string());
+    }
+
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source_path = PathBuf::from(path);
+    if !is_supported_preview_image(&source_path) {
+        return Ok(false);
+    }
+
+    let file_meta = fs::metadata(&source_path).map_err(|e| e.to_string())?;
+    let file_size = file_meta.len();
+    let modified_ms = file_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let cache_key = build_preview_cache_key(&source_path, file_size, modified_ms);
+    let legacy_key = build_preview_cache_key_legacy(&source_path, file_size, modified_ms);
+    let cache_dir = folder.join(".preview-cache");
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+
+    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+    let mut index = load_preview_cache_index(&cache_dir);
+
+    let mut changed = false;
+    let mut candidate_keys = vec![cache_key.clone(), legacy_key.clone()];
+    candidate_keys.sort();
+    candidate_keys.dedup();
+
+    for key in candidate_keys {
+        if let Some(entry) = index.entries.remove(&key) {
+            let _ = fs::remove_file(cache_dir.join(entry.file_name));
+            changed = true;
+        } else {
+            let _ = fs::remove_file(cache_dir.join(format!("{key}.jpg")));
+        }
+    }
+
+    if changed {
+        save_preview_cache_index(&cache_dir, &index)?;
+    }
+    Ok(changed)
 }
 
 #[tauri::command]
@@ -2775,6 +3544,53 @@ async fn get_cached_image_previews(
 }
 
 #[tauri::command]
+async fn get_import_wizard_cached_previews(
+    app_handle: tauri::AppHandle,
+    folder_dir: String,
+    paths: Vec<String>,
+    include_data_url: Option<bool>,
+    generate_if_missing: Option<bool>,
+) -> Result<Vec<CachedImagePreviewRow>, String> {
+    let folder_dir = folder_dir.trim().to_string();
+    if folder_dir.is_empty() {
+        return Err("folder directory is required".to_string());
+    }
+    let folder = PathBuf::from(&folder_dir);
+    if !folder.exists() || !folder.is_dir() {
+        return Err("folder directory does not exist".to_string());
+    }
+    if import_wizard_cache_dir_is_protected(&app_handle, &folder) {
+        return Err("import wizard folder conflicts with main/local preview cache".to_string());
+    }
+
+    let include_data_url = include_data_url.unwrap_or(true);
+    let generate_if_missing = generate_if_missing.unwrap_or(true);
+    let settings = read_settings(&app_handle).unwrap_or_default();
+    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
+    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let preview_perf_mode = normalize_preview_performance_mode(
+        settings
+            .preview_performance_mode
+            .as_deref()
+            .unwrap_or(PREVIEW_PERF_AUTO),
+    );
+    let cache_dir = folder.join(".preview-cache");
+
+    tauri::async_runtime::spawn_blocking(move || {
+        resolve_cached_previews_in_cache_dir(
+            &paths,
+            include_data_url,
+            generate_if_missing,
+            &cache_dir,
+            max_cache_bytes,
+            &preview_perf_mode,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 async fn get_existing_cached_preview_paths(
     app_handle: tauri::AppHandle,
     paths: Vec<String>,
@@ -2821,7 +3637,7 @@ async fn get_existing_cached_preview_paths(
 
             out.push(CachedPreviewPathRow {
                 path,
-                preview_path: if cache_file_path.exists() {
+                preview_path: if cache_file_path.exists() && is_valid_cached_preview_file(&cache_file_path) {
                     Some(cache_file_path.to_string_lossy().to_string())
                 } else {
                     None
@@ -2976,6 +3792,10 @@ fn start_import_files(
     let job_id = IMPORT_JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let app_handle_clone = app_handle.clone();
     let workspace_dir_for_preview_sync = workspace_dir.clone();
+    let import_wizard_cache_dir = read_settings(&app_handle)
+        .ok()
+        .and_then(|s| s.import_wizard_dir)
+        .map(|dir| PathBuf::from(dir.trim()).join(".preview-cache"));
     let import_files = file_paths
         .into_iter()
         .map(|p| p.trim().to_string())
@@ -3046,6 +3866,14 @@ fn start_import_files(
                     }
 
                     if is_supported_preview_image(&dst_path) {
+                        if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
+                            let _ = seed_active_preview_cache_from_import_wizard_cache(
+                                &app_handle_clone,
+                                cache_dir,
+                                &src_path,
+                                &dst_path,
+                            );
+                        }
                         pending_preview_paths.push(dst_path.to_string_lossy().to_string());
                         if pending_preview_paths.len() >= IMPORT_PREVIEW_MICROBATCH_SIZE {
                             let batch = std::mem::take(&mut pending_preview_paths);
@@ -3304,6 +4132,32 @@ fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheS
         used_bytes,
         max_bytes,
         used_percent,
+    })
+}
+
+#[tauri::command]
+async fn run_system_update(app_handle: tauri::AppHandle) -> Result<SystemUpdateResult, String> {
+    let updater = app_handle
+        .updater_builder()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(SystemUpdateResult {
+            updated: false,
+            version: None,
+        });
+    };
+
+    let next_version = update.version.to_string();
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(SystemUpdateResult {
+        updated: true,
+        version: Some(next_version),
     })
 }
 
@@ -3616,6 +4470,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = apply_saved_window_state(&app.handle(), &window);
@@ -3625,21 +4480,40 @@ pub fn run() {
         .on_window_event(|window, event| {
             match event {
                 tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) | tauri::WindowEvent::CloseRequested { .. } => {
-                    let _ = persist_window_state(&window.app_handle(), window);
+                    if window.label() == "main" {
+                        let _ = persist_main_window_state(&window.app_handle(), window);
+                    } else if window.label() == "import_wizard_preview" {
+                        let _ = persist_import_wizard_preview_window_state(&window.app_handle(), window);
+                    }
                 }
                 _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![
             save_workspace,
+            save_import_wizard_dir,
+            set_import_wizard_live_preview,
             clear_workspace,
             delete_database,
             open_workspace_dir,
             open_preview_cache_dir,
             open_path_with_default,
             copy_treatment_folder_to_destination,
+            copy_file_to_destination,
+            copy_patient_folder_to_destination,
+            list_import_wizard_files,
+            ensure_import_wizard_preview_cache,
+            clear_import_wizard_preview_cache,
+            open_import_wizard_preview_window,
+            get_import_wizard_preview_data_url,
+            get_current_import_wizard_preview_path,
+            close_import_wizard_preview_window,
+            close_import_wizard_helper_window,
+            notify_import_wizard_completed,
+            remove_import_wizard_cached_preview,
             list_patient_treatment_folders,
             list_patient_timeline_entries,
+            list_patient_overview,
             list_treatment_files,
             create_patient_with_metadata,
             save_patient_metadata,
@@ -3654,6 +4528,7 @@ pub fn run() {
             get_image_previews,
             get_quick_image_previews,
             get_cached_image_previews,
+            get_import_wizard_cached_previews,
             get_existing_cached_preview_paths,
             prefetch_treatment_folder_previews,
             start_import_files,
@@ -3664,6 +4539,7 @@ pub fn run() {
             sync_local_cache_copy,
             delete_local_cache_copy_files,
             get_preview_cache_stats,
+            run_system_update,
             get_preview_debug_counts,
             cleanup_preview_cache_for_workspace,
             get_preview_fill_status,

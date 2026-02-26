@@ -1,0 +1,21 @@
+* { box-sizing: border-box; }
+html, body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+}
+body{
+  background: #000000;
+}
+.preview-root{
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+}
+#previewImage{
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}

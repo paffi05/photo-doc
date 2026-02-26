@@ -82,6 +82,16 @@ export function initMainContent({
     onOpenPath: async (path) => {
       await invoke("open_path_with_default", { path });
     },
+    onOpenTreatmentFolder: (folderName) => {
+      const target = String(folderName ?? "").trim();
+      if (!target) return;
+      const points = Array.from(timelineTrack?.querySelectorAll(".main-timeline-point") ?? []);
+      const point = points.find((el) => String(el?.dataset?.folderName ?? "").trim() === target) ?? null;
+      if (!point) return;
+      setSelectedTimelinePoint(point);
+      ensureTimelinePointVisible(point);
+      positionImportProgressCapsules();
+    },
   });
 
   const emptyState = document.createElement("div");
@@ -158,6 +168,7 @@ export function initMainContent({
   const IMPORT_PREVIEW_MAX_ITEMS = 160;
   const IMPORT_PREVIEW_CONCURRENCY = 4;
   const importJobs = new Map();
+  const bufferedImportProgressByJobId = new Map();
   let importLiveRefreshTimerId = null;
   let importLiveRefreshPending = false;
   let missingPatientIdTaken = false;
@@ -223,6 +234,17 @@ export function initMainContent({
     if (!normalized) return "";
     const withPrefix = normalized.startsWith("/") ? normalized : `/${normalized}`;
     return `file://${encodeURI(withPrefix)}`;
+  }
+
+  function normalizeDialogPathSelection(selected) {
+    const raw = Array.isArray(selected) ? selected[0] : selected;
+    let path = String(raw ?? "").trim();
+    if (!path) return "";
+    if (path.startsWith("file://")) {
+      path = decodeURIComponent(path.replace(/^file:\/\//, ""));
+      if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+    }
+    return path;
   }
 
   function isNumericPatientId(value) {
@@ -522,7 +544,57 @@ export function initMainContent({
     if (typeof onImportDebugStateChange === "function") {
       onImportDebugStateChange(`import started (#${id})`);
     }
+
+    const buffered = bufferedImportProgressByJobId.get(id);
+    if (buffered) {
+      applyImportProgressEventForJob(job, buffered);
+      bufferedImportProgressByJobId.delete(id);
+    }
+
     requestAnimationFrame(positionImportProgressCapsules);
+  }
+
+  function applyImportProgressEventForJob(job, { percent = 0, done = false, error = "" } = {}) {
+    if (!job) return;
+
+    job.progressValue = Math.max(0, Math.min(100, Number(percent) || 0));
+    updateImportProgressCapsule(job.capsule, job.progressValue);
+    positionImportProgressCapsules();
+    if (typeof onImportDebugStateChange === "function") {
+      onImportDebugStateChange(`import #${job.id}: ${Math.round(job.progressValue)}%`);
+    }
+
+    if (!done) {
+      const selectedFolder = getSelectedTimelineFolderName().trim();
+      if (selectedFolder && selectedFolder === job.targetFolder) {
+        scheduleImportLiveRefresh();
+      }
+      return;
+    }
+    if (job.done) return;
+
+    job.done = true;
+    const elapsed = Date.now() - job.shownAt;
+    const minVisibleMs = 1500;
+    const waitMs = Math.max(0, minVisibleMs - elapsed);
+    if (waitMs > 0) {
+      job.capsule.classList.add("holding");
+      updateImportProgressCapsule(job.capsule, Math.max(1, job.progressValue));
+    }
+    if (job.finalizeTimerId !== null) clearTimeout(job.finalizeTimerId);
+    animateJobProgressTo100(job, waitMs, () => {
+      if (error) {
+        console.error("import failed:", error);
+        if (typeof onImportDebugStateChange === "function") {
+          onImportDebugStateChange(`error: import #${job.id}`);
+        }
+      } else {
+        void refreshTimeline();
+      }
+      releaseImportJob(job);
+      importStartBtn.disabled = false;
+      importCancelBtn.disabled = false;
+    });
   }
 
   function animateJobProgressTo100(job, durationMs, onDone) {
@@ -867,8 +939,15 @@ export function initMainContent({
   function updateTreatmentFilesPanelForSelection() {
     const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
     const selectedFolder = getSelectedTimelineFolderName();
-    if (!context?.workspaceDir || !context?.patientFolder || !selectedFolder) {
+    if (!context?.workspaceDir || !context?.patientFolder) {
       treatmentFilesPanel.clear();
+      return;
+    }
+    if (!selectedFolder) {
+      void treatmentFilesPanel.setPatientOverview({
+        workspaceDir: context.workspaceDir,
+        patientFolder: context.patientFolder,
+      });
       return;
     }
     void treatmentFilesPanel.setContext({
@@ -1066,7 +1145,7 @@ export function initMainContent({
             multiple: false,
             title: "Choose destination folder",
           });
-          const destinationDir = Array.isArray(selected) ? String(selected[0] ?? "").trim() : String(selected ?? "").trim();
+          const destinationDir = normalizeDialogPathSelection(selected);
           if (!destinationDir) return;
           await invoke("copy_treatment_folder_to_destination", {
             workspaceDir: exportPayload.workspaceDir,
@@ -1195,7 +1274,10 @@ export function initMainContent({
       if (timelineLine) timelineLine.style.width = "0px";
       if (timelinePrefixLine) timelinePrefixLine.hidden = true;
       setTimelineVisible(false);
-      treatmentFilesPanel.clear();
+      void treatmentFilesPanel.setPatientOverview({
+        workspaceDir: context.workspaceDir,
+        patientFolder: context.patientFolder,
+      });
       return;
     }
 
@@ -1608,48 +1690,14 @@ export function initMainContent({
     const jobId = Number(payload?.job_id ?? payload?.jobId ?? 0) || null;
     if (!jobId) return;
     const job = importJobs.get(jobId);
-    if (!job) return;
-
     const percent = Number(payload?.percent ?? 0);
     const done = Boolean(payload?.done);
     const error = payload?.error ? String(payload.error) : "";
-
-    job.progressValue = Math.max(0, Math.min(100, Number(percent) || 0));
-    updateImportProgressCapsule(job.capsule, job.progressValue);
-    positionImportProgressCapsules();
-    if (typeof onImportDebugStateChange === "function") {
-      onImportDebugStateChange(`import #${job.id}: ${Math.round(job.progressValue)}%`);
-    }
-
-    if (!done) {
-      const selectedFolder = getSelectedTimelineFolderName().trim();
-      if (selectedFolder && selectedFolder === job.targetFolder) {
-        scheduleImportLiveRefresh();
-      }
+    if (!job) {
+      bufferedImportProgressByJobId.set(jobId, { percent, done, error });
       return;
     }
-    job.done = true;
-    const elapsed = Date.now() - job.shownAt;
-    const minVisibleMs = 1500;
-    const waitMs = Math.max(0, minVisibleMs - elapsed);
-    if (waitMs > 0) {
-      job.capsule.classList.add("holding");
-      updateImportProgressCapsule(job.capsule, Math.max(1, job.progressValue));
-    }
-    if (job.finalizeTimerId !== null) clearTimeout(job.finalizeTimerId);
-    animateJobProgressTo100(job, waitMs, () => {
-      if (error) {
-        console.error("import failed:", error);
-        if (typeof onImportDebugStateChange === "function") {
-          onImportDebugStateChange(`error: import #${job.id}`);
-        }
-      } else {
-        void refreshTimeline();
-      }
-      releaseImportJob(job);
-      importStartBtn.disabled = false;
-      importCancelBtn.disabled = false;
-    });
+    applyImportProgressEventForJob(job, { percent, done, error });
   });
 
   function setSelectedPatientHeader({ lastName = "", firstName = "", patientId = "" } = {}) {
@@ -1737,6 +1785,29 @@ export function initMainContent({
         return;
       }
       await refreshTimeline();
+    },
+    registerExternalImportJob: ({
+      jobId,
+      targetFolder,
+      workspaceDir,
+      patientFolder,
+    } = {}) => {
+      const normalizedWorkspace = String(workspaceDir ?? "").trim();
+      const normalizedPatient = String(patientFolder ?? "").trim();
+      const normalizedTarget = String(targetFolder ?? "").trim();
+      const numericJobId = Number(jobId) || null;
+      if (!numericJobId || !normalizedWorkspace || !normalizedPatient || !normalizedTarget) return;
+      if (typeof onImportActivityChange === "function") {
+        onImportActivityChange({ patientFolder: normalizedPatient, active: true });
+      }
+      trackNewImportJob({
+        jobId: numericJobId,
+        targetFolder: normalizedTarget,
+        workspaceDir: normalizedWorkspace,
+        patientFolder: normalizedPatient,
+      });
+      selectedTimelineKey = normalizedTarget;
+      void refreshTimeline();
     },
   };
 }

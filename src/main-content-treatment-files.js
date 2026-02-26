@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 const VISIBLE_FIRST_IMAGE_COUNT = 10;
 const VISIBLE_FIRST_PREVIEW_CONCURRENCY = 6;
@@ -30,18 +31,88 @@ function extractExt(name = "") {
   return String(name).slice(idx + 1).toUpperCase();
 }
 
-export function createTreatmentFilesPanel({ container, onOpenPath }) {
+function fileExtBadgeLabel(name = "", maxLen = 4) {
+  const ext = extractExt(name) || "FILE";
+  return ext.length > maxLen ? "?" : ext;
+}
+
+function formatDateOnly(timestampMs = 0) {
+  const ms = Number(timestampMs) || 0;
+  if (ms <= 0) return "";
+  const d = new Date(ms);
+  if (!Number.isFinite(d.getTime())) return "";
+  return d.toLocaleDateString();
+}
+
+function parseTreatmentFolderHeader(folderName = "") {
+  const raw = String(folderName ?? "").trim();
+  if (!raw) return { title: "", date: "" };
+  const match = /^(\d{4}-\d{2}-\d{2})\s+(.+)$/.exec(raw);
+  if (!match) return { title: raw, date: "" };
+  const date = String(match[1] ?? "").trim();
+  const title = String(match[2] ?? "").trim();
+  return { title: title || raw, date };
+}
+
+function normalizeDialogPathSelection(selected) {
+  const raw = Array.isArray(selected) ? selected[0] : selected;
+  let path = String(raw ?? "").trim();
+  if (!path) return "";
+  if (path.startsWith("file://")) {
+    path = decodeURIComponent(path.replace(/^file:\/\//, ""));
+    if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
+  }
+  return path;
+}
+
+export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatmentFolder }) {
   const panel = document.createElement("section");
   panel.className = "treatment-files-panel";
   panel.hidden = true;
   panel.innerHTML = `
     <div class="treatment-files-header">
-      <div class="treatment-files-title">Treatment Files</div>
-      <div class="treatment-files-folder"></div>
-      <div class="treatment-files-counts"></div>
+      <div class="treatment-files-header-main">
+        <div class="treatment-files-title">Treatment Files</div>
+        <div class="treatment-files-folder"></div>
+        <div class="treatment-files-counts"></div>
+      </div>
+      <div class="treatment-files-view-toggle" role="group" aria-label="Treatment files view mode">
+        <button
+          type="button"
+          class="treatment-files-view-btn"
+          data-view-mode="list"
+          aria-label="List view"
+          title="List view"
+        >
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <path d="M4 5.2H16" />
+            <path d="M4 10H16" />
+            <path d="M4 14.8H16" />
+          </svg>
+        </button>
+        <button
+          type="button"
+          class="treatment-files-view-btn"
+          data-view-mode="tile"
+          aria-label="Tile view"
+          title="Tile view"
+        >
+          <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+            <rect x="3.6" y="3.6" width="5.8" height="5.8" rx="1.1" />
+            <rect x="10.6" y="10.6" width="5.8" height="5.8" rx="1.1" />
+          </svg>
+        </button>
+      </div>
     </div>
     <div class="treatment-files-loading" hidden>Loading files...</div>
     <div class="treatment-files-empty" hidden>No files in this treatment folder.</div>
+    <div class="treatment-folders-overview-wrap" hidden>
+      <div class="treatment-files-section-title">Folders</div>
+      <div class="treatment-folders-overview-grid"></div>
+    </div>
+    <div class="treatment-files-list-wrap" hidden>
+      <div class="treatment-files-list"></div>
+    </div>
     <div class="treatment-files-images-wrap" hidden>
       <div class="treatment-files-section-title">Images</div>
       <div class="treatment-files-images-grid"></div>
@@ -53,10 +124,17 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
   `;
   container.appendChild(panel);
 
+  const titleEl = panel.querySelector(".treatment-files-title");
   const folderEl = panel.querySelector(".treatment-files-folder");
   const countsEl = panel.querySelector(".treatment-files-counts");
+  const viewToggleEl = panel.querySelector(".treatment-files-view-toggle");
+  const viewBtns = Array.from(panel.querySelectorAll(".treatment-files-view-btn"));
   const loadingEl = panel.querySelector(".treatment-files-loading");
   const emptyEl = panel.querySelector(".treatment-files-empty");
+  const foldersOverviewWrapEl = panel.querySelector(".treatment-folders-overview-wrap");
+  const foldersOverviewGridEl = panel.querySelector(".treatment-folders-overview-grid");
+  const listWrapEl = panel.querySelector(".treatment-files-list-wrap");
+  const listEl = panel.querySelector(".treatment-files-list");
   const imagesWrapEl = panel.querySelector(".treatment-files-images-wrap");
   const imagesGridEl = panel.querySelector(".treatment-files-images-grid");
   const otherWrapEl = panel.querySelector(".treatment-files-other-wrap");
@@ -66,10 +144,53 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
   let activeContext = { workspaceDir: "", patientFolder: "", treatmentFolder: "" };
   let activeRequestId = 0;
   let isBackgroundFillRunning = false;
+  let currentViewMode = "tile";
   const runtimePreviewByPath = new Map();
   const cacheWarmupRequested = new Set();
   let activeCardsByPath = new Map();
   let activeImageFiles = [];
+
+  const VIEW_MODE_STORAGE_KEY = "mpm.treatmentFilesViewMode";
+  const normalizeViewMode = (value) => (value === "list" ? "list" : "tile");
+  function loadStoredViewMode() {
+    try {
+      return normalizeViewMode(localStorage.getItem(VIEW_MODE_STORAGE_KEY));
+    } catch {
+      return "tile";
+    }
+  }
+  function saveStoredViewMode(mode) {
+    try {
+      localStorage.setItem(VIEW_MODE_STORAGE_KEY, normalizeViewMode(mode));
+    } catch {
+      // ignore
+    }
+  }
+  function applyViewModeUi(mode) {
+    currentViewMode = normalizeViewMode(mode);
+    panel.dataset.viewMode = currentViewMode;
+    for (const btn of viewBtns) {
+      const isActive = btn.dataset.viewMode === currentViewMode;
+      btn.classList.toggle("active", isActive);
+      btn.setAttribute("aria-pressed", isActive ? "true" : "false");
+    }
+  }
+  function setViewMode(mode, { rerender = true } = {}) {
+    const normalized = normalizeViewMode(mode);
+    if (currentViewMode === normalized && rerender) return;
+    applyViewModeUi(normalized);
+    saveStoredViewMode(normalized);
+    if (rerender && activeContext?.workspaceDir && activeContext?.patientFolder && activeContext?.treatmentFolder) {
+      void setContext(activeContext);
+    }
+  }
+  applyViewModeUi(loadStoredViewMode());
+  viewToggleEl?.addEventListener("click", (event) => {
+    const btn = event.target?.closest?.(".treatment-files-view-btn");
+    if (!btn) return;
+    const mode = btn.dataset.viewMode === "list" ? "list" : "tile";
+    setViewMode(mode, { rerender: true });
+  });
 
   void listen("preview-fill-status", (event) => {
     const wasRunning = isBackgroundFillRunning;
@@ -116,45 +237,209 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
     activeCardsByPath = new Map();
     activeImageFiles = [];
     panel.hidden = true;
+    titleEl.textContent = "Treatment Files";
     folderEl.textContent = "";
     countsEl.textContent = "";
+    viewToggleEl.hidden = false;
     loadingEl.hidden = true;
     emptyEl.hidden = true;
+    foldersOverviewWrapEl.hidden = true;
+    listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
     otherWrapEl.hidden = true;
+    foldersOverviewGridEl.innerHTML = "";
+    listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
   }
 
   function setLoadingState(folderName = "") {
     panel.hidden = false;
-    folderEl.textContent = folderName;
+    const { title, date } = parseTreatmentFolderHeader(folderName);
+    titleEl.textContent = title || folderName;
+    folderEl.textContent = date;
+    countsEl.textContent = "";
+    viewToggleEl.hidden = false;
+    loadingEl.hidden = false;
+    emptyEl.hidden = true;
+    foldersOverviewWrapEl.hidden = true;
+    listWrapEl.hidden = true;
+    imagesWrapEl.hidden = true;
+    otherWrapEl.hidden = true;
+    foldersOverviewGridEl.innerHTML = "";
+    listEl.innerHTML = "";
+    imagesGridEl.innerHTML = "";
+    otherListEl.innerHTML = "";
+  }
+
+  function createFolderStackItem(src = "", orderClass = "") {
+    const item = document.createElement("span");
+    item.className = `treatment-folder-stack-item ${orderClass}`.trim();
+    const thumb = document.createElement("span");
+    thumb.className = "treatment-image-thumb treatment-folder-stack-thumb";
+    const img = document.createElement("img");
+    img.className = "full-preview";
+    img.alt = "";
+    img.loading = "lazy";
+    img.decoding = "async";
+    img.src = src;
+    thumb.appendChild(img);
+    item.appendChild(thumb);
+    return item;
+  }
+
+  function createFolderOverviewCard(folder = {}, previewSrcByPath = new Map()) {
+    const folderName = String(folder?.folder_name ?? folder?.folderName ?? "").trim();
+    const folderDate = String(folder?.folder_date ?? folder?.folderDate ?? "").trim();
+    const treatmentName = String(folder?.treatment_name ?? folder?.treatmentName ?? "").trim();
+    const previewPaths = Array.isArray(folder?.preview_paths ?? folder?.previewPaths)
+      ? (folder?.preview_paths ?? folder?.previewPaths).map((p) => String(p ?? "").trim()).filter(Boolean)
+      : [];
+
+    const card = document.createElement("button");
+    card.type = "button";
+    card.className = "treatment-folder-overview-card";
+    card.title = folderName || treatmentName || "Folder";
+
+    const stack = document.createElement("span");
+    stack.className = "treatment-folder-stack";
+    const stackSources = [];
+    for (const path of previewPaths.slice(0, 3)) {
+      const cached = previewSrcByPath.get(path) ?? "";
+      if (cached) {
+        stackSources.push(cached);
+        continue;
+      }
+      try {
+        stackSources.push(convertFileSrc(path));
+      } catch {
+        stackSources.push("");
+      }
+    }
+    const realSources = stackSources.filter(Boolean);
+    if (realSources.length < 1) {
+      const empty = document.createElement("span");
+      empty.className = "treatment-folder-stack-empty";
+      empty.textContent = "No images";
+      stack.appendChild(empty);
+    } else {
+      const classes =
+        realSources.length === 1
+          ? ["solo"]
+          : realSources.length === 2
+            ? ["duo-left", "duo-right"]
+            : ["one", "two", "three"];
+      for (let i = 0; i < realSources.length && i < classes.length; i += 1) {
+        stack.appendChild(createFolderStackItem(realSources[i], classes[i]));
+      }
+    }
+    card.appendChild(stack);
+
+    const label = document.createElement("span");
+    label.className = "treatment-folder-overview-name";
+    label.textContent = treatmentName || folderName || "Folder";
+    card.appendChild(label);
+
+    const date = document.createElement("span");
+    date.className = "treatment-folder-overview-date";
+    date.textContent = folderDate || "";
+    card.appendChild(date);
+
+    card.addEventListener("click", () => {
+      if (typeof onOpenTreatmentFolder === "function" && folderName) {
+        onOpenTreatmentFolder(folderName);
+      }
+    });
+    return card;
+  }
+
+  async function setPatientOverviewContext({ workspaceDir = "", patientFolder = "" } = {}) {
+    const w = String(workspaceDir ?? "").trim();
+    const p = String(patientFolder ?? "").trim();
+    if (!w || !p) {
+      clearPanel();
+      return;
+    }
+
+    activeContext = { workspaceDir: w, patientFolder: p, treatmentFolder: "" };
+    activeContextKey = `${w}::${p}::overview`;
+    const requestId = ++activeRequestId;
+    panel.hidden = false;
+    titleEl.textContent = "Overview";
+    folderEl.textContent = "";
     countsEl.textContent = "";
     loadingEl.hidden = false;
     emptyEl.hidden = true;
+    viewToggleEl.hidden = true;
+    foldersOverviewWrapEl.hidden = true;
+    listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
     otherWrapEl.hidden = true;
+    foldersOverviewGridEl.innerHTML = "";
+    listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
+
+    let overview = null;
+    try {
+      overview = await invoke("list_patient_overview", {
+        workspaceDir: w,
+        patientFolder: p,
+      });
+      if (requestId !== activeRequestId) return;
+    } catch {
+      if (requestId !== activeRequestId) return;
+      loadingEl.hidden = true;
+      emptyEl.hidden = false;
+      emptyEl.textContent = "Could not load patient overview.";
+      return;
+    }
+
+    const folders = Array.isArray(overview?.treatment_folders ?? overview?.treatmentFolders)
+      ? (overview?.treatment_folders ?? overview?.treatmentFolders)
+      : [];
+    const rootFiles = Array.isArray(overview?.root_files ?? overview?.rootFiles)
+      ? (overview?.root_files ?? overview?.rootFiles)
+      : [];
+
+    loadingEl.hidden = true;
+    emptyEl.hidden = folders.length > 0 || rootFiles.length > 0;
+    countsEl.textContent = `${folders.length} folders, ${rootFiles.length} root files`;
+
+    if (folders.length > 0) {
+      const previewPaths = [];
+      for (const folder of folders) {
+        const paths = Array.isArray(folder?.preview_paths ?? folder?.previewPaths)
+          ? (folder?.preview_paths ?? folder?.previewPaths)
+          : [];
+        for (const path of paths) {
+          const normalized = String(path ?? "").trim();
+          if (normalized) previewPaths.push(normalized);
+        }
+      }
+      let previewSrcByPath = new Map();
+      try {
+        previewSrcByPath = await loadExistingCachedPreviewSrcMap(previewPaths);
+      } catch {
+        previewSrcByPath = new Map();
+      }
+      if (requestId !== activeRequestId) return;
+
+      foldersOverviewWrapEl.hidden = false;
+      for (const folder of folders) {
+        const card = createFolderOverviewCard(folder, previewSrcByPath);
+        foldersOverviewGridEl.appendChild(card);
+      }
+    }
+
+    otherWrapEl.hidden = rootFiles.length < 1;
+    renderOtherFiles(rootFiles);
   }
 
   function renderOtherFiles(otherFiles = []) {
     otherListEl.innerHTML = "";
     for (const file of otherFiles) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "treatment-other-file-row";
-      row.title = file.path;
-      row.innerHTML = `
-        <span class="treatment-other-file-ext">${extractExt(file.name) || "FILE"}</span>
-        <span class="treatment-other-file-name">${file.name}</span>
-        <span class="treatment-other-file-size">${formatBytes(file.size)}</span>
-      `;
-      row.addEventListener("click", () => {
-        if (typeof onOpenPath === "function") {
-          void onOpenPath(file.path);
-        }
-      });
+      const row = createFileListRow(file);
       otherListEl.appendChild(row);
     }
   }
@@ -164,16 +449,103 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
     card.type = "button";
     card.className = "treatment-image-card";
     card.title = file.path;
+    card.draggable = true;
     card.innerHTML = `
       <span class="treatment-image-thumb fallback">IMG</span>
       <span class="treatment-image-name">${file.name}</span>
     `;
+    let dragged = false;
     card.addEventListener("click", () => {
+      if (dragged) {
+        dragged = false;
+        return;
+      }
       if (typeof onOpenPath === "function") {
         void onOpenPath(file.path);
       }
     });
+    card.addEventListener("dragstart", (event) => {
+      dragged = true;
+      const dt = event?.dataTransfer;
+      if (!dt) return;
+      dt.effectAllowed = "copy";
+      dt.setData("application/x-mpm-image-export", String(file.path ?? ""));
+
+      const previewImg = card.querySelector(".treatment-image-thumb img");
+      if (previewImg) {
+        dt.setDragImage(previewImg, 20, 20);
+      }
+    });
+    attachCopyOnDragEnd(card, file, () => {
+      dragged = false;
+    });
     return card;
+  }
+
+  function createFileListRow(file) {
+    const isImage = Boolean(file?.is_image ?? file?.isImage);
+    const createdMs = Number(file?.created_ms ?? file?.createdMs ?? file?.modified_ms ?? file?.modifiedMs ?? 0) || 0;
+    const dateText = formatDateOnly(createdMs);
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "treatment-file-list-row";
+    row.title = file.path;
+    row.draggable = true;
+    row.innerHTML = `
+      ${
+        isImage
+          ? `<span class="treatment-image-thumb treatment-list-image-thumb fallback">IMG</span>`
+          : `<span class="treatment-file-list-ext">${fileExtBadgeLabel(file.name)}</span>`
+      }
+      <span class="treatment-file-list-name">${file.name}</span>
+      <span class="treatment-file-list-meta">
+        <span class="treatment-file-list-size">${formatBytes(file.size)}</span>
+        <span class="treatment-file-list-date">${dateText || "-"}</span>
+      </span>
+    `;
+    row.addEventListener("click", () => {
+      if (typeof onOpenPath === "function") {
+        void onOpenPath(file.path);
+      }
+    });
+    row.addEventListener("dragstart", (event) => {
+      const dt = event?.dataTransfer;
+      if (!dt) return;
+      dt.effectAllowed = "copy";
+      dt.setData("application/x-mpm-file-export", String(file.path ?? ""));
+      dt.setData("text/plain", String(file.path ?? ""));
+    });
+    attachCopyOnDragEnd(row, file);
+    return row;
+  }
+
+  function attachCopyOnDragEnd(el, file, onDone = null) {
+    el.addEventListener("dragend", () => {
+      const sourcePath = String(file?.path ?? "").trim();
+      if (!sourcePath) {
+        if (typeof onDone === "function") onDone();
+        return;
+      }
+      void (async () => {
+        try {
+          const selected = await open({
+            directory: true,
+            multiple: false,
+            title: "Choose destination folder",
+          });
+          const destinationDir = normalizeDialogPathSelection(selected);
+          if (!destinationDir) return;
+          await invoke("copy_file_to_destination", {
+            sourcePath,
+            destinationDir,
+          });
+        } catch (err) {
+          console.error("copy_file_to_destination failed:", err);
+        } finally {
+          if (typeof onDone === "function") onDone();
+        }
+      })();
+    });
   }
 
   function setFallbackThumb(path, cardsByPath) {
@@ -480,22 +852,34 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
 
     loadingEl.hidden = true;
     emptyEl.hidden = files.length > 0;
-    imagesWrapEl.hidden = imageFiles.length < 1;
-    otherWrapEl.hidden = otherFiles.length < 1;
     countsEl.textContent = `${imageFiles.length} images, ${otherFiles.length} other files`;
+    const useListView = currentViewMode === "list";
+    listWrapEl.hidden = !useListView || files.length < 1;
+    imagesWrapEl.hidden = useListView || imageFiles.length < 1;
+    otherWrapEl.hidden = useListView || otherFiles.length < 1;
 
+    listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
 
     if (files.length < 1) return;
 
-    renderOtherFiles(otherFiles);
-
     const cardsByPath = new Map();
-    for (const file of imageFiles) {
-      const card = createImageCard(file);
-      cardsByPath.set(file.path, card);
-      imagesGridEl.appendChild(card);
+    if (useListView) {
+      for (const file of files) {
+        const row = createFileListRow(file);
+        listEl.appendChild(row);
+        if (Boolean(file?.is_image ?? file?.isImage)) {
+          cardsByPath.set(file.path, row);
+        }
+      }
+    } else {
+      renderOtherFiles(otherFiles);
+      for (const file of imageFiles) {
+        const card = createImageCard(file);
+        cardsByPath.set(file.path, card);
+        imagesGridEl.appendChild(card);
+      }
     }
     activeCardsByPath = cardsByPath;
     activeImageFiles = imageFiles;
@@ -564,12 +948,17 @@ export function createTreatmentFilesPanel({ container, onOpenPath }) {
   return {
     clear: clearPanel,
     setContext,
+    setPatientOverview: setPatientOverviewContext,
     invalidateRuntimePreviewCache: () => {
       runtimePreviewByPath.clear();
     },
     refreshActiveContext: async () => {
-      if (!activeContext?.workspaceDir || !activeContext?.patientFolder || !activeContext?.treatmentFolder) return;
-      await setContext(activeContext);
+      if (!activeContext?.workspaceDir || !activeContext?.patientFolder) return;
+      if (activeContext?.treatmentFolder) {
+        await setContext(activeContext);
+        return;
+      }
+      await setPatientOverviewContext(activeContext);
     },
   };
 }

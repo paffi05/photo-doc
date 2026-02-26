@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "medical-photo-manager",
-  "version": "0.1.0",
+  "productName": "Photo-Doc",
+  "version": "0.9.2",
   "identifier": "com.clemens.medical-photo-manager",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "medical-photo-manager",
+        "title": "Photo-Doc (0.9.2)",
         "width": 900,
         "height": 600,
         "minWidth": 300,
@@ -30,6 +30,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "icon": [
       "icons/32x32.png",
@@ -38,5 +39,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/paffi05/photo-doc/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZEN0JFQjgzRDA0NThERDMKUldUVGpVWFFnK3Q3YlU4V3h2VmNncDZZN0JnN2JadEF2TDMrRzU3aGV4em96SWcrNk1Ea1dkcVUK"
+    }
   }
 }
