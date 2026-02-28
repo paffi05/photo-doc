@@ -9,6 +9,9 @@ import confetti from "canvas-confetti";
 import { initSidebarLayout } from "./sidebar-layout";
 import { initMainContent } from "./main-content";
 
+const FORCE_UPDATE_UI_PREVIEW = false;
+const FORCE_UPDATE_UI_PREVIEW_VERSION = "1.0.4";
+
 // ---------- DOM ----------
 const onboardingView = document.getElementById("onboardingView");
 const appView = document.getElementById("appView");
@@ -84,6 +87,7 @@ const previewSpeedValue = document.getElementById("previewSpeedValue");
 const backgroundPreviewCreationToggle = document.getElementById("backgroundPreviewCreationToggle");
 const cacheUsageBar = document.getElementById("cacheUsageBar");
 const cacheUsageText = document.getElementById("cacheUsageText");
+const createdPreviewsCount = document.getElementById("createdPreviewsCount");
 const indexingCategoryTitle = document.getElementById("indexingCategoryTitle");
 const openCacheFolderBtn = document.getElementById("openCacheFolderBtn");
 const keepLocalCacheCopyToggle = document.getElementById("keepLocalCacheCopy");
@@ -373,6 +377,8 @@ let indexingProgressRunning = false;
 let indexingProgressMessage = "Up to date";
 let indexingCountsSuffix = "";
 let indexingCustomSuffix = "";
+let dbImageCountForSettings = 0;
+let activeCacheImageCountForSettings = 0;
 let previewFillProgressMessage = "";
 let previewFillProgressCompleted = 0;
 let previewFillProgressTotal = 0;
@@ -400,12 +406,13 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "1.0.3";
+let systemAppVersion = "1.0.4";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
 let systemUpdateAvailable = false;
 let systemUpdateAvailableVersion = "";
+let systemUpdatePreviewMode = false;
 let importWizardDir = null;
 let importWizardWindowState = null;
 let importWizardPreviewWindowState = null;
@@ -445,6 +452,7 @@ const MIN_MANUAL_CACHE_STATUS_MS = 1500;
 const PANEL_ANIM_MS = 230;
 const PATIENT_LIST_RENDER_BATCH_SIZE = 160;
 const PATIENT_LIST_PAGE_SIZE = 250;
+const PATIENT_LIST_ANCHOR_BACKFILL_MAX_PAGES = 80;
 const INVALID_ITEMS_PAGE_SIZE = 200;
 const WORKSPACE_REINDEX_START_TIMEOUT_MS = 6000;
 const WORKSPACE_REINDEX_STATUS_TIMEOUT_MS = 3500;
@@ -763,6 +771,13 @@ function setCacheUsageUi({ usedBytes = 0, maxBytes = 0, percent = 0 } = {}) {
   }
 }
 
+function renderCreatedPreviewsUi() {
+  if (!createdPreviewsCount) return;
+  const cacheCount = Math.max(0, Math.floor(Number(activeCacheImageCountForSettings) || 0));
+  const dbCount = Math.max(0, Math.floor(Number(dbImageCountForSettings) || 0));
+  createdPreviewsCount.textContent = `(${cacheCount}/${dbCount})`;
+}
+
 function formatLocalCacheCopyStatusText(state, lastSyncMs = null) {
   if (state === "copying") return "Copying Images...";
   if (state === "updating") return "Syncing Images...";
@@ -926,25 +941,6 @@ function setIndexingCustomSuffixUi(suffix = "") {
 
 function setIndexingCategoryTitle(dbImageCount = null, { loading = false } = {}) {
   if (!indexingCategoryTitle) return;
-  if (!currentWorkspaceDir) {
-    indexingCategoryTitle.textContent = "INDEXING";
-    return;
-  }
-  const count = Number(dbImageCount);
-  if (Number.isFinite(count) && count >= 0) {
-    indexingCategoryTitle.textContent = loading
-      ? `INDEXING (${Math.floor(count)}...)`
-      : `INDEXING (${Math.floor(count)})`;
-    return;
-  }
-  if (loading) {
-    indexingCategoryTitle.textContent = "INDEXING (...)";
-    return;
-  }
-  if (!Number.isFinite(count) || count < 0) {
-    indexingCategoryTitle.textContent = "INDEXING";
-    return;
-  }
   indexingCategoryTitle.textContent = "INDEXING";
 }
 
@@ -1044,6 +1040,8 @@ function updateCacheReloadButtonState() {
 
 async function refreshIndexingDebugCounts() {
   if (!currentWorkspaceDir) {
+    dbImageCountForSettings = 0;
+    renderCreatedPreviewsUi();
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: false });
     return;
@@ -1052,6 +1050,8 @@ async function refreshIndexingDebugCounts() {
   indexingDebugCountsInFlight = true;
   try {
     const dbImageCount = Number(await invoke("get_db_image_count", { workspaceDir: currentWorkspaceDir })) || 0;
+    dbImageCountForSettings = dbImageCount;
+    renderCreatedPreviewsUi();
     setIndexingCategoryTitle(dbImageCount, { loading: false });
     setIndexingDebugCountsUi(dbImageCount, 0, { show: shouldShowIndexingDebugCounts() });
     indexingCountsWarmRetryWorkspace = "";
@@ -1061,6 +1061,8 @@ async function refreshIndexingDebugCounts() {
     }
   } catch (err) {
     console.error("get_db_image_count failed:", err);
+    dbImageCountForSettings = 0;
+    renderCreatedPreviewsUi();
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: shouldShowIndexingDebugCounts() });
   } finally {
@@ -1248,6 +1250,10 @@ async function ensureBackgroundPreviewFill(cacheStats = null) {
 async function refreshCacheUsageUi() {
   try {
     const stats = await invoke("get_preview_cache_stats");
+    activeCacheImageCountForSettings = Number(
+      stats?.active_cache_image_count ?? stats?.activeCacheImageCount ?? 0
+    ) || 0;
+    renderCreatedPreviewsUi();
     setCacheUsageUi({
       usedBytes: stats?.used_bytes ?? stats?.usedBytes ?? 0,
       maxBytes: stats?.max_bytes ?? stats?.maxBytes ?? 0,
@@ -1265,6 +1271,8 @@ async function refreshCacheUsageUi() {
     return stats;
   } catch (err) {
     console.error("get_preview_cache_stats failed:", err);
+    activeCacheImageCountForSettings = 0;
+    renderCreatedPreviewsUi();
     const fallback = {
       used_bytes: 0,
       max_bytes: (DEFAULT_CACHE_SIZE_GB * 1024 * 1024 * 1024),
@@ -1354,7 +1362,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.3").trim() || "1.0.3";
+  const safeVersion = String(version || "1.0.4").trim() || "1.0.4";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -1407,6 +1415,10 @@ async function searchSystemUpdateNow({ showStartupNotice = false } = {}) {
 }
 
 async function installSystemUpdateNow() {
+  if (systemUpdatePreviewMode) {
+    setSystemUpdateStatusText("Preview mode only");
+    return;
+  }
   if (systemUpdateBusy || systemUpdateInstalling || !systemUpdateAvailable) return;
   systemUpdateInstalling = true;
   setSystemUpdateUi({ busy: false, installing: true });
@@ -1438,6 +1450,18 @@ async function installSystemUpdateNow() {
 }
 
 async function initSystemUpdateStatus() {
+  if (FORCE_UPDATE_UI_PREVIEW) {
+    systemUpdatePreviewMode = true;
+    systemUpdateBusy = false;
+    systemUpdateInstalling = false;
+    systemUpdateAvailable = true;
+    systemUpdateAvailableVersion = FORCE_UPDATE_UI_PREVIEW_VERSION;
+    systemUpdateCheckedAtMs = Date.now();
+    setStartupUpdateNoticeVisible(true);
+    setSystemUpdateUi({ busy: false });
+    setSystemUpdateStatusText(`Update available (${FORCE_UPDATE_UI_PREVIEW_VERSION})`);
+    return;
+  }
   try {
     const version = await getVersion();
     if (version && String(version).trim()) {
@@ -2039,6 +2063,65 @@ function captureSelectedPatientViewportAnchor() {
   };
 }
 
+function findPatientListItemByFolderName(folderName = "") {
+  if (!patientList) return null;
+  const target = String(folderName ?? "").trim();
+  if (!target) return null;
+  return Array.from(patientList.querySelectorAll(".patient-item"))
+    .find((item) => item.dataset.folderName === target) ?? null;
+}
+
+function restoreSelectedPatientViewportAnchor(anchor) {
+  if (!anchor || !patientListWrap || !patientList) return false;
+  const selectedItem = findPatientListItemByFolderName(anchor.folderName);
+  if (!selectedItem) return false;
+  const wrapRect = patientListWrap.getBoundingClientRect();
+  const itemRect = selectedItem.getBoundingClientRect();
+  const targetOffset = Number(anchor.offsetFromTop);
+  const offsetFromTop = Number.isFinite(targetOffset) ? targetOffset : 0;
+  const delta = (itemRect.top - wrapRect.top) - offsetFromTop;
+  if (Math.abs(delta) > 0.75) {
+    patientListWrap.scrollTop += delta;
+  }
+  return true;
+}
+
+async function backfillPatientListUntilAnchorVisible(normalizedQuery, preserveSelectedAnchor) {
+  if (!currentWorkspaceDir || !preserveSelectedAnchor) return;
+  if (String(normalizedQuery ?? "").trim().length > 0) return;
+  const selectedFolder = String(preserveSelectedAnchor.folderName ?? "").trim();
+  if (!selectedFolder) return;
+
+  let pagesFetched = 0;
+  while (patientSearchHasMore && pagesFetched < PATIENT_LIST_ANCHOR_BACKFILL_MAX_PAGES) {
+    if (String(selectedPatient ?? "").trim() !== selectedFolder) break;
+    if (restoreSelectedPatientViewportAnchor(preserveSelectedAnchor)) break;
+
+    const page = await withTimeout(
+      invoke("search_patients_page", {
+        workspaceDir: currentWorkspaceDir,
+        query: normalizedQuery,
+        offset: patientSearchOffset,
+        limit: PATIENT_LIST_PAGE_SIZE,
+      }),
+      SEARCH_PATIENTS_TIMEOUT_MS,
+      "search_patients_page",
+    );
+    const rows = Array.isArray(page?.rows) ? page.rows : [];
+    patientSearchHasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
+    patientSearchOffset += rows.length;
+    if (rows.length < 1) break;
+
+    const entries = [...lastRenderedPatientEntries, ...rows];
+    lastRenderedPatientEntries = entries;
+    lastRenderedFilterText = normalizedQuery;
+    appendPatientListRows(rows);
+    updatePatientSelectionInList();
+    restoreSelectedPatientViewportAnchor(preserveSelectedAnchor);
+    pagesFetched += 1;
+  }
+}
+
 function buildPatientListItem(entry) {
   const { folderName, patientId, keywords, matchedKeywords } = normalizePatientEntry(entry);
   if (!folderName) return null;
@@ -2214,18 +2297,8 @@ function renderPatientList(entries, filterText = "", options = {}) {
       if (item) fragment.appendChild(item);
     }
     patientList.appendChild(fragment);
-    if (!anchorRestored && preserveSelectedAnchor && patientListWrap) {
-      const selectedItem = Array.from(patientList.querySelectorAll(".patient-item"))
-        .find((item) => item.dataset.folderName === preserveSelectedAnchor.folderName);
-      if (selectedItem) {
-        const wrapRect = patientListWrap.getBoundingClientRect();
-        const itemRect = selectedItem.getBoundingClientRect();
-        const delta = (itemRect.top - wrapRect.top) - preserveSelectedAnchor.offsetFromTop;
-        if (Math.abs(delta) > 1) {
-          patientListWrap.scrollTop += delta;
-        }
-        anchorRestored = true;
-      }
+    if (!anchorRestored && preserveSelectedAnchor) {
+      anchorRestored = restoreSelectedPatientViewportAnchor(preserveSelectedAnchor);
     }
     if (index < entries.length) {
       requestAnimationFrame(appendBatch);
@@ -2292,6 +2365,9 @@ async function searchPatients(query = "", { append = false } = {}) {
         preserveSelectedAnchor: selectedViewportAnchor,
         blendInOnExpand: Boolean(selectedViewportAnchor),
       });
+      if (selectedViewportAnchor) {
+        await backfillPatientListUntilAnchorVisible(normalizedQuery, selectedViewportAnchor);
+      }
       lastCommittedPatientSearchQuery = normalizedQuery;
     }
   } catch (err) {
@@ -3345,6 +3421,7 @@ newPatientId?.addEventListener("input", () => {
 initDebugVisibilitySetting();
 initTimelineNamesSetting();
 setDbStatusIdle();
+renderCreatedPreviewsUi();
 updateWindowDebugSize();
 if (/windows/i.test(navigator.userAgent)) {
   appView?.classList.add("platform-windows");

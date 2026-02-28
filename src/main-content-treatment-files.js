@@ -949,6 +949,18 @@ export function createTreatmentFilesPanel({
     thumb.textContent = "IMG";
   }
 
+  function previewSrcFromRow(row) {
+    const dataUrl = normalizePath(row?.data_url ?? row?.dataUrl ?? "");
+    if (dataUrl) return dataUrl;
+    const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+    if (!previewPath) return "";
+    try {
+      return convertFileSrc(previewPath);
+    } catch {
+      return "";
+    }
+  }
+
   function recoverSingleThumbWithRetry(path, cardsByPath, requestId, attempt = 0) {
     void (async () => {
       if (requestId !== activeRequestId) return;
@@ -960,9 +972,9 @@ export function createTreatmentFilesPanel({
         });
         if (requestId !== activeRequestId) return;
         const row = Array.isArray(rows) ? rows[0] : null;
-        const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
-        if (dataUrl) {
-          setThumbImage(path, cardsByPath, dataUrl, {
+        const src = previewSrcFromRow(row);
+        if (src) {
+          setThumbImage(path, cardsByPath, src, {
             requestId,
             allowPathFallback: false,
             previewQuality: "full",
@@ -993,24 +1005,41 @@ export function createTreatmentFilesPanel({
     const quality = previewQuality === "quick" ? "quick" : "full";
     runtimePreviewByPath.set(path, { src, quality });
 
-    thumb.classList.remove("loading");
-    thumb.classList.remove("fallback");
+    thumb.classList.add("loading");
+    thumb.classList.add("fallback");
+    thumb.textContent = "IMG";
     const img = document.createElement("img");
     img.className = quality === "quick" ? "quick-preview" : "full-preview";
     img.alt = "";
     img.loading = "eager";
     img.decoding = "async";
 
+    const showLoadedImage = () => {
+      if (requestId !== activeRequestId) return;
+      thumb.classList.remove("loading");
+      thumb.classList.remove("fallback");
+      thumb.innerHTML = "";
+      thumb.appendChild(img);
+    };
+
+    img.addEventListener("load", showLoadedImage, { once: true });
+
     if (allowPathFallback) {
       img.addEventListener("error", () => {
         if (requestId !== activeRequestId) return;
         recoverSingleThumbWithRetry(path, cardsByPath, requestId, 0);
       }, { once: true });
+    } else {
+      img.addEventListener("error", () => {
+        if (requestId !== activeRequestId) return;
+        setFallbackThumb(path, cardsByPath);
+      }, { once: true });
     }
 
     img.src = src;
-    thumb.innerHTML = "";
-    thumb.appendChild(img);
+    if (img.complete && img.naturalWidth > 0) {
+      showLoadedImage();
+    }
   }
 
   function applyRuntimePreviewIfAvailable(path, cardsByPath) {
@@ -1149,8 +1178,8 @@ export function createTreatmentFilesPanel({
       const map = new Map();
       for (const row of Array.isArray(rows) ? rows : []) {
         const path = normalizePath(row?.path ?? "");
-        const dataUrl = normalizePath(row?.data_url ?? row?.dataUrl ?? "");
-        if (path && dataUrl) map.set(path, dataUrl);
+        const src = previewSrcFromRow(row);
+        if (path && src) map.set(path, src);
       }
       for (const path of batch) {
         const src = map.get(path) ?? "";

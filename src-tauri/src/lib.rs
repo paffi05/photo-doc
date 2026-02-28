@@ -388,6 +388,7 @@ struct CachedImagePreviewRow {
     kind: String,
     preview_path: Option<String>,
     data_url: Option<String>,
+    created: bool,
 }
 
 #[derive(Serialize)]
@@ -413,6 +414,7 @@ struct PreviewCacheStatsRow {
     used_bytes: u64,
     max_bytes: u64,
     used_percent: f64,
+    active_cache_image_count: u64,
 }
 
 #[derive(Serialize, Clone, Default)]
@@ -547,6 +549,8 @@ const PREVIEW_CACHE_MAX_AGE_DAYS: u64 = 90;
 const PREVIEW_PREFETCH_FOLDERS: usize = 3;
 const PREVIEW_PREFETCH_IMAGES_PER_FOLDER: usize = 40;
 const LOCAL_CACHE_COPY_DIR_NAME: &str = ".preview-cache";
+const LEGACY_APP_IDENTIFIER: &str = "com.clemens.medical-photo-manager";
+const PREVIEW_CACHE_MIGRATION_MARKER: &str = ".migrated-from-legacy-app-id";
 const IMPORT_PREVIEW_MICROBATCH_SIZE: usize = 2;
 const PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS: u64 = 15_000;
 const PREVIEW_PERF_GENTLE: &str = "gentle";
@@ -1332,6 +1336,69 @@ fn preview_cache_dir_path(app_handle: &tauri::AppHandle) -> PathBuf {
     base_dir.join("preview-cache")
 }
 
+fn legacy_preview_cache_dir_candidates(app_handle: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for base_result in [
+        app_handle.path().app_cache_dir(),
+        app_handle.path().app_data_dir(),
+    ] {
+        let Ok(base_dir) = base_result else {
+            continue;
+        };
+        let Some(parent) = base_dir.parent() else {
+            continue;
+        };
+        let candidate = parent
+            .join(LEGACY_APP_IDENTIFIER)
+            .join("preview-cache");
+        if seen.insert(candidate.clone()) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+fn migrate_legacy_preview_cache_if_needed(app_handle: &tauri::AppHandle) {
+    let destination = preview_cache_dir_path(app_handle);
+    let _ = fs::create_dir_all(&destination);
+    let marker = destination.join(PREVIEW_CACHE_MIGRATION_MARKER);
+    if marker.exists() {
+        return;
+    }
+
+    let mut copied = 0_u64;
+    let mut scanned = 0_u64;
+    for source in legacy_preview_cache_dir_candidates(app_handle) {
+        if !source.exists() || !source.is_dir() {
+            continue;
+        }
+        if paths_point_to_same_location(&source, &destination) {
+            continue;
+        }
+
+        for source_file in walk_cache_files(&source) {
+            let Ok(relative) = source_file.strip_prefix(&source) else {
+                continue;
+            };
+            scanned = scanned.saturating_add(1);
+            let target_file = destination.join(relative);
+            if target_file.exists() {
+                continue;
+            }
+            if let Some(parent) = target_file.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if fs::copy(&source_file, &target_file).is_ok() {
+                copied = copied.saturating_add(1);
+            }
+        }
+    }
+
+    let marker_text = format!("copied={copied}\nscanned={scanned}\n");
+    let _ = fs::write(marker, marker_text);
+}
+
 fn get_active_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
     let settings = read_settings(app_handle).unwrap_or_default();
     if let Some(workspace_dir) = settings.workspace_dir {
@@ -1966,6 +2033,22 @@ fn compute_preview_cache_used_bytes(cache_dir: &Path) -> u64 {
     used_bytes
 }
 
+fn compute_preview_cache_image_count(cache_dir: &Path) -> u64 {
+    let mut count = 0_u64;
+    for path in walk_cache_files(cache_dir) {
+        if !is_cache_preview_jpeg(&path) {
+            continue;
+        }
+        let is_non_empty_file = fs::metadata(&path)
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false);
+        if is_non_empty_file {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
 fn resolve_existing_cache_file_path(cache_dir: &Path, path_buf: &Path, file_size: u64, modified_ms: u64) -> PathBuf {
     let key = build_preview_cache_key(path_buf, file_size, modified_ms);
     let cache_file_path = cache_dir.join(format!("{key}.jpg"));
@@ -2557,6 +2640,7 @@ fn resolve_cached_previews_in_cache_dir(
     let current_ms = now_ms();
 
     struct PlannedRow {
+        row_index: usize,
         path: String,
         source_path: PathBuf,
         kind: String,
@@ -2592,6 +2676,7 @@ fn resolve_cached_previews_in_cache_dir(
                 kind: "none".to_string(),
                 preview_path: None,
                 data_url: None,
+                created: false,
             }));
             continue;
         }
@@ -2626,9 +2711,11 @@ fn resolve_cached_previews_in_cache_dir(
                     kind,
                     preview_path: None,
                     data_url: None,
+                    created: false,
                 }));
                 continue;
         };
+        let row_index = rows.len();
         let cache_key = build_preview_cache_key(&path_buf, file_size, modified_ms);
         let file_name = format!("{cache_key}.jpg");
         let cache_file_path = cache_dir.join(&file_name);
@@ -2644,13 +2731,14 @@ fn resolve_cached_previews_in_cache_dir(
 
         if !cache_file_path.exists() && generate_if_missing {
             tasks.push(GenerateTask {
-                row_index: rows.len(),
+                row_index,
                 source_path: path_buf.clone(),
                 cache_file_path: cache_file_path.clone(),
             });
         }
 
         rows.push(RowState::Planned(PlannedRow {
+            row_index,
             path,
             source_path: path_buf,
             kind,
@@ -2660,13 +2748,14 @@ fn resolve_cached_previews_in_cache_dir(
         }));
     }
 
+    let mut created_row_indexes: HashSet<usize> = HashSet::new();
     if generate_if_missing && !tasks.is_empty() {
         let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
         let logical_cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
         let worker_count = preview_worker_count_for_mode(preview_perf_mode, logical_cores);
-        let (tx, rx) = std::sync::mpsc::channel::<(usize, u64)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u64, bool)>();
         let mut handles = Vec::new();
 
         for _worker_id in 0..worker_count {
@@ -2691,7 +2780,7 @@ fn resolve_cached_previews_in_cache_dir(
 
                     if task.cache_file_path.exists() {
                         let size = fs::metadata(&task.cache_file_path).map(|m| m.len()).unwrap_or(0);
-                        let _ = tx_clone.send((task.row_index, size));
+                        let _ = tx_clone.send((task.row_index, size, false));
                         continue;
                     }
 
@@ -2709,11 +2798,11 @@ fn resolve_cached_previews_in_cache_dir(
                                 let _ = fs::remove_file(&task.cache_file_path);
                                 continue;
                             }
-                            let _ = tx_clone.send((task.row_index, bytes.len() as u64));
+                            let _ = tx_clone.send((task.row_index, bytes.len() as u64, true));
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                             let size = fs::metadata(&task.cache_file_path).map(|m| m.len()).unwrap_or(0);
-                            let _ = tx_clone.send((task.row_index, size));
+                            let _ = tx_clone.send((task.row_index, size, false));
                         }
                         Err(_) => {
                             continue;
@@ -2724,18 +2813,21 @@ fn resolve_cached_previews_in_cache_dir(
         }
         drop(tx);
 
-        let mut generated_sizes: HashMap<usize, u64> = HashMap::new();
-        for (row_index, size) in rx {
-            generated_sizes.insert(row_index, size);
+        let mut generated_rows: HashMap<usize, (u64, bool)> = HashMap::new();
+        for (row_index, size, created) in rx {
+            generated_rows.insert(row_index, (size, created));
         }
         for handle in handles {
             let _ = handle.join();
         }
 
-        for (row_index, size) in generated_sizes {
+        for (row_index, (size, created)) in generated_rows {
             let Some(RowState::Planned(planned)) = rows.get(row_index) else {
                 continue;
             };
+            if created {
+                created_row_indexes.insert(row_index);
+            }
             index.entries.insert(
                 planned.cache_key.clone(),
                 PreviewCacheEntry {
@@ -2759,6 +2851,7 @@ fn resolve_cached_previews_in_cache_dir(
                         kind: planned.kind,
                         preview_path: None,
                         data_url: None,
+                        created: false,
                     });
                     continue;
                 }
@@ -2815,6 +2908,7 @@ fn resolve_cached_previews_in_cache_dir(
                     } else {
                         None
                     },
+                    created: created_row_indexes.contains(&planned.row_index),
                 });
             }
         }
@@ -5066,7 +5160,34 @@ async fn get_existing_cached_preview_paths(
     paths: Vec<String>,
 ) -> Result<Vec<CachedPreviewPathRow>, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let cache_dir = get_active_preview_cache_dir(&app_handle);
+        let active_cache_dir = get_active_preview_cache_dir(&app_handle);
+        let settings = read_settings(&app_handle).unwrap_or_default();
+        let workspace_dir = settings.workspace_dir.unwrap_or_default();
+        let workspace_trimmed = workspace_dir.trim();
+        let workspace_cache_dir = if workspace_trimmed.is_empty() {
+            None
+        } else {
+            let workspace_path = PathBuf::from(workspace_trimmed);
+            if workspace_path.exists() && workspace_path.is_dir() {
+                Some(get_local_cache_copy_dir(&workspace_path))
+            } else {
+                None
+            }
+        };
+        let local_cache_dir = preview_cache_dir_path(&app_handle);
+        let mut candidate_cache_dirs: Vec<PathBuf> = vec![active_cache_dir.clone()];
+        if let Some(workspace_cache) = workspace_cache_dir {
+            if !paths_point_to_same_location(&workspace_cache, &active_cache_dir) {
+                candidate_cache_dirs.push(workspace_cache);
+            }
+        }
+        if !paths_point_to_same_location(&local_cache_dir, &active_cache_dir)
+            && !candidate_cache_dirs
+                .iter()
+                .any(|dir| paths_point_to_same_location(dir, &local_cache_dir))
+        {
+            candidate_cache_dirs.push(local_cache_dir);
+        }
         let (source_meta_map, workspace_root) = build_source_meta_map_for_paths(&app_handle, &paths);
         let mut out = Vec::with_capacity(paths.len());
 
@@ -5113,16 +5234,22 @@ async fn get_existing_cached_preview_paths(
                     });
                     continue;
             };
-            let cache_file_path =
-                resolve_existing_cache_file_path(&cache_dir, &path_buf, file_size, modified_ms);
+            let mut preview_match: Option<PathBuf> = None;
+            for cache_dir in &candidate_cache_dirs {
+                let cache_file_path =
+                    resolve_existing_cache_file_path(cache_dir, &path_buf, file_size, modified_ms);
+                let valid_quick = fs::metadata(&cache_file_path)
+                    .map(|m| m.is_file() && m.len() > 0)
+                    .unwrap_or(false);
+                if valid_quick {
+                    preview_match = Some(cache_file_path);
+                    break;
+                }
+            }
 
             out.push(CachedPreviewPathRow {
                 path,
-                preview_path: if cache_file_path.exists() && is_valid_cached_preview_file(&cache_file_path) {
-                    Some(cache_file_path.to_string_lossy().to_string())
-                } else {
-                    None
-                },
+                preview_path: preview_match.map(|p| p.to_string_lossy().to_string()),
             });
         }
 
@@ -5682,11 +5809,13 @@ fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheS
     } else {
         0.0
     };
+    let active_cache_image_count = compute_preview_cache_image_count(&cache_dir);
 
     Ok(PreviewCacheStatsRow {
         used_bytes,
         max_bytes,
         used_percent,
+        active_cache_image_count,
     })
 }
 
@@ -5976,117 +6105,103 @@ fn start_background_preview_fill(
     tauri::async_runtime::spawn_blocking(move || {
         let _io_guard = io_guard;
         const BATCH_SIZE: usize = 6;
-        const QUEUE_CAPACITY: usize = 220;
         let workspace_dir_value = workspace.to_string_lossy().to_string();
-        let (tx, rx) = std::sync::mpsc::sync_channel::<String>(QUEUE_CAPACITY);
-        let discovered_total = Arc::new(AtomicU64::new(0));
-        let discovered_total_clone = Arc::clone(&discovered_total);
-        let producer = std::thread::spawn(move || {
-            let mut stack = vec![workspace];
-            while let Some(dir) = stack.pop() {
-                if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
-                    || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
-                {
-                    break;
-                }
-                let entries = match fs::read_dir(&dir) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-
-                for entry in entries {
-                    let Ok(entry) = entry else {
-                        continue;
-                    };
-                    let path = entry.path();
-                    let Ok(file_type) = entry.file_type() else {
-                        continue;
-                    };
-
-                    if file_type.is_dir() {
-                        stack.push(path);
-                        continue;
-                    }
-                    if !file_type.is_file() || !is_supported_preview_image(&path) {
-                        continue;
-                    }
-
-                    discovered_total_clone.fetch_add(1, Ordering::Relaxed);
-                    if tx.send(path.to_string_lossy().to_string()).is_err() {
-                        break;
+        let cache_dir = get_active_preview_cache_dir(&app_handle_clone);
+        let mut missing_paths: Vec<String> = Vec::new();
+        if let Ok(conn) = open_db(&app_handle_clone) {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT patient_folder, treatment_folder, file_name, size_bytes, modified_ms
+                 FROM patient_file_index
+                 WHERE workspace_dir = ?1 AND is_image = 1",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![workspace_dir_value.clone()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                }) {
+                    for row in rows {
+                        if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                            || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+                        {
+                            break;
+                        }
+                        let Ok((patient_folder, treatment_folder, file_name, size_bytes, modified_ms)) = row else {
+                            continue;
+                        };
+                        let source_path = if treatment_folder.trim().is_empty() {
+                            workspace.join(&patient_folder).join(&file_name)
+                        } else {
+                            workspace
+                                .join(&patient_folder)
+                                .join(&treatment_folder)
+                                .join(&file_name)
+                        };
+                        if !source_path.exists() {
+                            continue;
+                        }
+                        let cache_file_path = resolve_existing_cache_file_path(
+                            &cache_dir,
+                            &source_path,
+                            size_bytes.max(0) as u64,
+                            modified_ms.max(0) as u64,
+                        );
+                        let has_valid_preview = cache_file_path.exists() && is_valid_cached_preview_file(&cache_file_path);
+                        if !has_valid_preview {
+                            missing_paths.push(source_path.to_string_lossy().to_string());
+                        }
                     }
                 }
             }
-        });
+        }
 
+        let total_target = missing_paths.len() as u64;
         let mut completed = 0_u64;
-        let mut producer_finished = false;
-        let mut batch: Vec<String> = Vec::with_capacity(BATCH_SIZE);
-        let mut total_hint = 0_u64;
-        emit_preview_fill_progress(&app_handle_clone, true, "Creating new previews (0/0)", 0, 0);
+        emit_preview_fill_progress(
+            &app_handle_clone,
+            true,
+            format!("Creating new previews ({completed}/{total_target})"),
+            completed,
+            total_target,
+        );
 
-        loop {
+        for chunk in missing_paths.chunks(BATCH_SIZE) {
             if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
                 || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
             {
                 break;
             }
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(path) => batch.push(path),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    producer_finished = true;
-                }
-            }
-
-            if batch.len() >= BATCH_SIZE || (producer_finished && !batch.is_empty()) {
-                let chunk = std::mem::take(&mut batch);
-                let chunk_len = chunk.len() as u64;
-                let _ = resolve_cached_previews(&app_handle_clone, &chunk, false, true);
-                completed = completed.saturating_add(chunk_len);
-                let discovered_now = discovered_total.load(Ordering::Relaxed);
-                total_hint = total_hint.max(discovered_now).max(completed);
-                emit_preview_fill_progress(
-                    &app_handle_clone,
-                    true,
-                    format!("Creating new previews ({completed}/{total_hint})"),
-                    completed,
-                    total_hint,
-                );
-                std::thread::sleep(Duration::from_millis(16));
-            }
-
-            if producer_finished && batch.is_empty() {
-                break;
-            }
-        }
-
-        let _ = producer.join();
-        if !batch.is_empty() {
-            let chunk = std::mem::take(&mut batch);
-            let chunk_len = chunk.len() as u64;
-            let _ = resolve_cached_previews(&app_handle_clone, &chunk, false, true);
-            completed = completed.saturating_add(chunk_len);
-            let discovered_now = discovered_total.load(Ordering::Relaxed);
-            total_hint = total_hint.max(discovered_now).max(completed);
+            let rows = resolve_cached_previews(
+                &app_handle_clone,
+                chunk,
+                false,
+                true,
+            )
+            .unwrap_or_default();
+            let created_in_chunk = rows.iter().filter(|row| row.created).count() as u64;
+            completed = completed.saturating_add(created_in_chunk);
+            let shown_completed = completed.min(total_target);
             emit_preview_fill_progress(
                 &app_handle_clone,
                 true,
-                format!("Creating new previews ({completed}/{total_hint})"),
-                completed,
-                total_hint,
+                format!("Creating new previews ({shown_completed}/{total_target})"),
+                shown_completed,
+                total_target,
             );
+            std::thread::sleep(Duration::from_millis(16));
         }
 
-        let final_total = total_hint
-            .max(discovered_total.load(Ordering::Relaxed))
-            .max(completed);
+        let final_total = total_target;
+        let final_completed = completed.min(final_total);
         if PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
             || LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
         {
             PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
             PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-            emit_preview_fill_progress(&app_handle_clone, false, "Paused", completed, final_total);
+            emit_preview_fill_progress(&app_handle_clone, false, "Paused", final_completed, final_total);
             let _ = app_handle_clone.emit(
                 "preview-fill-status",
                 PreviewFillStatusEvent { running: false },
@@ -6102,19 +6217,19 @@ fn start_background_preview_fill(
                 &app_handle_clone,
                 true,
                 "Cleanup on hold (import in progress)",
-                completed,
+                final_completed,
                 final_total,
             );
         } else {
-            emit_preview_fill_progress(&app_handle_clone, true, "Removing old files", completed, final_total);
+            emit_preview_fill_progress(&app_handle_clone, true, "Removing old files", final_completed, final_total);
             run_preview_cache_cleanup(&app_handle_clone);
-            emit_preview_fill_progress(&app_handle_clone, true, "Clearing duplicates", completed, final_total);
+            emit_preview_fill_progress(&app_handle_clone, true, "Clearing duplicates", final_completed, final_total);
             run_preview_cache_cleanup(&app_handle_clone);
         }
 
         PREVIEW_FILL_RUNNING.store(false, Ordering::Relaxed);
         PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
-        emit_preview_fill_progress(&app_handle_clone, false, "Up to date", completed, final_total);
+        emit_preview_fill_progress(&app_handle_clone, false, "Up to date", final_completed, final_total);
         let _ = app_handle_clone.emit(
             "preview-fill-status",
             PreviewFillStatusEvent { running: false },
@@ -6132,6 +6247,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_handle = app.handle().clone();
+            migrate_legacy_preview_cache_if_needed(&app_handle);
             if let Some(window) = app.get_webview_window("main") {
                 let _ = apply_saved_window_state(&app_handle, &window);
             }

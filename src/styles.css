@@ -2768,6 +2768,24 @@ body{
   flex: 1 1 auto;
 }
 
+.created-previews-count{
+  min-width: 44px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 11px;
+  color: rgba(0,0,0,0.60);
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.created-previews-row{
+  align-items: center;
+  margin: 0;
+}
+
 .about-section-text{
   display: flex;
   flex-direction: column;
@@ -2944,8 +2962,8 @@ body{
   margin-bottom: 20px;
 }
 
-.cache-usage-wrap > .settings-row:first-of-type{
-  margin-top: 60px;
+.cache-usage-wrap > .processing-speed-row{
+  margin-top: 0;
 }
 
 .indexing-progress-row{
@@ -3095,17 +3113,22 @@ body{
 }
 
 .system-install-btn{
-  width: 24px;
-  height: 24px;
+  min-width: 74px;
+  height: 28px;
+  padding: 0 12px;
   border-radius: 8px;
-  background: rgba(249, 115, 22, 0.96);
-  border-color: rgba(194, 65, 12, 0.42);
+  background: #dc2626;
+  border-color: #dc2626;
   color: #ffffff;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
   margin-left: auto;
 }
 
 .system-install-btn:hover{
-  background: rgba(249, 115, 22, 1);
+  background: #dc2626;
+  border-color: #dc2626;
 }
 
 .system-install-btn:disabled{
@@ -3278,6 +3301,36 @@ body{
 
 .db-reload-icon{
   display: block;
+}
+
+button.system-install-btn.db-reload-btn{
+  min-width: 74px;
+  width: auto;
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border-color: #dc2626 !important;
+  background: #dc2626 !important;
+  color: #ffffff !important;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+button.system-install-btn.db-reload-btn:hover:not(:disabled){
+  background: #dc2626 !important;
+  border-color: #dc2626 !important;
+  color: #ffffff !important;
+}
+
+button.system-install-btn.db-reload-btn:disabled{
+  background: rgba(148, 163, 184, 0.7) !important;
+  border-color: rgba(100, 116, 139, 0.36) !important;
+  color: rgba(255,255,255,0.92) !important;
 }
 
 .toggle-switch{

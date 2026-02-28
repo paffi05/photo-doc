@@ -2723,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "photo-doc"
-version = "1.0.3"
+version = "1.0.4"
 dependencies = [
  "base64 0.22.1",
  "image",
@@ -4566,7 +4566,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typeid"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc7d623258602320d5c55d1bc22793b57daff0ec7efc270ea7d55ce1d5f5471c"
 
