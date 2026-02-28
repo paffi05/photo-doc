@@ -1112,6 +1112,7 @@ fn get_active_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
         if workspace.exists() && workspace.is_dir() {
             let main_cache_dir = get_local_cache_copy_dir(&workspace);
             fs::create_dir_all(&main_cache_dir).ok();
+            hide_path_on_windows(&main_cache_dir);
             if settings.keep_local_cache_copy.unwrap_or(false) {
                 return get_preview_cache_dir(app_handle);
             }
@@ -1123,6 +1124,19 @@ fn get_active_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
 
 fn get_local_cache_copy_dir(workspace: &Path) -> PathBuf {
     workspace.join(LOCAL_CACHE_COPY_DIR_NAME)
+}
+
+fn hide_path_on_windows(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        if path.exists() {
+            let _ = Command::new("attrib").arg("+h").arg(path).status();
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = path;
+    }
 }
 
 fn paths_point_to_same_location(left: &Path, right: &Path) -> bool {
@@ -1159,6 +1173,7 @@ fn import_wizard_cache_dir_is_protected(app_handle: &tauri::AppHandle, folder: &
         if workspace.exists() && workspace.is_dir() {
             let workspace_main_cache_dir = get_local_cache_copy_dir(&workspace);
             let _ = fs::create_dir_all(&workspace_main_cache_dir);
+            hide_path_on_windows(&workspace_main_cache_dir);
             if paths_point_to_same_location(&candidate, &workspace_main_cache_dir) {
                 return true;
             }
@@ -1431,11 +1446,15 @@ fn local_cache_copy_status_row(
     let state = if !enabled {
         "disabled".to_string()
     } else if running {
-        runtime.state.clone()
-    } else if runtime.state.is_empty() {
-        "up_to_date".to_string()
+        if runtime.state.is_empty() {
+            "updating".to_string()
+        } else {
+            runtime.state.clone()
+        }
+    } else if runtime.state == "paused" {
+        "paused".to_string()
     } else {
-        runtime.state.clone()
+        "up_to_date".to_string()
     };
     LocalCacheCopyStatusRow {
         enabled,
@@ -1447,6 +1466,14 @@ fn local_cache_copy_status_row(
         local_cache_exists: preview_cache_dir_path(app_handle).exists(),
         local_cache_file_count: walk_cache_files(&preview_cache_dir_path(app_handle)).len() as u64,
     }
+}
+
+fn clear_cancel_flags_if_idle() {
+    if PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) || LOCAL_CACHE_COPY_RUNNING.load(Ordering::Relaxed) {
+        return;
+    }
+    PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 }
 
 fn run_local_cache_copy_sync(
@@ -1461,6 +1488,7 @@ fn run_local_cache_copy_sync(
     let main_cache_dir = get_local_cache_copy_dir(workspace);
     let local_cache_dir = get_preview_cache_dir(app_handle);
     fs::create_dir_all(&main_cache_dir).map_err(|e| e.to_string())?;
+    hide_path_on_windows(&main_cache_dir);
     let phase = if initial_copy { "copying" } else { "updating" };
     set_local_cache_copy_runtime_state(phase, 0, 0, None);
     emit_local_cache_copy_progress(app_handle, true, phase, 0, 0);
@@ -2093,6 +2121,7 @@ fn schedule_local_preview_mirror_to_workspace_main(
     }
     tauri::async_runtime::spawn_blocking(move || {
         let _ = fs::create_dir_all(&workspace_main_cache_dir);
+        hide_path_on_windows(&workspace_main_cache_dir);
         let mut seen_file_names: HashSet<String> = HashSet::new();
         for src_preview_path in preview_paths {
             if src_preview_path.parent() != Some(local_cache_dir.as_path()) {
@@ -3123,6 +3152,7 @@ fn open_preview_cache_dir(app_handle: tauri::AppHandle, workspace_dir: Option<St
         let workspace = PathBuf::from(workspace_value);
         let main_cache_dir = get_local_cache_copy_dir(&workspace);
         fs::create_dir_all(&main_cache_dir).map_err(|e| e.to_string())?;
+        hide_path_on_windows(&main_cache_dir);
         main_cache_dir
     };
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
@@ -4662,6 +4692,7 @@ async fn get_cached_image_previews(
     include_data_url: Option<bool>,
     generate_if_missing: Option<bool>,
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
+    clear_cancel_flags_if_idle();
     let include_data_url = include_data_url.unwrap_or(true);
     let generate_if_missing = generate_if_missing.unwrap_or(true);
     let app_handle_for_resolve = app_handle.clone();
@@ -4691,6 +4722,7 @@ async fn get_import_wizard_cached_previews(
     include_data_url: Option<bool>,
     generate_if_missing: Option<bool>,
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
+    clear_cancel_flags_if_idle();
     let folder_dir = folder_dir.trim().to_string();
     if folder_dir.is_empty() {
         return Err("folder directory is required".to_string());
@@ -5750,8 +5782,19 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            let app_handle = app.handle().clone();
             if let Some(window) = app.get_webview_window("main") {
-                let _ = apply_saved_window_state(&app.handle(), &window);
+                let _ = apply_saved_window_state(&app_handle, &window);
+            }
+            if let Ok(settings) = read_settings(&app_handle) {
+                if let Some(workspace_dir) = settings.workspace_dir {
+                    let workspace = PathBuf::from(workspace_dir.trim());
+                    if workspace.exists() && workspace.is_dir() {
+                        let workspace_main_cache_dir = get_local_cache_copy_dir(&workspace);
+                        let _ = fs::create_dir_all(&workspace_main_cache_dir);
+                        hide_path_on_windows(&workspace_main_cache_dir);
+                    }
+                }
             }
             Ok(())
         })

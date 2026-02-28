@@ -2334,6 +2334,15 @@ body{
   transform: translateX(0);
 }
 
+.app.platform-windows .patient-sidebar,
+.app.platform-windows .main-header-frost,
+.app.platform-windows .settings,
+.app.platform-windows .settings-header,
+.app.platform-windows .settings.is-scrolled .settings-header{
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
 /* Settings layout */
 .settings-body{
   flex: 1;
@@ -2800,8 +2809,13 @@ body{
   border: 0;
   background: transparent;
   padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
   color: #2563eb;
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1;
   cursor: pointer;
   flex: 0 0 auto;
@@ -2813,6 +2827,7 @@ body{
 
 .local-cache-open-btn{
   margin-top: 0;
+  align-self: center;
 }
 
 .local-cache-delete-label-wrap{

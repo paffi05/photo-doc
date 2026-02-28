@@ -186,21 +186,6 @@ function renderInvalidPatientFoldersPanel() {
     invalidPatientFoldersList.appendChild(item);
   }
 
-  if (invalidPatientHasMore) {
-    const action = document.createElement("li");
-    action.className = "invalid-patient-folder-item";
-    const moreBtn = document.createElement("button");
-    moreBtn.type = "button";
-    moreBtn.className = "small-btn";
-    moreBtn.textContent = invalidPatientLoading ? "Loading Files..." : "Load more";
-    moreBtn.disabled = invalidPatientLoading;
-    moreBtn.addEventListener("click", () => {
-      void refreshInvalidPatientFolderWarning(currentWorkspaceDir, { append: true });
-    });
-    action.appendChild(moreBtn);
-    invalidPatientFoldersList.appendChild(action);
-  }
-
   if (invalidPatientLoading) {
     const loading = document.createElement("li");
     loading.className = "invalid-patient-folder-item invalid-patient-loading-item";
@@ -209,6 +194,16 @@ function renderInvalidPatientFoldersPanel() {
       <span class="invalid-patient-folder-name">Loading Files...</span>
     `;
     invalidPatientFoldersList.appendChild(loading);
+  }
+
+  // Keep loading additional invalid entries until list becomes scrollable (or exhausted).
+  if (expanded && invalidPatientHasMore && !invalidPatientLoading) {
+    requestAnimationFrame(() => {
+      if (!invalidPatientFoldersList) return;
+      const scrollable = invalidPatientFoldersList.scrollHeight > invalidPatientFoldersList.clientHeight + 4;
+      if (scrollable || invalidPatientLoading || !invalidPatientHasMore) return;
+      void refreshInvalidPatientFolderWarning(currentWorkspaceDir, { append: true });
+    });
   }
 }
 
@@ -398,7 +393,7 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "0.9.5";
+let systemAppVersion = "0.9.6";
 let systemUpdateBusy = false;
 let systemUpdateCheckedAtMs = null;
 let importWizardDir = null;
@@ -812,6 +807,7 @@ function applyLocalCacheCopyStatus(status = {}) {
   localCacheStatusCompleted = Math.max(0, Number(status?.completed ?? 0) || 0);
   localCacheStatusTotal = Math.max(localCacheStatusCompleted, Number(status?.total ?? 0) || 0);
   updateLocalCacheDeleteButtonState();
+  updateCacheReloadButtonState();
   void refreshIndexingStatus();
 }
 
@@ -920,16 +916,20 @@ function setIndexingCategoryTitle(dbImageCount = null, { loading = false } = {})
     indexingCategoryTitle.textContent = "INDEXING";
     return;
   }
+  const count = Number(dbImageCount);
+  if (Number.isFinite(count) && count >= 0) {
+    indexingCategoryTitle.textContent = `INDEXING (${Math.floor(count)})`;
+    return;
+  }
   if (loading) {
     indexingCategoryTitle.textContent = "INDEXING (...)";
     return;
   }
-  const count = Number(dbImageCount);
   if (!Number.isFinite(count) || count < 0) {
     indexingCategoryTitle.textContent = "INDEXING";
     return;
   }
-  indexingCategoryTitle.textContent = `INDEXING (${Math.floor(count)})`;
+  indexingCategoryTitle.textContent = "INDEXING";
 }
 
 async function syncActiveViewPreviewPriority() {
@@ -2186,6 +2186,8 @@ async function searchPatients(query = "", { append = false } = {}) {
 
 async function loadPatients(workspaceDir, options = {}) {
   const minStatusMs = options?.minStatusMs ?? 0;
+  const lightweight = Boolean(options?.lightweight);
+  const allowBlockingFallback = options?.allowBlockingFallback ?? true;
   const onReindexProgress = typeof options?.onReindexProgress === "function"
     ? options.onReindexProgress
     : null;
@@ -2220,7 +2222,7 @@ async function loadPatients(workspaceDir, options = {}) {
         "get_workspace_reindex_status",
       ).catch(() => null);
       if (!status) {
-        if (!startAccepted) {
+        if (!startAccepted && allowBlockingFallback) {
           indexedCount = await withTimeout(
             invoke("reindex_patient_folders", { workspaceDir }),
             WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
@@ -2248,7 +2250,7 @@ async function loadPatients(workspaceDir, options = {}) {
 
       const completed = Number(status?.completed ?? 0) || 0;
       const total = Number(status?.total ?? 0) || 0;
-      if (!statusWorkspaceDir && !running && !startAccepted) {
+      if (!statusWorkspaceDir && !running && !startAccepted && allowBlockingFallback) {
         indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
         if (onReindexProgress) onReindexProgress(100);
         break;
@@ -2291,9 +2293,8 @@ async function loadPatients(workspaceDir, options = {}) {
 
   try {
     if (onStartupStage) onStartupStage("Loading patient list...");
-    await searchPatients(query);
-    if (onStartupStage) onStartupStage("Scanning invalid files...");
-    await withTimeout(
+    const loadListTask = searchPatients(query);
+    const loadInvalidTask = withTimeout(
       refreshInvalidPatientFolderWarning(workspaceDir),
       12000,
       "refreshInvalidPatientFolderWarning",
@@ -2301,22 +2302,35 @@ async function loadPatients(workspaceDir, options = {}) {
       console.error("refreshInvalidPatientFolderWarning failed:", err);
       return 0;
     });
-    if (onStartupStage) onStartupStage("Preparing timeline...");
-    await withTimeout(
+    const loadTimelineTask = withTimeout(
       mainContent.refreshTimelineForSelection(),
       20000,
       "refreshTimelineForSelection",
     ).catch((err) => {
       console.error("refreshTimelineForSelection failed:", err);
     });
-    if (onStartupStage) onStartupStage("Counting indexed images...");
-    await withTimeout(
+    const loadCountsTask = withTimeout(
       refreshIndexingDebugCounts(),
       12000,
       "refreshIndexingDebugCounts",
     ).catch((err) => {
       console.error("refreshIndexingDebugCounts failed:", err);
     });
+
+    if (lightweight) {
+      void loadListTask;
+      void loadInvalidTask;
+      void loadTimelineTask;
+      void loadCountsTask;
+    } else {
+      if (onStartupStage) onStartupStage("Scanning invalid files...");
+      await loadListTask;
+      await loadInvalidTask;
+      if (onStartupStage) onStartupStage("Preparing timeline...");
+      await loadTimelineTask;
+      if (onStartupStage) onStartupStage("Counting indexed images...");
+      await loadCountsTask;
+    }
   } finally {
     setPatientListLoading(false);
   }
@@ -2862,8 +2876,12 @@ deleteLocalCacheBtn?.addEventListener("click", async () => {
 });
 dbReloadBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || isDbUpdating) return;
-  await loadPatients(currentWorkspaceDir, { minStatusMs: 1500 });
-  await refreshIndexingDebugCounts();
+  await loadPatients(currentWorkspaceDir, {
+    minStatusMs: 300,
+    lightweight: true,
+    allowBlockingFallback: false,
+  });
+  void refreshIndexingDebugCounts();
 });
 cacheReloadBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || isPreviewFillStopInFlight) return;
@@ -2921,10 +2939,17 @@ keepLocalCacheCopyToggle?.addEventListener("change", async (e) => {
     await mainContent.refreshTreatmentFilesForSelection();
   } catch (err) {
     console.error("set_keep_local_cache_copy failed:", err);
-    if (keepLocalCacheCopyToggle) keepLocalCacheCopyToggle.checked = keepLocalCacheCopyEnabled;
+    applyLocalCacheCopyStatus({
+      enabled: previousEnabled,
+      running: false,
+      state: previousEnabled ? localCacheStatusState : "disabled",
+      completed: localCacheStatusCompleted,
+      total: localCacheStatusTotal,
+    });
   } finally {
     localCacheSyncInFlight = false;
     updateLocalCacheDeleteButtonState();
+    updateCacheReloadButtonState();
     void refreshLocalCacheCopyStatus();
   }
 });
@@ -3003,6 +3028,16 @@ invalidPatientFoldersBtn?.addEventListener("click", () => {
   if (invalidPatientFolderCount <= 0) return;
   invalidPatientFoldersPanelExpanded = !invalidPatientFoldersPanelExpanded;
   renderInvalidPatientFoldersPanel();
+});
+invalidPatientFoldersList?.addEventListener("scroll", () => {
+  if (!invalidPatientFoldersPanelExpanded) return;
+  if (!invalidPatientHasMore || invalidPatientLoading) return;
+  const remaining =
+    invalidPatientFoldersList.scrollHeight -
+    invalidPatientFoldersList.scrollTop -
+    invalidPatientFoldersList.clientHeight;
+  if (remaining > 80) return;
+  void refreshInvalidPatientFolderWarning(currentWorkspaceDir, { append: true });
 });
 confirmAddPatientBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || !isAddPatientFormValid() || confirmAddPatientBtn.disabled) return;
@@ -3168,6 +3203,9 @@ initDebugVisibilitySetting();
 initTimelineNamesSetting();
 setDbStatusIdle();
 updateWindowDebugSize();
+if (/windows/i.test(navigator.userAgent)) {
+  appView?.classList.add("platform-windows");
+}
 sidebarLayout.applyPatientSidebarMode();
 sidebarLayout.updateTopButtonSpacing();
 updateAddPatientFormState();
@@ -3210,6 +3248,7 @@ void listen("local-cache-copy-progress", (event) => {
   localCacheStatusCompleted = completed;
   localCacheStatusTotal = total;
   updateLocalCacheDeleteButtonState();
+  updateCacheReloadButtonState();
   void refreshIndexingStatus();
 });
 void listen("import-wizard-completed", async (event) => {

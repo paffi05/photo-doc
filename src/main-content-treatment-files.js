@@ -357,7 +357,7 @@ export function createTreatmentFilesPanel({
     img.decoding = "async";
     const showLoaded = () => {
       thumb.classList.remove("fallback");
-      thumb.textContent = "";
+      thumb.innerHTML = "";
       thumb.appendChild(img);
     };
     img.addEventListener("load", showLoaded, { once: true });
@@ -368,8 +368,7 @@ export function createTreatmentFilesPanel({
       thumb.classList.add("fallback");
       thumb.textContent = "IMG";
     }, { once: true });
-    // Attach immediately so each stack slot can update itself as soon as it is ready.
-    thumb.appendChild(img);
+    // Keep fallback label centered until image bytes are actually ready.
     img.src = src;
     if (img.complete && img.naturalWidth > 0) {
       showLoaded();
