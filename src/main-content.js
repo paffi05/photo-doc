@@ -13,6 +13,7 @@ export function initMainContent({
   onImportActivityChange,
   onImportDebugStateChange,
   onPreviewLoadingStatusChange,
+  onPatientKeywordsChanged,
   onCheckMissingPatientIdTaken,
   onSubmitMissingPatientId,
 }) {
@@ -29,6 +30,7 @@ export function initMainContent({
   const {
     timeline,
     patientLabel,
+    patientNameRow,
     patientLast,
     patientFirst,
     patientIdLine,
@@ -96,6 +98,11 @@ export function initMainContent({
     onPreviewLoadingStatusChange: (status) => {
       if (typeof onPreviewLoadingStatusChange === "function") {
         onPreviewLoadingStatusChange(status);
+      }
+    },
+    onPatientKeywordsChanged: (payload) => {
+      if (typeof onPatientKeywordsChanged === "function") {
+        onPatientKeywordsChanged(payload);
       }
     },
   });
@@ -1681,6 +1688,11 @@ export function initMainContent({
     animateImportFilesListScrollTo(importFilesListWrap.scrollHeight, 650);
   });
   patientIdLine?.addEventListener("click", openMissingPatientIdInput);
+  patientNameRow?.addEventListener("click", () => {
+    if (!hasPatientSelection) return;
+    if (timelinePanPointerId !== null) return;
+    setSelectedTimelinePoint(null);
+  });
   patientIdInput?.addEventListener("input", () => {
     const normalizedId = normalizeFieldValue(patientIdInput.value);
     const hasInvalidId = Boolean(normalizedId) && !isNumericPatientId(normalizedId);

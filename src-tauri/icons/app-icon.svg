@@ -1,0 +1,27 @@
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" id="doctor-svg" style="background: #ffffff;">
+  <!-- All animations removed; this is now a static image -->
+
+  <g transform="rotate(-10, 100, 100)">
+    <circle cx="100" cy="95" r="30" fill="#000000" />
+    <path d="M70,95 A30,30 0 0,1 130,95 L130,85 Q100,70 70,85 Z" fill="#000000" />
+   
+    <!-- Eyes – now fully black (no white sclera, no pupil distinction) -->
+    <g id="eye-l">
+      <circle cx="90" cy="100" r="5" fill="#000000" />
+    </g>
+    <g id="eye-r">
+      <circle cx="110" cy="100" r="5" fill="#000000" />
+    </g>
+
+    <!-- Glasses: white outlines only -->
+    <circle cx="90" cy="100" r="9" fill="none" stroke="#ffffff" stroke-width="1.5" />
+    <circle cx="110" cy="100" r="9" fill="none" stroke="#ffffff" stroke-width="1.5" />
+    <line x1="99" y1="100" x2="101" y2="100" stroke="#ffffff" stroke-width="1.5" />
+  </g>
+
+  <!-- Bottom elements – all black -->
+  <path d="M60,150 L140,150 L130,120 Q100,110 70,120 Z" fill="#000000" stroke="#000000" stroke-width="1" />
+  <path d="M90,120 L100,150 L110,120" fill="none" stroke="#000000" stroke-width="1" />
+  <path d="M80,120 Q80,145 100,145 Q120,145 120,120" fill="none" stroke="#000000" stroke-width="2" />
+  <circle cx="100" cy="145" r="5" fill="#000000" stroke="#000000" stroke-width="1" />
+</svg>

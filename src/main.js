@@ -14,6 +14,7 @@ const onboardingView = document.getElementById("onboardingView");
 const appView = document.getElementById("appView");
 const startupView = document.getElementById("startupView");
 const startupProcessText = document.getElementById("startupProcessText");
+const startupUpdateNotice = document.getElementById("startupUpdateNotice");
 
 const pickBtn = document.getElementById("pickWorkspaceBtn");
 const pickIcon = document.getElementById("pickWorkspaceIcon");
@@ -98,6 +99,11 @@ function setStartupProcessStatus(message = "") {
   if (!startupProcessText) return;
   const text = String(message ?? "").trim();
   startupProcessText.textContent = text || "Starting application...";
+}
+
+function setStartupUpdateNoticeVisible(visible) {
+  if (!startupUpdateNotice) return;
+  startupUpdateNotice.hidden = !visible;
 }
 
 function setInvalidPanelExpanded(expanded) {
@@ -393,9 +399,11 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "0.9.6";
+let systemAppVersion = "1.0.0";
 let systemUpdateBusy = false;
 let systemUpdateCheckedAtMs = null;
+let systemUpdateAvailable = false;
+let systemUpdateAvailableVersion = "";
 let importWizardDir = null;
 let importWizardWindowState = null;
 let importWizardPreviewWindowState = null;
@@ -556,6 +564,9 @@ const mainContent = initMainContent({
     activeViewPreviewLoading = { running, completed, total };
     void syncActiveViewPreviewPriority();
     void refreshIndexingStatus();
+  },
+  onPatientKeywordsChanged: async () => {
+    await searchPatients(patientSearchInput?.value ?? "");
   },
   onCheckMissingPatientIdTaken: async (patientId) => {
     if (!currentWorkspaceDir) return false;
@@ -1340,18 +1351,24 @@ function setSystemUpdateUi({
   busy = false,
   version = systemAppVersion,
   checkedAtMs = systemUpdateCheckedAtMs,
+  available = systemUpdateAvailable,
+  availableVersion = systemUpdateAvailableVersion,
 } = {}) {
   if (systemUpdateBtn) {
     systemUpdateBtn.disabled = busy;
-    systemUpdateBtn.setAttribute("title", busy ? "Updating..." : "System update");
+    systemUpdateBtn.setAttribute("title", busy ? "Searching..." : "Search for updates");
   }
   if (systemUpdateSpinner) systemUpdateSpinner.hidden = !busy;
-  const safeVersion = String(version || "0.9.1").trim() || "0.9.1";
+  const safeVersion = String(version || "1.0.0").trim() || "1.0.0";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
   const nextStatus = (() => {
-    if (busy) return "Updating...";
+    if (busy) return "Searching for updates...";
+    if (available) {
+      const next = String(availableVersion ?? "").trim();
+      return next ? `Update available (${next})` : "Update available";
+    }
     if (Number.isFinite(Number(checkedAtMs)) && Number(checkedAtMs) > 0) {
       return `Up to date (${formatDateTime(new Date(Number(checkedAtMs)))})`;
     }
@@ -1368,40 +1385,28 @@ function setSystemUpdateStatusText(text) {
   if (systemUpdateStatusText) systemUpdateStatusText.textContent = value;
 }
 
-async function runSystemUpdateNow() {
+async function searchSystemUpdateNow({ showStartupNotice = false } = {}) {
   if (systemUpdateBusy) return;
   systemUpdateBusy = true;
   setSystemUpdateUi({ busy: true });
-  let updateFailed = false;
   try {
-    const result = await invoke("run_system_update");
-    const updated = Boolean(result?.updated);
-    const nextVersion = String(result?.version ?? "").trim();
-    if (!updated) {
-      systemUpdateCheckedAtMs = Date.now();
-      return;
-    }
-
-    setSystemUpdateStatusText("Update installed. Restart app to apply.");
-    if (nextVersion) {
-      systemAppVersion = nextVersion;
-    }
+    const result = await withTimeout(
+      invoke("check_system_update"),
+      2800,
+      "check_system_update",
+    );
+    systemUpdateAvailable = Boolean(result?.available);
+    systemUpdateAvailableVersion = String(result?.version ?? "").trim();
     systemUpdateCheckedAtMs = Date.now();
+    if (showStartupNotice) {
+      setStartupUpdateNoticeVisible(systemUpdateAvailable);
+    }
   } catch (err) {
-    updateFailed = true;
-    console.error("system update failed:", err);
-    setSystemUpdateStatusText("Update failed. Check updater config.");
+    console.error("check_system_update failed:", err);
+    if (showStartupNotice) setStartupUpdateNoticeVisible(false);
   } finally {
     systemUpdateBusy = false;
-    if (!updateFailed) {
-      setSystemUpdateUi({ busy: false });
-    } else {
-      if (systemUpdateBtn) {
-        systemUpdateBtn.disabled = false;
-        systemUpdateBtn.setAttribute("title", "System update");
-      }
-      if (systemUpdateSpinner) systemUpdateSpinner.hidden = true;
-    }
+    setSystemUpdateUi({ busy: false });
   }
 }
 
@@ -1411,10 +1416,13 @@ async function initSystemUpdateStatus() {
     if (version && String(version).trim()) {
       systemAppVersion = String(version).trim();
     }
+    await searchSystemUpdateNow({ showStartupNotice: true });
   } catch (err) {
     console.error("getVersion failed:", err);
   } finally {
-    systemUpdateCheckedAtMs = Date.now();
+    if (!Number.isFinite(Number(systemUpdateCheckedAtMs)) || Number(systemUpdateCheckedAtMs) <= 0) {
+      systemUpdateCheckedAtMs = Date.now();
+    }
     setSystemUpdateUi({ busy: false });
   }
 }
@@ -1459,15 +1467,34 @@ function splitPatientName(folderName) {
 
 function normalizePatientEntry(entry) {
   if (typeof entry === "string") {
-    return { folderName: entry, patientId: "" };
+    return { folderName: entry, patientId: "", keywords: [], matchedKeywords: [] };
   }
 
   const folderName =
     (entry?.folder_name ?? entry?.folderName ?? "").toString();
   const patientId =
     (entry?.patient_id ?? entry?.patientId ?? "").toString().trim();
+  const keywordsRaw = Array.isArray(entry?.keywords) ? entry.keywords : [];
+  const matchedKeywordsRaw = Array.isArray(entry?.matched_keywords ?? entry?.matchedKeywords)
+    ? (entry?.matched_keywords ?? entry?.matchedKeywords)
+    : [];
+  const normalizeKeywords = (list) => {
+    const seen = new Set();
+    const out = [];
+    for (const value of list) {
+      const text = String(value ?? "").trim();
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(text);
+    }
+    return out;
+  };
+  const keywords = normalizeKeywords(keywordsRaw);
+  const matchedKeywords = normalizeKeywords(matchedKeywordsRaw);
 
-  return { folderName, patientId };
+  return { folderName, patientId, keywords, matchedKeywords };
 }
 
 function setWorkspacePathDisplay(workspaceDir) {
@@ -1966,7 +1993,7 @@ function updatePatientSelectionInList() {
 }
 
 function buildPatientListItem(entry) {
-  const { folderName, patientId } = normalizePatientEntry(entry);
+  const { folderName, patientId, keywords, matchedKeywords } = normalizePatientEntry(entry);
   if (!folderName) return null;
   const { lastName, firstName } = splitPatientName(folderName);
   const item = document.createElement("li");
@@ -2011,6 +2038,15 @@ function buildPatientListItem(entry) {
     id.className = "patient-id";
     id.textContent = patientId;
     item.appendChild(id);
+  }
+
+  const shownKeywords = matchedKeywords.length > 0 ? matchedKeywords : [];
+  if (shownKeywords.length > 0) {
+    const meta = document.createElement("span");
+    meta.className = "patient-keywords";
+    meta.textContent = shownKeywords.join(", ");
+    meta.title = keywords.length > 0 ? keywords.join(", ") : shownKeywords.join(", ");
+    item.appendChild(meta);
   }
 
   item.addEventListener("click", () => {
@@ -2203,9 +2239,17 @@ async function loadPatients(workspaceDir, options = {}) {
   const startedAt = Date.now();
   const loadDeadline = startedAt + WORKSPACE_LOAD_OVERALL_TIMEOUT_MS;
   let reindexFailed = false;
+  let lastStartupStageText = "";
+
+  const setStartupStageIfChanged = (text) => {
+    const next = String(text ?? "").trim();
+    if (!next || next === lastStartupStageText) return;
+    lastStartupStageText = next;
+    if (onStartupStage) onStartupStage(next);
+  };
 
   try {
-    if (onStartupStage) onStartupStage("Building workspace index...");
+    setStartupStageIfChanged("Building workspace index...");
     let startAccepted = await withTimeout(
       invoke("start_workspace_reindex", { workspaceDir }),
       WORKSPACE_REINDEX_START_TIMEOUT_MS,
@@ -2250,6 +2294,18 @@ async function loadPatients(workspaceDir, options = {}) {
 
       const completed = Number(status?.completed ?? 0) || 0;
       const total = Number(status?.total ?? 0) || 0;
+      const statusMessage = String(status?.message ?? "").trim();
+      const importingKeywords = /importing keywords/i.test(statusMessage);
+      if (running) {
+        if (importingKeywords) {
+          setStartupStageIfChanged("Importing Keywords...");
+        } else {
+          setStartupStageIfChanged("Building workspace index...");
+        }
+      }
+      if (isDbUpdating && dbStatusText) {
+        dbStatusText.textContent = importingKeywords ? "importing keywords..." : "updating...";
+      }
       if (!statusWorkspaceDir && !running && !startAccepted && allowBlockingFallback) {
         indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
         if (onReindexProgress) onReindexProgress(100);
@@ -2292,7 +2348,7 @@ async function loadPatients(workspaceDir, options = {}) {
   }
 
   try {
-    if (onStartupStage) onStartupStage("Loading patient list...");
+    setStartupStageIfChanged("Loading patient list...");
     const loadListTask = searchPatients(query);
     const loadInvalidTask = withTimeout(
       refreshInvalidPatientFolderWarning(workspaceDir),
@@ -2317,18 +2373,18 @@ async function loadPatients(workspaceDir, options = {}) {
       console.error("refreshIndexingDebugCounts failed:", err);
     });
 
-    if (lightweight) {
+      if (lightweight) {
       void loadListTask;
       void loadInvalidTask;
       void loadTimelineTask;
       void loadCountsTask;
     } else {
-      if (onStartupStage) onStartupStage("Scanning invalid files...");
+      setStartupStageIfChanged("Scanning invalid files...");
       await loadListTask;
       await loadInvalidTask;
-      if (onStartupStage) onStartupStage("Preparing timeline...");
+      setStartupStageIfChanged("Preparing timeline...");
       await loadTimelineTask;
-      if (onStartupStage) onStartupStage("Counting indexed images...");
+      setStartupStageIfChanged("Counting indexed images...");
       await loadCountsTask;
     }
   } finally {
@@ -2668,6 +2724,7 @@ async function pickImportWizardFolderAndSave() {
 async function boot() {
   setDebugState("booting");
   setStartupProcessStatus("Loading settings...");
+  setStartupUpdateNoticeVisible(false);
   if (startupView) startupView.hidden = false;
   onboardingView.hidden = true;
   appView.hidden = true;
@@ -3144,7 +3201,7 @@ openLocalCacheCopyFolderBtn?.addEventListener("click", async () => {
   }
 });
 systemUpdateBtn?.addEventListener("click", () => {
-  void runSystemUpdateNow();
+  void searchSystemUpdateNow({ showStartupNotice: false });
 });
 settingsBody?.addEventListener("scroll", syncSettingsHeaderScrollState);
 openBtn?.addEventListener("click", () => {

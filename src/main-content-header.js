@@ -50,6 +50,7 @@ export function createMainHeaderTimeline(mainCanvas) {
     header,
     timeline,
     patientLabel,
+    patientNameRow,
     patientLast,
     patientFirst,
     patientIdLine,

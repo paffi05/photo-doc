@@ -67,11 +67,27 @@ function normalizeDialogPathSelection(selected) {
   return path;
 }
 
+function normalizeKeywords(value) {
+  const out = [];
+  const seen = new Set();
+  const list = Array.isArray(value) ? value : [];
+  for (const entry of list) {
+    const keyword = String(entry ?? "").trim();
+    if (!keyword) continue;
+    const key = keyword.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(keyword);
+  }
+  return out;
+}
+
 export function createTreatmentFilesPanel({
   container,
   onOpenPath,
   onOpenTreatmentFolder,
   onPreviewLoadingStatusChange,
+  onPatientKeywordsChanged,
 }) {
   const panel = document.createElement("section");
   panel.className = "treatment-files-panel";
@@ -117,6 +133,10 @@ export function createTreatmentFilesPanel({
     </div>
     <div class="treatment-files-loading" hidden>Loading files...</div>
     <div class="treatment-files-empty" hidden>No files in this treatment folder.</div>
+    <div class="treatment-keywords-wrap" hidden>
+      <div class="treatment-files-section-title">Keywords</div>
+      <div class="treatment-keywords-list"></div>
+    </div>
     <div class="treatment-folders-overview-wrap" hidden>
       <div class="treatment-files-section-title">Folders</div>
       <div class="treatment-folders-overview-grid"></div>
@@ -145,6 +165,8 @@ export function createTreatmentFilesPanel({
   const viewBtns = Array.from(panel.querySelectorAll(".treatment-files-view-btn"));
   const loadingEl = panel.querySelector(".treatment-files-loading");
   const emptyEl = panel.querySelector(".treatment-files-empty");
+  const keywordsWrapEl = panel.querySelector(".treatment-keywords-wrap");
+  const keywordsListEl = panel.querySelector(".treatment-keywords-list");
   const foldersOverviewWrapEl = panel.querySelector(".treatment-folders-overview-wrap");
   const foldersOverviewGridEl = panel.querySelector(".treatment-folders-overview-grid");
   const listWrapEl = panel.querySelector(".treatment-files-list-wrap");
@@ -167,6 +189,7 @@ export function createTreatmentFilesPanel({
   let activeLoadedFiles = [];
   let activeFileOffset = 0;
   let previewLoadingStatus = { running: false, completed: 0, total: 0 };
+  let activeOverviewKeywords = [];
 
   const VIEW_MODE_STORAGE_KEY = "mpm.treatmentFilesViewMode";
   const normalizeViewMode = (value) => (value === "list" ? "list" : "tile");
@@ -256,6 +279,7 @@ export function createTreatmentFilesPanel({
     activeImageFiles = [];
     activeLoadedFiles = [];
     activeFileOffset = 0;
+    activeOverviewKeywords = [];
     panel.hidden = true;
     titleEl.textContent = "Treatment Files";
     folderEl.textContent = "";
@@ -269,6 +293,7 @@ export function createTreatmentFilesPanel({
     viewToggleEl.hidden = false;
     loadingEl.hidden = true;
     emptyEl.hidden = true;
+    keywordsWrapEl.hidden = true;
     foldersOverviewWrapEl.hidden = true;
     listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
@@ -276,6 +301,7 @@ export function createTreatmentFilesPanel({
     loadMoreBtn.hidden = true;
     loadMoreBtn.disabled = false;
     foldersOverviewGridEl.innerHTML = "";
+    keywordsListEl.innerHTML = "";
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
@@ -296,6 +322,7 @@ export function createTreatmentFilesPanel({
     viewToggleEl.hidden = false;
     loadingEl.hidden = false;
     emptyEl.hidden = true;
+    keywordsWrapEl.hidden = true;
     foldersOverviewWrapEl.hidden = true;
     listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
@@ -303,7 +330,9 @@ export function createTreatmentFilesPanel({
     loadMoreBtn.hidden = true;
     loadMoreBtn.disabled = false;
     loadMoreBtn.onclick = null;
+    activeOverviewKeywords = [];
     foldersOverviewGridEl.innerHTML = "";
+    keywordsListEl.innerHTML = "";
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
@@ -460,6 +489,7 @@ export function createTreatmentFilesPanel({
     loadingEl.hidden = false;
     emptyEl.hidden = true;
     viewToggleEl.hidden = true;
+    keywordsWrapEl.hidden = true;
     foldersOverviewWrapEl.hidden = true;
     listWrapEl.hidden = true;
     imagesWrapEl.hidden = true;
@@ -467,25 +497,36 @@ export function createTreatmentFilesPanel({
     loadMoreBtn.hidden = true;
     loadMoreBtn.disabled = false;
     loadMoreBtn.onclick = null;
+    keywordsListEl.innerHTML = "";
     foldersOverviewGridEl.innerHTML = "";
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
 
     let overview = null;
-    try {
-      overview = await invoke("list_patient_overview", {
+    let keywords = [];
+    const [overviewResult, keywordsResult] = await Promise.allSettled([
+      invoke("list_patient_overview", {
         workspaceDir: w,
         patientFolder: p,
-      });
-      if (requestId !== activeRequestId) return;
-    } catch {
+      }),
+      invoke("load_patient_keywords", {
+        workspaceDir: w,
+        folderName: p,
+      }),
+    ]);
+    if (requestId !== activeRequestId) return;
+    if (keywordsResult.status === "fulfilled") {
+      keywords = normalizeKeywords(keywordsResult.value);
+    }
+    if (overviewResult.status !== "fulfilled") {
       if (requestId !== activeRequestId) return;
       loadingEl.hidden = true;
       emptyEl.hidden = false;
       emptyEl.textContent = "Could not load patient overview.";
       return;
     }
+    overview = overviewResult.value;
 
     const folders = Array.isArray(overview?.treatment_folders ?? overview?.treatmentFolders)
       ? (overview?.treatment_folders ?? overview?.treatmentFolders)
@@ -497,6 +538,8 @@ export function createTreatmentFilesPanel({
     loadingEl.hidden = true;
     emptyEl.hidden = folders.length > 0 || rootFiles.length > 0;
     countsEl.textContent = `${folders.length} folders, ${rootFiles.length} root files`;
+    activeOverviewKeywords = normalizeKeywords(keywords);
+    renderOverviewKeywords(w, p, requestId);
 
     otherWrapEl.hidden = rootFiles.length < 1;
     const rootImageCardsByPath = renderOtherFiles(rootFiles);
@@ -675,6 +718,107 @@ export function createTreatmentFilesPanel({
     } else {
       setPreviewLoadingProgress(0, 0);
     }
+  }
+
+  async function persistOverviewKeywords(workspaceDir, patientFolder, keywords, requestId) {
+    const normalized = normalizeKeywords(keywords);
+    await invoke("save_patient_keywords", {
+      workspaceDir,
+      folderName: patientFolder,
+      keywords: normalized,
+    });
+    if (requestId !== activeRequestId) return;
+    activeOverviewKeywords = normalized;
+    renderOverviewKeywords(workspaceDir, patientFolder, requestId);
+    if (typeof onPatientKeywordsChanged === "function") {
+      onPatientKeywordsChanged({
+        workspaceDir,
+        patientFolder,
+        keywords: normalized,
+      });
+    }
+  }
+
+  function renderOverviewKeywords(workspaceDir, patientFolder, requestId) {
+    keywordsWrapEl.hidden = false;
+    keywordsListEl.innerHTML = "";
+
+    for (const keyword of activeOverviewKeywords) {
+      const badge = document.createElement("span");
+      badge.className = "treatment-keyword-badge";
+
+      const text = document.createElement("span");
+      text.className = "treatment-keyword-label";
+      text.textContent = keyword;
+      badge.appendChild(text);
+
+      const xMark = document.createElement("button");
+      xMark.type = "button";
+      xMark.className = "treatment-keyword-x";
+      xMark.textContent = "×";
+      xMark.setAttribute("aria-label", `Remove keyword ${keyword}`);
+      xMark.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const filtered = activeOverviewKeywords.filter(
+          (entry) => entry.toLowerCase() !== keyword.toLowerCase()
+        );
+        void persistOverviewKeywords(workspaceDir, patientFolder, filtered, requestId);
+      });
+      badge.appendChild(xMark);
+
+      keywordsListEl.appendChild(badge);
+    }
+
+    const addKeywordBtn = document.createElement("button");
+    addKeywordBtn.type = "button";
+    addKeywordBtn.className = "treatment-keyword-add";
+    addKeywordBtn.textContent = "Add Keywords...";
+    addKeywordBtn.addEventListener("click", () => {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.className = "treatment-keyword-input";
+      input.placeholder = "Add Keywords...";
+      let closed = false;
+      const closeInput = () => {
+        if (closed) return;
+        closed = true;
+        renderOverviewKeywords(workspaceDir, patientFolder, requestId);
+      };
+      const submitValue = async () => {
+        const value = String(input.value ?? "").trim();
+        if (!value) {
+          closeInput();
+          return;
+        }
+        const next = normalizeKeywords([...activeOverviewKeywords, value]);
+        input.disabled = true;
+        try {
+          await persistOverviewKeywords(workspaceDir, patientFolder, next, requestId);
+        } catch (err) {
+          console.error("save_patient_keywords failed:", err);
+          closeInput();
+        }
+      };
+      input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          void submitValue();
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          closeInput();
+        }
+      });
+      input.addEventListener("blur", closeInput, { once: true });
+      addKeywordBtn.replaceWith(input);
+      requestAnimationFrame(() => {
+        input.focus();
+        input.select();
+      });
+    });
+    keywordsListEl.appendChild(addKeywordBtn);
   }
 
   function renderOtherFiles(otherFiles = []) {

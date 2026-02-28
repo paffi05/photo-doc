@@ -1,7 +1,7 @@
 use tauri::{Emitter, Manager};
 use tauri_plugin_updater::UpdaterExt;
 use base64::Engine;
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -297,6 +297,8 @@ struct PatientMetadata {
 struct PatientSearchRow {
     folder_name: String,
     patient_id: String,
+    keywords: Vec<String>,
+    matched_keywords: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -460,6 +462,12 @@ struct SystemUpdateResult {
     version: Option<String>,
 }
 
+#[derive(Serialize)]
+struct SystemUpdateCheckResult {
+    available: bool,
+    version: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 struct ImportProgressEvent {
     job_id: u64,
@@ -603,6 +611,173 @@ fn read_patient_metadata_value(folder_path: &PathBuf) -> Option<Value> {
     serde_json::from_str::<Value>(&content).ok()
 }
 
+fn find_keywords_txt_path(folder_path: &Path) -> Option<PathBuf> {
+    if !folder_path.exists() || !folder_path.is_dir() {
+        return None;
+    }
+    let entries = fs::read_dir(folder_path).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let file_type = entry.file_type().ok()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.eq_ignore_ascii_case("keywords.txt") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+fn parse_keywords_txt_import(folder_path: &Path) -> Option<(PathBuf, String, Vec<String>)> {
+    let path = find_keywords_txt_path(folder_path)?;
+    let content = fs::read_to_string(&path).ok()?;
+    let mut lines = content.lines();
+    let _name_line = lines.next();
+    let id_line = lines.next().unwrap_or_default().trim().to_string();
+    let mut imported_id = String::new();
+    if !id_line.is_empty() {
+        let lower = id_line.to_lowercase();
+        if lower.starts_with("id:") {
+            let raw = id_line[3..].trim();
+            let cleaned = raw
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim()
+                .to_string();
+            imported_id = cleaned;
+        }
+    }
+
+    let mut keywords = Vec::new();
+    let mut seen = HashSet::new();
+    for line in lines {
+        let keyword = line.trim();
+        if keyword.is_empty() {
+            continue;
+        }
+        let key = keyword.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        keywords.push(keyword.to_string());
+    }
+
+    if imported_id.is_empty() && keywords.is_empty() {
+        return None;
+    }
+    Some((path, imported_id, keywords))
+}
+
+fn merge_keywords_txt_into_metadata(folder_path: &Path) -> Option<(Value, bool)> {
+    let Some((source_path, imported_id, imported_keywords)) = parse_keywords_txt_import(folder_path) else {
+        return None;
+    };
+
+    let folder_buf = folder_path.to_path_buf();
+    let mut metadata_value = read_patient_metadata_value(&folder_buf).unwrap_or_else(|| json!({}));
+    if !metadata_value.is_object() {
+        metadata_value = json!({});
+    }
+    let metadata_obj = metadata_value.as_object_mut()?;
+
+    let mut changed = false;
+
+    let existing_id = metadata_obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if existing_id.is_empty() && !imported_id.trim().is_empty() {
+        metadata_obj.insert("id".to_string(), Value::String(imported_id.trim().to_string()));
+        changed = true;
+    } else if !metadata_obj.contains_key("id") {
+        metadata_obj.insert("id".to_string(), Value::String(String::new()));
+        changed = true;
+    }
+
+    let mut existing_keywords: Vec<String> = Vec::new();
+    if let Some(raw_keywords) = metadata_obj.get("keywords") {
+        match raw_keywords {
+            Value::Array(items) => {
+                for item in items {
+                    let text = item.as_str().unwrap_or("").trim();
+                    if !text.is_empty() {
+                        existing_keywords.push(text.to_string());
+                    }
+                }
+            }
+            Value::String(s) => {
+                let text = s.trim();
+                if !text.is_empty() {
+                    existing_keywords.push(text.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut merged_keywords: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+    for keyword in existing_keywords.into_iter().chain(imported_keywords.into_iter()) {
+        let trimmed = keyword.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let key = trimmed.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        merged_keywords.push(trimmed.to_string());
+    }
+
+    if !metadata_obj.contains_key("keywords") {
+        changed = true;
+    } else {
+        let current_count = metadata_obj
+            .get("keywords")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+        if current_count != merged_keywords.len() {
+            changed = true;
+        }
+    }
+    metadata_obj.insert(
+        "keywords".to_string(),
+        Value::Array(merged_keywords.into_iter().map(Value::String).collect()),
+    );
+
+    if !metadata_obj.contains_key("searchterms") {
+        metadata_obj.insert("searchterms".to_string(), json!([]));
+        changed = true;
+    }
+
+    if changed {
+        let json_text = serde_json::to_string_pretty(&metadata_value).ok()?;
+        fs::write(patient_metadata_path(&folder_buf), json_text).ok()?;
+    }
+
+    let mut imported_deleted = false;
+    let is_expected_name = source_path
+        .file_name()
+        .and_then(|v| v.to_str())
+        .map(|name| name.eq_ignore_ascii_case("keywords.txt"))
+        .unwrap_or(false);
+    let in_patient_folder = source_path
+        .parent()
+        .map(|parent| parent == folder_path)
+        .unwrap_or(false);
+    if in_patient_folder && is_expected_name && source_path.is_file() && fs::remove_file(&source_path).is_ok() {
+        imported_deleted = true;
+    }
+
+    Some((metadata_value, imported_deleted))
+}
+
 fn metadata_id_from_value(value: &Value) -> String {
     let Some(obj) = value.as_object() else {
         return String::new();
@@ -617,6 +792,51 @@ fn metadata_id_from_value(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         _ => String::new(),
     }
+}
+
+fn extract_keywords_from_metadata_value(value: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(obj) = value.as_object() {
+        if let Some(raw_keywords) = obj.get("keywords") {
+            match raw_keywords {
+                Value::Array(items) => {
+                    for item in items {
+                        let text = item.as_str().unwrap_or("").trim();
+                        if text.is_empty() {
+                            continue;
+                        }
+                        out.push(text.to_string());
+                    }
+                }
+                Value::String(s) => {
+                    let text = s.trim();
+                    if !text.is_empty() {
+                        out.push(text.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut deduped = Vec::new();
+    let mut seen = HashSet::new();
+    for keyword in out {
+        let key = keyword.to_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.insert(key);
+        deduped.push(keyword);
+    }
+    deduped
+}
+
+fn load_keywords_for_folder(folder_path: &PathBuf) -> Vec<String> {
+    let Some(value) = read_patient_metadata_value(folder_path) else {
+        return vec![];
+    };
+    extract_keywords_from_metadata_value(&value)
 }
 
 fn collect_metadata_tokens(value: &Value, out: &mut Vec<String>) {
@@ -807,7 +1027,7 @@ fn reindex_single_patient_in_tx(
     workspace_dir: &str,
     patient_folder: &str,
     patient_path: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     tx.execute(
         "DELETE FROM patient_treatment_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
         params![workspace_dir, patient_folder],
@@ -821,7 +1041,14 @@ fn reindex_single_patient_in_tx(
 
     let (last_name, first_name) = split_patient_name(patient_folder);
     let metadata = read_patient_metadata(&patient_path.to_path_buf());
-    let metadata_value = read_patient_metadata_value(&patient_path.to_path_buf());
+    let merged_keywords = merge_keywords_txt_into_metadata(patient_path);
+    let keywords_imported = merged_keywords
+        .as_ref()
+        .map(|(_, imported)| *imported)
+        .unwrap_or(false);
+    let metadata_value = merged_keywords
+        .map(|(value, _)| value)
+        .or_else(|| read_patient_metadata_value(&patient_path.to_path_buf()));
     let mut patient_id = String::new();
     let mut metadata_tokens = Vec::new();
     if let Some(meta) = metadata {
@@ -921,7 +1148,7 @@ fn reindex_single_patient_in_tx(
     )
     .map_err(|e| e.to_string())?;
 
-    Ok(())
+    Ok(keywords_imported)
 }
 
 fn refresh_invalid_workspace_items_in_tx(
@@ -2876,47 +3103,7 @@ fn load_patient_keywords(
         return Err("patient folder does not exist".to_string());
     }
 
-    let metadata_value = read_patient_metadata_value(&folder_path);
-    let Some(value) = metadata_value else {
-        return Ok(vec![]);
-    };
-
-    let mut out = Vec::new();
-    if let Some(obj) = value.as_object() {
-        if let Some(raw_keywords) = obj.get("keywords") {
-            match raw_keywords {
-                Value::Array(items) => {
-                    for item in items {
-                        let text = item.as_str().unwrap_or("").trim();
-                        if text.is_empty() {
-                            continue;
-                        }
-                        out.push(text.to_string());
-                    }
-                }
-                Value::String(s) => {
-                    let text = s.trim();
-                    if !text.is_empty() {
-                        out.push(text.to_string());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut deduped = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for keyword in out {
-        let key = keyword.to_lowercase();
-        if seen.contains(&key) {
-            continue;
-        }
-        seen.insert(key);
-        deduped.push(keyword);
-    }
-
-    Ok(deduped)
+    Ok(load_keywords_for_folder(&folder_path))
 }
 
 #[tauri::command]
@@ -4100,10 +4287,10 @@ fn reindex_patient_folders_internal<F>(
     mut on_progress: F,
 ) -> Result<usize, String>
 where
-    F: FnMut(u64, u64),
+    F: FnMut(u64, u64, bool),
 {
     if !workspace.exists() || !workspace.is_dir() {
-        on_progress(0, 0);
+        on_progress(0, 0, false);
         return Ok(0);
     }
 
@@ -4122,7 +4309,7 @@ where
     }
 
     let total = patient_dirs.len() as u64;
-    on_progress(0, total);
+    on_progress(0, total, false);
 
     let workspace_dir = workspace.to_string_lossy().to_string();
     let mut conn = open_db(app_handle)?;
@@ -4150,9 +4337,10 @@ where
 
     let mut indexed_count = 0usize;
     for (index, (folder_name, patient_path)) in patient_dirs.into_iter().enumerate() {
-        reindex_single_patient_in_tx(&tx, &workspace_dir, &folder_name, &patient_path)?;
+        let keywords_imported =
+            reindex_single_patient_in_tx(&tx, &workspace_dir, &folder_name, &patient_path)?;
         indexed_count = indexed_count.saturating_add(1);
-        on_progress((index + 1) as u64, total);
+        on_progress((index + 1) as u64, total, keywords_imported);
     }
     refresh_invalid_workspace_items_in_tx(&tx, &workspace_dir, workspace)?;
 
@@ -4163,7 +4351,7 @@ where
 #[tauri::command]
 fn reindex_patient_folders(app_handle: tauri::AppHandle, workspace_dir: String) -> Result<usize, String> {
     let workspace = PathBuf::from(workspace_dir);
-    reindex_patient_folders_internal(&app_handle, &workspace, |_completed, _total| {})
+    reindex_patient_folders_internal(&app_handle, &workspace, |_completed, _total, _keywords_imported| {})
 }
 
 #[tauri::command]
@@ -4213,7 +4401,7 @@ async fn start_workspace_reindex(
         let result = reindex_patient_folders_internal(
             &app_handle_clone,
             &workspace,
-            |completed, total| {
+            |completed, total, keywords_imported| {
                 // Avoid flooding the frontend with progress events for very large directories.
                 let should_emit = total == 0
                     || completed == total
@@ -4225,6 +4413,11 @@ async fn start_workspace_reindex(
                 }
                 last_emitted_completed = completed;
                 last_emitted_total = total;
+                let progress_message = if keywords_imported {
+                    "Importing Keywords..."
+                } else {
+                    "Indexing folders"
+                };
                 set_workspace_reindex_status(
                     &app_handle_clone,
                     true,
@@ -4232,7 +4425,7 @@ async fn start_workspace_reindex(
                     completed,
                     total,
                     completed,
-                    "Indexing folders",
+                    progress_message,
                     None,
                 );
             },
@@ -4371,7 +4564,7 @@ fn crawl_workspace_changes_batch_internal(
         if next_signature == current_signature {
             continue;
         }
-        reindex_single_patient_in_tx(&tx, &workspace_dir, &patient_folder, &patient_path)?;
+        let _ = reindex_single_patient_in_tx(&tx, &workspace_dir, &patient_folder, &patient_path)?;
         refreshed = refreshed.saturating_add(1);
     }
     refresh_invalid_workspace_items_in_tx(&tx, &workspace_dir, workspace)?;
@@ -4434,6 +4627,26 @@ fn search_patients_page(
 ) -> Result<PatientSearchPageRow, String> {
     let conn = open_db(&app_handle)?;
     let q = query.trim().to_lowercase();
+    let query_terms: Vec<String> = if q.is_empty() {
+        vec![]
+    } else {
+        if q.contains(',') {
+            q.split(',')
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect()
+        } else {
+            let mut terms: Vec<String> = q
+                .split_whitespace()
+                .map(|part| part.trim().to_string())
+                .filter(|part| !part.is_empty())
+                .collect();
+            if terms.is_empty() {
+                terms.push(q.clone());
+            }
+            terms
+        }
+    };
     let mut rows_out: Vec<PatientSearchRow> = Vec::new();
     let page_size = limit.clamp(1, 500);
     let fetch_limit = page_size.saturating_add(1);
@@ -4450,10 +4663,12 @@ fn search_patients_page(
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
-            .query_map(params![workspace_dir, fetch_limit as i64, offset as i64], |row| {
+            .query_map(params![&workspace_dir, fetch_limit as i64, offset as i64], |row| {
                 Ok(PatientSearchRow {
                     folder_name: row.get::<_, String>(0)?,
                     patient_id: row.get::<_, String>(1)?,
+                    keywords: vec![],
+                    matched_keywords: vec![],
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -4461,8 +4676,8 @@ fn search_patients_page(
         for row in rows {
             rows_out.push(row.map_err(|e| e.to_string())?);
         }
-    } else {
-        let pattern = format!("%{}%", q);
+    } else if query_terms.len() == 1 {
+        let pattern = format!("%{}%", query_terms[0]);
         let mut stmt = conn
             .prepare(
                 "SELECT folder_name, patient_id
@@ -4474,14 +4689,53 @@ fn search_patients_page(
             .map_err(|e| e.to_string())?;
 
         let rows = stmt
-            .query_map(params![workspace_dir, pattern, fetch_limit as i64, offset as i64], |row| {
+            .query_map(params![&workspace_dir, pattern, fetch_limit as i64, offset as i64], |row| {
                 Ok(PatientSearchRow {
                     folder_name: row.get::<_, String>(0)?,
                     patient_id: row.get::<_, String>(1)?,
+                    keywords: vec![],
+                    matched_keywords: vec![],
                 })
             })
             .map_err(|e| e.to_string())?;
 
+        for row in rows {
+            rows_out.push(row.map_err(|e| e.to_string())?);
+        }
+    } else {
+        let mut sql = String::from(
+            "SELECT folder_name, patient_id
+             FROM patient_index
+             WHERE workspace_dir = ?1",
+        );
+        let mut bind_values: Vec<rusqlite::types::Value> = Vec::new();
+        bind_values.push(rusqlite::types::Value::Text(workspace_dir.clone()));
+        for (idx, term) in query_terms.iter().enumerate() {
+            let bind_idx = idx + 2;
+            sql.push_str(&format!(" AND search_text LIKE ?{}", bind_idx));
+            bind_values.push(rusqlite::types::Value::Text(format!("%{}%", term)));
+        }
+        let limit_idx = query_terms.len() + 2;
+        let offset_idx = query_terms.len() + 3;
+        sql.push_str(&format!(
+            " ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+              LIMIT ?{} OFFSET ?{}",
+            limit_idx, offset_idx
+        ));
+        bind_values.push(rusqlite::types::Value::Integer(fetch_limit as i64));
+        bind_values.push(rusqlite::types::Value::Integer(offset as i64));
+
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params_from_iter(bind_values.iter()), |row| {
+                Ok(PatientSearchRow {
+                    folder_name: row.get::<_, String>(0)?,
+                    patient_id: row.get::<_, String>(1)?,
+                    keywords: vec![],
+                    matched_keywords: vec![],
+                })
+            })
+            .map_err(|e| e.to_string())?;
         for row in rows {
             rows_out.push(row.map_err(|e| e.to_string())?);
         }
@@ -4491,6 +4745,31 @@ fn search_patients_page(
     if has_more {
         rows_out.truncate(page_size);
     }
+
+    let workspace_path = PathBuf::from(&workspace_dir);
+    for row in &mut rows_out {
+        let folder_path = workspace_path.join(&row.folder_name);
+        let keywords = load_keywords_for_folder(&folder_path);
+        if keywords.is_empty() {
+            row.keywords = vec![];
+            row.matched_keywords = vec![];
+            continue;
+        }
+        row.keywords = keywords.clone();
+        if query_terms.is_empty() {
+            row.matched_keywords = vec![];
+            continue;
+        }
+        let mut matches = Vec::new();
+        for keyword in keywords {
+            let lowered = keyword.to_lowercase();
+            if query_terms.iter().any(|term| lowered.contains(term)) {
+                matches.push(keyword);
+            }
+        }
+        row.matched_keywords = matches;
+    }
+
     Ok(PatientSearchPageRow { rows: rows_out, has_more })
 }
 
@@ -5251,8 +5530,10 @@ fn get_local_cache_copy_status(
     app_handle: tauri::AppHandle,
 ) -> Result<LocalCacheCopyStatusRow, String> {
     let settings = read_settings(&app_handle).unwrap_or_default();
-    let enabled = settings.keep_local_cache_copy.unwrap_or(false);
     let running = LOCAL_CACHE_COPY_RUNNING.load(Ordering::Relaxed);
+    // During first-enable sync, settings may still be false until the copy finalizes.
+    // Report "enabled" while a local-cache copy job is actively running to avoid UI toggle flicker.
+    let enabled = settings.keep_local_cache_copy.unwrap_or(false) || running;
     let runtime = local_cache_copy_runtime()
         .lock()
         .map_err(|e| e.to_string())?;
@@ -5414,6 +5695,26 @@ async fn run_system_update(app_handle: tauri::AppHandle) -> Result<SystemUpdateR
     Ok(SystemUpdateResult {
         updated: true,
         version: Some(next_version),
+    })
+}
+
+#[tauri::command]
+async fn check_system_update(app_handle: tauri::AppHandle) -> Result<SystemUpdateCheckResult, String> {
+    let updater = app_handle
+        .updater_builder()
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let Some(update) = updater.check().await.map_err(|e| e.to_string())? else {
+        return Ok(SystemUpdateCheckResult {
+            available: false,
+            version: None,
+        });
+    };
+
+    Ok(SystemUpdateCheckResult {
+        available: true,
+        version: Some(update.version.to_string()),
     })
 }
 
@@ -5870,6 +6171,7 @@ pub fn run() {
             delete_local_cache_copy_files,
             get_preview_cache_stats,
             run_system_update,
+            check_system_update,
             get_preview_debug_counts,
             cleanup_preview_cache_for_workspace,
             get_preview_fill_status,
