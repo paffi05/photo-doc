@@ -443,10 +443,6 @@ body{
   transition: color 0.2s ease, padding 0.3s ease, background-color 0.3s ease, border-color 0.3s ease;
 }
 
-.patient-list.blend-in-expand .patient-item:not(.selected){
-  animation: patientBlendIn 0.22s ease both;
-}
-
 .patient-item:hover{
   color: #2563eb;
 }
@@ -517,17 +513,6 @@ body{
   border-color: #2563eb;
   color: #ffffff;
   padding: 8px 8px 8px 10px;
-}
-
-@keyframes patientBlendIn {
-  from {
-    opacity: 0;
-    transform: translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
 }
 
 .patient-keywords{
@@ -2768,24 +2753,6 @@ body{
   flex: 1 1 auto;
 }
 
-.created-previews-count{
-  min-width: 44px;
-  height: 22px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: flex-end;
-  font-size: 11px;
-  color: rgba(0,0,0,0.60);
-  text-align: right;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.created-previews-row{
-  align-items: center;
-  margin: 0;
-}
-
 .about-section-text{
   display: flex;
   flex-direction: column;
@@ -2818,21 +2785,21 @@ body{
 }
 
 .about-avatar{
-  width: 36px;
-  height: 36px;
-  border-radius: 8px;
+  width: 42px;
+  height: 42px;
+  border-radius: 10px;
   object-fit: cover;
   object-position: center;
   box-shadow: 0 8px 14px rgba(15,23,42,0.12);
   border: 1px solid rgba(15,23,42,0.08);
   background: #ffffff;
-  flex: 0 0 36px;
+  flex: 0 0 42px;
 }
 
 .about-person-lines{
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   min-width: 0;
 }
 
@@ -2845,16 +2812,15 @@ body{
 .about-copy-author{
   font-size: 12px;
   font-weight: 400;
-  color: #111111;
+  color: rgba(0,0,0,0.74);
   line-height: 1.45;
-  margin-bottom: 0;
+  margin-bottom: -2px;
 }
 
 .about-copy-location{
   font-size: 10px;
   color: rgba(100,116,139,0.9);
   line-height: 1.3;
-  margin-top: -3px;
 }
 
 .settings button:not(.workspace-path-link):not(.cache-open-btn){
@@ -2959,11 +2925,26 @@ body{
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-bottom: 20px;
+  margin-bottom: 0;
 }
 
-.cache-usage-wrap > .processing-speed-row{
-  margin-top: 0;
+.preview-created-row{
+  align-items: center;
+  padding-top: 15px;
+  padding-bottom: 8px;
+}
+
+.preview-created-label{
+  flex: 1 1 auto;
+}
+
+.preview-created-count{
+  width: auto;
+  margin-left: auto;
+}
+
+.cache-usage-wrap > .settings-row:first-of-type{
+  margin-top: 60px;
 }
 
 .indexing-progress-row{
@@ -3029,6 +3010,23 @@ body{
 }
 
 #deleteLocalCacheLabel.deleting::before{
+  content: "";
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid rgba(220,38,38,0.22);
+  border-top-color: #dc2626;
+  animation: dbSpin 0.8s linear infinite;
+}
+
+#deleteMainCacheLabel.deleting{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #dc2626;
+}
+
+#deleteMainCacheLabel.deleting::before{
   content: "";
   width: 11px;
   height: 11px;
@@ -3112,26 +3110,26 @@ body{
   min-width: 0;
 }
 
-.system-install-btn{
-  min-width: 74px;
+.settings .system-install-btn{
+  width: auto;
+  min-width: 72px;
   height: 28px;
   padding: 0 12px;
   border-radius: 8px;
-  background: #dc2626;
-  border-color: #dc2626;
-  color: #ffffff;
-  font-size: 12px;
+  background: #f97316 !important;
+  border-color: #f97316 !important;
+  color: #ffffff !important;
   font-weight: 700;
-  line-height: 1;
+  font-size: 12px;
   margin-left: auto;
 }
 
-.system-install-btn:hover{
-  background: #dc2626;
-  border-color: #dc2626;
+.settings .system-install-btn:hover{
+  background: #f97316 !important;
+  border-color: #f97316 !important;
 }
 
-.system-install-btn:disabled{
+.settings .system-install-btn:disabled{
   background: rgba(148, 163, 184, 0.7);
   border-color: rgba(100, 116, 139, 0.36);
   color: rgba(255,255,255,0.92);
@@ -3278,6 +3276,21 @@ body{
   cursor: not-allowed;
 }
 
+.delete-main-cache-btn{
+  background: #dc2626 !important;
+  border-color: #dc2626 !important;
+  color: #ffffff !important;
+}
+
+.delete-main-cache-btn:hover:not(:disabled){
+  background: #dc2626;
+  border-color: #dc2626;
+}
+
+.main-cache-delete-row.deleting .delete-main-cache-btn{
+  opacity: 0.6;
+}
+
 .delete-folder-icon{
   display: block;
 }
@@ -3301,36 +3314,6 @@ body{
 
 .db-reload-icon{
   display: block;
-}
-
-button.system-install-btn.db-reload-btn{
-  min-width: 74px;
-  width: auto;
-  height: 28px;
-  padding: 0 12px;
-  border-radius: 8px;
-  border-color: #dc2626 !important;
-  background: #dc2626 !important;
-  color: #ffffff !important;
-  font-size: 12px;
-  font-weight: 700;
-  line-height: 1;
-  letter-spacing: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-
-button.system-install-btn.db-reload-btn:hover:not(:disabled){
-  background: #dc2626 !important;
-  border-color: #dc2626 !important;
-  color: #ffffff !important;
-}
-
-button.system-install-btn.db-reload-btn:disabled{
-  background: rgba(148, 163, 184, 0.7) !important;
-  border-color: rgba(100, 116, 139, 0.36) !important;
-  color: rgba(255,255,255,0.92) !important;
 }
 
 .toggle-switch{

@@ -1,8 +1,8 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Photo-Doc",
-  "version": "1.0.4",
-  "identifier": "com.clemens.photo-doc",
+  "version": "1.0.5",
+  "identifier": "com.clemens.medical-photo-manager",
   "build": {
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Photo-Doc (1.0.4)",
+        "title": "Photo-Doc (1.0.5)",
         "width": 900,
         "height": 600,
         "minWidth": 300,

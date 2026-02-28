@@ -9,9 +9,6 @@ import confetti from "canvas-confetti";
 import { initSidebarLayout } from "./sidebar-layout";
 import { initMainContent } from "./main-content";
 
-const FORCE_UPDATE_UI_PREVIEW = false;
-const FORCE_UPDATE_UI_PREVIEW_VERSION = "1.0.4";
-
 // ---------- DOM ----------
 const onboardingView = document.getElementById("onboardingView");
 const appView = document.getElementById("appView");
@@ -67,6 +64,9 @@ const deleteDatabaseLabel = document.getElementById("deleteDatabaseLabel");
 const deleteLocalCacheBtn = document.getElementById("deleteLocalCacheBtn");
 const deleteLocalCacheRow = document.getElementById("deleteLocalCacheRow");
 const deleteLocalCacheLabel = document.getElementById("deleteLocalCacheLabel");
+const deleteMainCacheBtn = document.getElementById("deleteMainCacheBtn");
+const deleteMainCacheRow = document.getElementById("deleteMainCacheRow");
+const deleteMainCacheLabel = document.getElementById("deleteMainCacheLabel");
 const openLocalCacheCopyFolderBtn = document.getElementById("openLocalCacheCopyFolderBtn");
 const patientSearchInput = document.getElementById("patientSearchInput");
 const patientList = document.getElementById("patientList");
@@ -84,10 +84,10 @@ const cacheSizeSlider = document.getElementById("cacheSizeSlider");
 const cacheSizeValue = document.getElementById("cacheSizeValue");
 const previewSpeedSlider = document.getElementById("previewSpeedSlider");
 const previewSpeedValue = document.getElementById("previewSpeedValue");
+const previewImagesCreatedCount = document.getElementById("previewImagesCreatedCount");
 const backgroundPreviewCreationToggle = document.getElementById("backgroundPreviewCreationToggle");
 const cacheUsageBar = document.getElementById("cacheUsageBar");
 const cacheUsageText = document.getElementById("cacheUsageText");
-const createdPreviewsCount = document.getElementById("createdPreviewsCount");
 const indexingCategoryTitle = document.getElementById("indexingCategoryTitle");
 const openCacheFolderBtn = document.getElementById("openCacheFolderBtn");
 const keepLocalCacheCopyToggle = document.getElementById("keepLocalCacheCopy");
@@ -377,8 +377,6 @@ let indexingProgressRunning = false;
 let indexingProgressMessage = "Up to date";
 let indexingCountsSuffix = "";
 let indexingCustomSuffix = "";
-let dbImageCountForSettings = 0;
-let activeCacheImageCountForSettings = 0;
 let previewFillProgressMessage = "";
 let previewFillProgressCompleted = 0;
 let previewFillProgressTotal = 0;
@@ -398,6 +396,7 @@ let localCacheStatusTotal = 0;
 let localCacheFolderExists = false;
 let localCacheFileCount = 0;
 let isDeleteLocalCacheInFlight = false;
+let isDeleteMainCacheInFlight = false;
 let previewFillIdleTimerId = null;
 let previewFillLastAttemptMs = 0;
 let selectedPatient = null;
@@ -406,13 +405,12 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "1.0.4";
+let systemAppVersion = "1.0.5";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
 let systemUpdateAvailable = false;
 let systemUpdateAvailableVersion = "";
-let systemUpdatePreviewMode = false;
 let importWizardDir = null;
 let importWizardWindowState = null;
 let importWizardPreviewWindowState = null;
@@ -428,6 +426,7 @@ let importWizardPreviewWindow = null;
 let importWizardLinkedPatient = null;
 const importWizardCleanupByJobId = new Map();
 const importingPatientJobCounts = new Map();
+const patientEntryCacheByFolder = new Map();
 let lastRenderedPatientEntries = [];
 let lastRenderedFilterText = "";
 let isPatientListLoading = false;
@@ -436,7 +435,7 @@ let patientSearchOffset = 0;
 let patientSearchHasMore = false;
 let patientSearchInFlight = false;
 let activePatientSearchQuery = "";
-let lastCommittedPatientSearchQuery = "";
+let shouldEnsureSelectedPatientVisible = false;
 let slowWorkspaceMode = false;
 let initialMainReadyInProgress = false;
 
@@ -452,7 +451,6 @@ const MIN_MANUAL_CACHE_STATUS_MS = 1500;
 const PANEL_ANIM_MS = 230;
 const PATIENT_LIST_RENDER_BATCH_SIZE = 160;
 const PATIENT_LIST_PAGE_SIZE = 250;
-const PATIENT_LIST_ANCHOR_BACKFILL_MAX_PAGES = 80;
 const INVALID_ITEMS_PAGE_SIZE = 200;
 const WORKSPACE_REINDEX_START_TIMEOUT_MS = 6000;
 const WORKSPACE_REINDEX_STATUS_TIMEOUT_MS = 3500;
@@ -622,13 +620,13 @@ function updateWindowDebugSize() {
 }
 
 function setDeleteWorkspaceAvailability(enabled) {
-  if (deleteWorkspaceBtn) deleteWorkspaceBtn.disabled = !enabled || isDeleteLocalCacheInFlight;
+  if (deleteWorkspaceBtn) deleteWorkspaceBtn.disabled = !enabled || isDeleteLocalCacheInFlight || isDeleteMainCacheInFlight;
   deleteWorkspaceRow?.classList.toggle("inactive", !enabled);
 }
 
 function setDeleteDatabaseAvailability(enabled) {
   const available = Boolean(enabled) && !isDbUpdating && !databaseDeleteLocked;
-  if (deleteDatabaseBtn) deleteDatabaseBtn.disabled = !available || isDeleteLocalCacheInFlight;
+  if (deleteDatabaseBtn) deleteDatabaseBtn.disabled = !available || isDeleteLocalCacheInFlight || isDeleteMainCacheInFlight;
   deleteDatabaseRow?.classList.toggle("inactive", !available);
 }
 
@@ -641,9 +639,19 @@ function setDeleteLocalCacheDeletingUi(deleting) {
   }
 }
 
+function setDeleteMainCacheDeletingUi(deleting) {
+  const isDeleting = Boolean(deleting);
+  deleteMainCacheRow?.classList.toggle("deleting", isDeleting);
+  if (deleteMainCacheLabel) {
+    deleteMainCacheLabel.textContent = isDeleting ? "Deleting main Cache..." : "Delete main Cache Files";
+    deleteMainCacheLabel.classList.toggle("deleting", isDeleting);
+  }
+}
+
 function setDebugOnlyRowsVisibility(show) {
   if (deleteWorkspaceRow) deleteWorkspaceRow.hidden = !show;
   if (deleteDatabaseRow) deleteDatabaseRow.hidden = !show;
+  if (deleteMainCacheRow) deleteMainCacheRow.hidden = !show;
 }
 
 function readDebugVisibilityPref() {
@@ -771,13 +779,6 @@ function setCacheUsageUi({ usedBytes = 0, maxBytes = 0, percent = 0 } = {}) {
   }
 }
 
-function renderCreatedPreviewsUi() {
-  if (!createdPreviewsCount) return;
-  const cacheCount = Math.max(0, Math.floor(Number(activeCacheImageCountForSettings) || 0));
-  const dbCount = Math.max(0, Math.floor(Number(dbImageCountForSettings) || 0));
-  createdPreviewsCount.textContent = `(${cacheCount}/${dbCount})`;
-}
-
 function formatLocalCacheCopyStatusText(state, lastSyncMs = null) {
   if (state === "copying") return "Copying Images...";
   if (state === "updating") return "Syncing Images...";
@@ -802,12 +803,24 @@ function updateLocalCacheDeleteButtonState() {
     !blocked;
   const busy = Boolean(localCacheStatusRunning || localCacheSyncInFlight);
   if (deleteLocalCacheBtn) {
-    deleteLocalCacheBtn.disabled = !enabled || busy || isDeleteLocalCacheInFlight;
+    deleteLocalCacheBtn.disabled = !enabled || busy || isDeleteLocalCacheInFlight || isDeleteMainCacheInFlight;
   }
   if (openLocalCacheCopyFolderBtn) {
-    openLocalCacheCopyFolderBtn.disabled = !currentWorkspaceDir || isDeleteLocalCacheInFlight;
+    openLocalCacheCopyFolderBtn.disabled = !currentWorkspaceDir || isDeleteLocalCacheInFlight || isDeleteMainCacheInFlight;
   }
   deleteLocalCacheRow?.classList.toggle("inactive", !enabled);
+  const mainDeleteBlocked = Boolean(
+    !currentWorkspaceDir ||
+    hasActiveImportJobs() ||
+    isPreviewFillRunning ||
+    isStoppingCacheProcesses ||
+    localCacheStatusRunning ||
+    localCacheSyncInFlight
+  );
+  if (deleteMainCacheBtn) {
+    deleteMainCacheBtn.disabled = mainDeleteBlocked || isDeleteMainCacheInFlight || isDeleteLocalCacheInFlight;
+  }
+  deleteMainCacheRow?.classList.toggle("inactive", mainDeleteBlocked);
   if (keepLocalCacheCopyToggle) {
     keepLocalCacheCopyToggle.disabled =
       !currentWorkspaceDir || localCacheSyncInFlight || blocked;
@@ -838,6 +851,25 @@ function applyLocalCacheCopyStatus(status = {}) {
   updateLocalCacheDeleteButtonState();
   updateCacheReloadButtonState();
   void refreshIndexingStatus();
+}
+
+async function deleteLocalCacheFilesFlow(workspaceDir, { refreshTreatment = true } = {}) {
+  localCacheSyncInFlight = true;
+  await invoke("set_keep_local_cache_copy", {
+    workspaceDir,
+    enabled: false,
+  });
+  applyLocalCacheCopyStatus({ enabled: false, running: false, state: "disabled" });
+  await invoke("delete_local_cache_copy_files", {
+    workspaceDir,
+  });
+  mainContent.invalidateTreatmentPreviewCache();
+  await refreshCacheUsageUi();
+  await refreshLocalCacheCopyStatus();
+  if (refreshTreatment) {
+    await mainContent.refreshTreatmentFilesForSelection();
+  }
+  await refreshIndexingStatus();
 }
 
 async function refreshLocalCacheCopyStatus() {
@@ -929,9 +961,20 @@ function setIndexingProgressUi({ running = false, message = "Up to date" } = {})
   renderIndexingProgressText();
 }
 
-function setIndexingDebugCountsUi(dbImageCount = 0, _cacheImageCount = 0, { show = false } = {}) {
-  indexingCountsSuffix = show ? `(${dbImageCount})` : "";
+function setIndexingDebugCountsUi(dbImageCount = 0, cacheImageCount = 0, { show = false } = {}) {
+  indexingCountsSuffix = show ? `(${dbImageCount}/${cacheImageCount})` : "";
   renderIndexingProgressText();
+}
+
+function setPreviewImagesCreatedUi(activeFolderImageCount = 0, dbImageCount = 0, { loading = false } = {}) {
+  if (!previewImagesCreatedCount) return;
+  if (loading) {
+    previewImagesCreatedCount.textContent = "(.../...)";
+    return;
+  }
+  const active = Math.max(0, Number(activeFolderImageCount) || 0);
+  const db = Math.max(0, Number(dbImageCount) || 0);
+  previewImagesCreatedCount.textContent = `(${active}/${db})`;
 }
 
 function setIndexingCustomSuffixUi(suffix = "") {
@@ -941,6 +984,23 @@ function setIndexingCustomSuffixUi(suffix = "") {
 
 function setIndexingCategoryTitle(dbImageCount = null, { loading = false } = {}) {
   if (!indexingCategoryTitle) return;
+  if (!currentWorkspaceDir) {
+    indexingCategoryTitle.textContent = "INDEXING";
+    return;
+  }
+  if (loading) {
+    indexingCategoryTitle.textContent = "INDEXING (...)";
+    return;
+  }
+  const count = Number(dbImageCount);
+  if (Number.isFinite(count) && count >= 0) {
+    indexingCategoryTitle.textContent = `INDEXING (${Math.floor(count)})`;
+    return;
+  }
+  if (!Number.isFinite(count) || count < 0) {
+    indexingCategoryTitle.textContent = "INDEXING";
+    return;
+  }
   indexingCategoryTitle.textContent = "INDEXING";
 }
 
@@ -1040,31 +1100,47 @@ function updateCacheReloadButtonState() {
 
 async function refreshIndexingDebugCounts() {
   if (!currentWorkspaceDir) {
-    dbImageCountForSettings = 0;
-    renderCreatedPreviewsUi();
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: false });
+    setPreviewImagesCreatedUi(0, 0, { loading: false });
     return;
   }
   if (indexingDebugCountsInFlight) return;
   indexingDebugCountsInFlight = true;
   try {
-    const dbImageCount = Number(await invoke("get_db_image_count", { workspaceDir: currentWorkspaceDir })) || 0;
-    dbImageCountForSettings = dbImageCount;
-    renderCreatedPreviewsUi();
-    setIndexingCategoryTitle(dbImageCount, { loading: false });
-    setIndexingDebugCountsUi(dbImageCount, 0, { show: shouldShowIndexingDebugCounts() });
-    indexingCountsWarmRetryWorkspace = "";
-    if (indexingCountsWarmRetryTimerId !== null) {
-      clearTimeout(indexingCountsWarmRetryTimerId);
-      indexingCountsWarmRetryTimerId = null;
+    const stats = await invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir });
+    const loading = Boolean(stats?.loading);
+    const dbImageCount = Number(stats?.db_image_count ?? stats?.dbImageCount ?? 0) || 0;
+    const cacheImageCount = Number(stats?.cache_image_count ?? stats?.cacheImageCount ?? 0) || 0;
+    setIndexingCategoryTitle(dbImageCount, { loading });
+    setPreviewImagesCreatedUi(cacheImageCount, dbImageCount, { loading });
+    setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: shouldShowIndexingDebugCounts() });
+    if (dbImageCount === 0 && cacheImageCount === 0) {
+      const workspaceKey = String(currentWorkspaceDir ?? "").trim();
+      if (
+        workspaceKey &&
+        workspaceKey !== indexingCountsWarmRetryWorkspace &&
+        indexingCountsWarmRetryTimerId === null
+      ) {
+        indexingCountsWarmRetryWorkspace = workspaceKey;
+        indexingCountsWarmRetryTimerId = setTimeout(() => {
+          indexingCountsWarmRetryTimerId = null;
+          if (String(currentWorkspaceDir ?? "").trim() !== workspaceKey) return;
+          void refreshIndexingDebugCounts();
+        }, 450);
+      }
+    } else {
+      indexingCountsWarmRetryWorkspace = "";
+      if (indexingCountsWarmRetryTimerId !== null) {
+        clearTimeout(indexingCountsWarmRetryTimerId);
+        indexingCountsWarmRetryTimerId = null;
+      }
     }
   } catch (err) {
-    console.error("get_db_image_count failed:", err);
-    dbImageCountForSettings = 0;
-    renderCreatedPreviewsUi();
+    console.error("get_preview_debug_counts failed:", err);
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: shouldShowIndexingDebugCounts() });
+    setPreviewImagesCreatedUi(0, 0, { loading: false });
   } finally {
     indexingDebugCountsInFlight = false;
   }
@@ -1250,10 +1326,6 @@ async function ensureBackgroundPreviewFill(cacheStats = null) {
 async function refreshCacheUsageUi() {
   try {
     const stats = await invoke("get_preview_cache_stats");
-    activeCacheImageCountForSettings = Number(
-      stats?.active_cache_image_count ?? stats?.activeCacheImageCount ?? 0
-    ) || 0;
-    renderCreatedPreviewsUi();
     setCacheUsageUi({
       usedBytes: stats?.used_bytes ?? stats?.usedBytes ?? 0,
       maxBytes: stats?.max_bytes ?? stats?.maxBytes ?? 0,
@@ -1271,8 +1343,6 @@ async function refreshCacheUsageUi() {
     return stats;
   } catch (err) {
     console.error("get_preview_cache_stats failed:", err);
-    activeCacheImageCountForSettings = 0;
-    renderCreatedPreviewsUi();
     const fallback = {
       used_bytes: 0,
       max_bytes: (DEFAULT_CACHE_SIZE_GB * 1024 * 1024 * 1024),
@@ -1362,7 +1432,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.4").trim() || "1.0.4";
+  const safeVersion = String(version || "1.0.5").trim() || "1.0.5";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -1415,10 +1485,6 @@ async function searchSystemUpdateNow({ showStartupNotice = false } = {}) {
 }
 
 async function installSystemUpdateNow() {
-  if (systemUpdatePreviewMode) {
-    setSystemUpdateStatusText("Preview mode only");
-    return;
-  }
   if (systemUpdateBusy || systemUpdateInstalling || !systemUpdateAvailable) return;
   systemUpdateInstalling = true;
   setSystemUpdateUi({ busy: false, installing: true });
@@ -1450,18 +1516,6 @@ async function installSystemUpdateNow() {
 }
 
 async function initSystemUpdateStatus() {
-  if (FORCE_UPDATE_UI_PREVIEW) {
-    systemUpdatePreviewMode = true;
-    systemUpdateBusy = false;
-    systemUpdateInstalling = false;
-    systemUpdateAvailable = true;
-    systemUpdateAvailableVersion = FORCE_UPDATE_UI_PREVIEW_VERSION;
-    systemUpdateCheckedAtMs = Date.now();
-    setStartupUpdateNoticeVisible(true);
-    setSystemUpdateUi({ busy: false });
-    setSystemUpdateStatusText(`Update available (${FORCE_UPDATE_UI_PREVIEW_VERSION})`);
-    return;
-  }
   try {
     const version = await getVersion();
     if (version && String(version).trim()) {
@@ -1546,6 +1600,78 @@ function normalizePatientEntry(entry) {
   const matchedKeywords = normalizeKeywords(matchedKeywordsRaw);
 
   return { folderName, patientId, keywords, matchedKeywords };
+}
+
+function cachePatientEntries(entries = []) {
+  if (!Array.isArray(entries) || entries.length < 1) return;
+  for (const entry of entries) {
+    const normalized = normalizePatientEntry(entry);
+    if (!normalized.folderName) continue;
+    patientEntryCacheByFolder.set(normalized.folderName, normalized);
+  }
+}
+
+function prependSelectedPatientIfMissing(rows = [], query = "") {
+  const normalizedQuery = String(query ?? "").trim();
+  const selectedFolder = String(selectedPatient ?? "").trim();
+  if (normalizedQuery || !selectedFolder) return rows;
+
+  const hasSelected = rows.some((entry) => normalizePatientEntry(entry).folderName === selectedFolder);
+  if (hasSelected) return rows;
+
+  const cached = patientEntryCacheByFolder.get(selectedFolder);
+  const selectedRow = cached ?? {
+    folderName: selectedFolder,
+    patientId: String(selectedPatientId ?? "").trim(),
+    keywords: [],
+    matchedKeywords: [],
+  };
+  return [selectedRow, ...rows];
+}
+
+function mergeUniquePatientRows(existing = [], incoming = []) {
+  const seen = new Set(
+    existing
+      .map((entry) => normalizePatientEntry(entry).folderName)
+      .filter(Boolean),
+  );
+  const uniqueIncoming = [];
+  for (const row of incoming) {
+    const folderName = normalizePatientEntry(row).folderName;
+    if (!folderName || seen.has(folderName)) continue;
+    seen.add(folderName);
+    uniqueIncoming.push(row);
+  }
+  return {
+    entries: [...existing, ...uniqueIncoming],
+    appendedRows: uniqueIncoming,
+  };
+}
+
+function patientRowsContainFolder(rows = [], folderName = "") {
+  const target = String(folderName ?? "").trim();
+  if (!target) return false;
+  return rows.some((entry) => normalizePatientEntry(entry).folderName === target);
+}
+
+function ensureSelectedPatientVisibleInList() {
+  if (!shouldEnsureSelectedPatientVisible || !patientList || !patientListWrap) return;
+  const selectedFolder = String(selectedPatient ?? "").trim();
+  if (!selectedFolder) {
+    shouldEnsureSelectedPatientVisible = false;
+    return;
+  }
+  const items = patientList.querySelectorAll(".patient-item");
+  let selectedItem = null;
+  for (const item of items) {
+    if (item?.dataset?.folderName === selectedFolder) {
+      selectedItem = item;
+      break;
+    }
+  }
+  if (!selectedItem) return;
+  shouldEnsureSelectedPatientVisible = false;
+  selectedItem.scrollIntoView({ block: "nearest" });
 }
 
 function setWorkspacePathDisplay(workspaceDir) {
@@ -2043,85 +2169,6 @@ function updatePatientSelectionInList() {
   }
 }
 
-function captureSelectedPatientViewportAnchor() {
-  if (!patientListWrap || !patientList) return null;
-  const selected = String(selectedPatient ?? "").trim();
-  if (!selected) return null;
-  const selectedItem = Array.from(patientList.querySelectorAll(".patient-item"))
-    .find((item) => item.dataset.folderName === selected);
-  const wrapRect = patientListWrap.getBoundingClientRect();
-  if (!selectedItem) {
-    return {
-      folderName: selected,
-      offsetFromTop: Math.max(0, Math.round(patientListWrap.clientHeight * 0.38)),
-    };
-  }
-  const itemRect = selectedItem.getBoundingClientRect();
-  return {
-    folderName: selected,
-    offsetFromTop: itemRect.top - wrapRect.top,
-  };
-}
-
-function findPatientListItemByFolderName(folderName = "") {
-  if (!patientList) return null;
-  const target = String(folderName ?? "").trim();
-  if (!target) return null;
-  return Array.from(patientList.querySelectorAll(".patient-item"))
-    .find((item) => item.dataset.folderName === target) ?? null;
-}
-
-function restoreSelectedPatientViewportAnchor(anchor) {
-  if (!anchor || !patientListWrap || !patientList) return false;
-  const selectedItem = findPatientListItemByFolderName(anchor.folderName);
-  if (!selectedItem) return false;
-  const wrapRect = patientListWrap.getBoundingClientRect();
-  const itemRect = selectedItem.getBoundingClientRect();
-  const targetOffset = Number(anchor.offsetFromTop);
-  const offsetFromTop = Number.isFinite(targetOffset) ? targetOffset : 0;
-  const delta = (itemRect.top - wrapRect.top) - offsetFromTop;
-  if (Math.abs(delta) > 0.75) {
-    patientListWrap.scrollTop += delta;
-  }
-  return true;
-}
-
-async function backfillPatientListUntilAnchorVisible(normalizedQuery, preserveSelectedAnchor) {
-  if (!currentWorkspaceDir || !preserveSelectedAnchor) return;
-  if (String(normalizedQuery ?? "").trim().length > 0) return;
-  const selectedFolder = String(preserveSelectedAnchor.folderName ?? "").trim();
-  if (!selectedFolder) return;
-
-  let pagesFetched = 0;
-  while (patientSearchHasMore && pagesFetched < PATIENT_LIST_ANCHOR_BACKFILL_MAX_PAGES) {
-    if (String(selectedPatient ?? "").trim() !== selectedFolder) break;
-    if (restoreSelectedPatientViewportAnchor(preserveSelectedAnchor)) break;
-
-    const page = await withTimeout(
-      invoke("search_patients_page", {
-        workspaceDir: currentWorkspaceDir,
-        query: normalizedQuery,
-        offset: patientSearchOffset,
-        limit: PATIENT_LIST_PAGE_SIZE,
-      }),
-      SEARCH_PATIENTS_TIMEOUT_MS,
-      "search_patients_page",
-    );
-    const rows = Array.isArray(page?.rows) ? page.rows : [];
-    patientSearchHasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
-    patientSearchOffset += rows.length;
-    if (rows.length < 1) break;
-
-    const entries = [...lastRenderedPatientEntries, ...rows];
-    lastRenderedPatientEntries = entries;
-    lastRenderedFilterText = normalizedQuery;
-    appendPatientListRows(rows);
-    updatePatientSelectionInList();
-    restoreSelectedPatientViewportAnchor(preserveSelectedAnchor);
-    pagesFetched += 1;
-  }
-}
-
 function buildPatientListItem(entry) {
   const { folderName, patientId, keywords, matchedKeywords } = normalizePatientEntry(entry);
   if (!folderName) return null;
@@ -2249,20 +2296,17 @@ function appendPatientListRows(rows) {
     if (item) fragment.appendChild(item);
   }
   patientList.appendChild(fragment);
+  ensureSelectedPatientVisibleInList();
 }
 
-function renderPatientList(entries, filterText = "", options = {}) {
+function renderPatientList(entries, filterText = "") {
   if (!patientList) return;
   const renderToken = ++patientListRenderToken;
-  const preserveSelectedAnchor = options?.preserveSelectedAnchor ?? null;
-  const blendInOnExpand = Boolean(options?.blendInOnExpand);
-  let anchorRestored = false;
   lastRenderedPatientEntries = entries;
   lastRenderedFilterText = filterText;
 
   patientList.innerHTML = "";
   patientList.classList.remove("is-empty-state");
-  patientList.classList.toggle("blend-in-expand", blendInOnExpand);
 
   if (isPatientListLoading && !filterText) {
     const loading = document.createElement("li");
@@ -2297,16 +2341,9 @@ function renderPatientList(entries, filterText = "", options = {}) {
       if (item) fragment.appendChild(item);
     }
     patientList.appendChild(fragment);
-    if (!anchorRestored && preserveSelectedAnchor) {
-      anchorRestored = restoreSelectedPatientViewportAnchor(preserveSelectedAnchor);
-    }
+    ensureSelectedPatientVisibleInList();
     if (index < entries.length) {
       requestAnimationFrame(appendBatch);
-    } else if (blendInOnExpand) {
-      setTimeout(() => {
-        if (!patientList || renderToken !== patientListRenderToken) return;
-        patientList.classList.remove("blend-in-expand");
-      }, 260);
     }
   };
   appendBatch();
@@ -2320,16 +2357,6 @@ async function searchPatients(query = "", { append = false } = {}) {
   if (patientSearchInFlight) return;
 
   const normalizedQuery = String(query ?? "").trim();
-  const previousCommittedQuery = lastCommittedPatientSearchQuery;
-  const shouldPreserveSelectedOnClear = (
-    !append &&
-    previousCommittedQuery.length > 0 &&
-    normalizedQuery.length === 0 &&
-    Boolean(String(selectedPatient ?? "").trim())
-  );
-  const selectedViewportAnchor = shouldPreserveSelectedOnClear
-    ? captureSelectedPatientViewportAnchor()
-    : null;
   if (!append) {
     patientSearchOffset = 0;
     patientSearchHasMore = false;
@@ -2341,34 +2368,56 @@ async function searchPatients(query = "", { append = false } = {}) {
 
   try {
     patientSearchInFlight = true;
-    const page = await withTimeout(
+    const fetchPage = async (offset) => withTimeout(
       invoke("search_patients_page", {
         workspaceDir: currentWorkspaceDir,
         query: normalizedQuery,
-        offset: patientSearchOffset,
+        offset,
         limit: PATIENT_LIST_PAGE_SIZE,
       }),
       SEARCH_PATIENTS_TIMEOUT_MS,
       "search_patients_page",
     );
-    const rows = Array.isArray(page?.rows) ? page.rows : [];
-    patientSearchHasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
-    patientSearchOffset += rows.length;
+    const selectedFolder = String(selectedPatient ?? "").trim();
+    const shouldLocateSelectedOnClear = !append && !normalizedQuery && Boolean(selectedFolder);
+    shouldEnsureSelectedPatientVisible = shouldLocateSelectedOnClear;
+
+    const page = await fetchPage(patientSearchOffset);
+    const firstRows = Array.isArray(page?.rows) ? page.rows : [];
+    let rawRows = firstRows;
+    let hasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
+    let nextOffset = patientSearchOffset + firstRows.length;
+    cachePatientEntries(firstRows);
+
+    if (shouldLocateSelectedOnClear && !patientRowsContainFolder(rawRows, selectedFolder)) {
+      while (hasMore) {
+        const nextPage = await fetchPage(nextOffset);
+        const nextRows = Array.isArray(nextPage?.rows) ? nextPage.rows : [];
+        if (nextRows.length < 1) {
+          hasMore = false;
+          break;
+        }
+        cachePatientEntries(nextRows);
+        rawRows = [...rawRows, ...nextRows];
+        nextOffset += nextRows.length;
+        hasMore = Boolean(nextPage?.has_more ?? nextPage?.hasMore ?? false);
+        if (patientRowsContainFolder(rawRows, selectedFolder)) break;
+      }
+    }
+
+    const rows = append ? rawRows : prependSelectedPatientIfMissing(rawRows, normalizedQuery);
+    patientSearchHasMore = hasMore;
+    patientSearchOffset = nextOffset;
     if (append) {
-      const entries = [...lastRenderedPatientEntries, ...rows];
+      const merged = mergeUniquePatientRows(lastRenderedPatientEntries, rows);
+      const entries = merged.entries;
+      const rowsToAppend = merged.appendedRows;
       lastRenderedPatientEntries = entries;
       lastRenderedFilterText = normalizedQuery;
-      appendPatientListRows(rows);
+      appendPatientListRows(rowsToAppend);
       updatePatientSelectionInList();
     } else {
-      renderPatientList(rows, normalizedQuery, {
-        preserveSelectedAnchor: selectedViewportAnchor,
-        blendInOnExpand: Boolean(selectedViewportAnchor),
-      });
-      if (selectedViewportAnchor) {
-        await backfillPatientListUntilAnchorVisible(normalizedQuery, selectedViewportAnchor);
-      }
-      lastCommittedPatientSearchQuery = normalizedQuery;
+      renderPatientList(rows, normalizedQuery);
     }
   } catch (err) {
     console.error("search_patients_page failed:", err);
@@ -2562,6 +2611,7 @@ function clearPatients() {
   selectedPatientId = "";
   updateImportWizardButtonState();
   importingPatientJobCounts.clear();
+  patientEntryCacheByFolder.clear();
   updateCacheReloadButtonState();
   updateLocalCacheDeleteButtonState();
   sidebarLayout.clearAutoHidePatientSidebar();
@@ -2575,6 +2625,7 @@ function clearPatients() {
   patientSearchHasMore = false;
   patientSearchInFlight = false;
   activePatientSearchQuery = "";
+  shouldEnsureSelectedPatientVisible = false;
   invalidPatientOffset = 0;
   setInvalidPatientFolderWarningUi(0, [], [], false);
   setAddPatientFormVisible(false);
@@ -2598,6 +2649,7 @@ function clearPatients() {
   setPreviewFillRunning(false);
   setIndexingProgressUi({ running: false, message: "Up to date" });
   setIndexingDebugCountsUi(0, 0, { show: false });
+  setPreviewImagesCreatedUi(0, 0, { loading: false });
   setDbStatusIdle();
 }
 
@@ -3065,20 +3117,7 @@ deleteLocalCacheBtn?.addEventListener("click", async () => {
   setDeleteWorkspaceAvailability(Boolean(showFrontendDebugToggle?.checked));
   setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
   try {
-    localCacheSyncInFlight = true;
-    await invoke("set_keep_local_cache_copy", {
-      workspaceDir: currentWorkspaceDir,
-      enabled: false,
-    });
-    applyLocalCacheCopyStatus({ enabled: false, running: false, state: "disabled" });
-    await invoke("delete_local_cache_copy_files", {
-      workspaceDir: currentWorkspaceDir,
-    });
-    mainContent.invalidateTreatmentPreviewCache();
-    await refreshCacheUsageUi();
-    await refreshLocalCacheCopyStatus();
-    await mainContent.refreshTreatmentFilesForSelection();
-    await refreshIndexingStatus();
+    await deleteLocalCacheFilesFlow(currentWorkspaceDir, { refreshTreatment: true });
   } catch (err) {
     console.error("delete_local_cache_copy_files failed:", err);
   } finally {
@@ -3086,6 +3125,38 @@ deleteLocalCacheBtn?.addEventListener("click", async () => {
     setDeleteLocalCacheDeletingUi(false);
     localCacheSyncInFlight = false;
     updateLocalCacheDeleteButtonState();
+    setDeleteWorkspaceAvailability(Boolean(showFrontendDebugToggle?.checked));
+    setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
+  }
+});
+deleteMainCacheBtn?.addEventListener("click", async () => {
+  if (!currentWorkspaceDir || deleteMainCacheBtn.disabled) return;
+  isDeleteMainCacheInFlight = true;
+  isDeleteLocalCacheInFlight = true;
+  setDeleteMainCacheDeletingUi(true);
+  setDeleteLocalCacheDeletingUi(true);
+  updateLocalCacheDeleteButtonState();
+  setDeleteWorkspaceAvailability(Boolean(showFrontendDebugToggle?.checked));
+  setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
+  try {
+    await deleteLocalCacheFilesFlow(currentWorkspaceDir, { refreshTreatment: false });
+    await invoke("delete_main_cache_files", {
+      workspaceDir: currentWorkspaceDir,
+    });
+    mainContent.invalidateTreatmentPreviewCache();
+    await refreshCacheUsageUi();
+    await refreshIndexingDebugCounts();
+    await refreshIndexingStatus();
+    await mainContent.refreshTreatmentFilesForSelection();
+  } catch (err) {
+    console.error("delete_main_cache_files failed:", err);
+  } finally {
+    isDeleteMainCacheInFlight = false;
+    isDeleteLocalCacheInFlight = false;
+    setDeleteMainCacheDeletingUi(false);
+    setDeleteLocalCacheDeletingUi(false);
+    updateLocalCacheDeleteButtonState();
+    localCacheSyncInFlight = false;
     setDeleteWorkspaceAvailability(Boolean(showFrontendDebugToggle?.checked));
     setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
   }
@@ -3421,7 +3492,6 @@ newPatientId?.addEventListener("input", () => {
 initDebugVisibilitySetting();
 initTimelineNamesSetting();
 setDbStatusIdle();
-renderCreatedPreviewsUi();
 updateWindowDebugSize();
 if (/windows/i.test(navigator.userAgent)) {
   appView?.classList.add("platform-windows");
@@ -3430,6 +3500,7 @@ sidebarLayout.applyPatientSidebarMode();
 sidebarLayout.updateTopButtonSpacing();
 updateAddPatientFormState();
 renderPatientList([], "");
+setPreviewImagesCreatedUi(0, 0, { loading: false });
 void listen("preview-fill-status", (event) => {
   const running = Boolean(event?.payload?.running);
   setPreviewFillRunning(running);

@@ -1,5 +1,5 @@
-<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" id="doctor-svg" style="background: #ffffff;">
-  <!-- All animations removed; this is now a static image -->
+<svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" id="doctor-svg">
+  <rect x="8" y="8" width="184" height="184" rx="36" fill="#ffffff" />
 
   <g transform="rotate(-10, 100, 100)">
     <circle cx="100" cy="95" r="30" fill="#000000" />

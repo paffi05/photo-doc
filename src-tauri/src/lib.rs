@@ -5838,6 +5838,46 @@ fn delete_local_cache_copy_files(
 }
 
 #[tauri::command]
+async fn delete_main_cache_files(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<(), String> {
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
+        return Err("cannot delete main cache while preview creation is active".to_string());
+    }
+    let workspace_dir = workspace_dir.trim().to_string();
+    if workspace_dir.is_empty() {
+        return Err("workspace directory is required".to_string());
+    }
+    let workspace = PathBuf::from(&workspace_dir);
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+    let main_cache_dir = get_local_cache_copy_dir(&workspace);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+        if !main_cache_dir.exists() {
+            return Ok(());
+        }
+        let main_canon = fs::canonicalize(&main_cache_dir).unwrap_or(main_cache_dir.clone());
+        if main_canon
+            .file_name()
+            .and_then(|s| s.to_str())
+            != Some(LOCAL_CACHE_COPY_DIR_NAME)
+        {
+            return Err("refusing to delete unexpected main cache directory".to_string());
+        }
+        if !path_is_inside_dir(&main_canon, &workspace) {
+            return Err("refusing to delete cache path outside workspace".to_string());
+        }
+        fs::remove_dir_all(&main_canon).map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
     let max_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
     let cache_dir = get_active_preview_cache_dir(&app_handle);
@@ -5889,6 +5929,13 @@ async fn run_system_update(app_handle: tauri::AppHandle) -> Result<SystemUpdateR
         .download_and_install(|_, _| {}, || {})
         .await
         .map_err(|e| e.to_string())?;
+
+    // Restart into the freshly installed version automatically.
+    let restart_handle = app_handle.clone();
+    tauri::async_runtime::spawn(async move {
+        std::thread::sleep(Duration::from_millis(220));
+        restart_handle.restart();
+    });
 
     Ok(SystemUpdateResult {
         updated: true,
@@ -6385,6 +6432,7 @@ pub fn run() {
             get_local_cache_copy_status,
             sync_local_cache_copy,
             delete_local_cache_copy_files,
+            delete_main_cache_files,
             get_preview_cache_stats,
             run_system_update,
             check_system_update,
