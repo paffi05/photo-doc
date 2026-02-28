@@ -2436,6 +2436,23 @@ body{
   -webkit-backdrop-filter: none;
 }
 
+.app.platform-windows .patient-sidebar{
+  background: rgba(250,251,252,0.97);
+}
+
+.app.platform-windows .main-header-frost{
+  background: rgba(255,255,255,0.92);
+}
+
+.app.platform-windows .settings{
+  background: rgba(255,255,255,0.95);
+}
+
+.app.platform-windows .settings-header,
+.app.platform-windows .settings.is-scrolled .settings-header{
+  background: rgba(255,255,255,0.96);
+}
+
 /* Settings layout */
 .settings-body{
   flex: 1;

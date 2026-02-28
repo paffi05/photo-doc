@@ -927,13 +927,13 @@ function setIndexingCategoryTitle(dbImageCount = null, { loading = false } = {})
     indexingCategoryTitle.textContent = "INDEXING";
     return;
   }
+  if (loading) {
+    indexingCategoryTitle.textContent = "INDEXING (...)";
+    return;
+  }
   const count = Number(dbImageCount);
   if (Number.isFinite(count) && count >= 0) {
     indexingCategoryTitle.textContent = `INDEXING (${Math.floor(count)})`;
-    return;
-  }
-  if (loading) {
-    indexingCategoryTitle.textContent = "INDEXING (...)";
     return;
   }
   if (!Number.isFinite(count) || count < 0) {

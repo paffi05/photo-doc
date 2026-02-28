@@ -1354,16 +1354,7 @@ fn get_local_cache_copy_dir(workspace: &Path) -> PathBuf {
 }
 
 fn hide_path_on_windows(path: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        if path.exists() {
-            let _ = Command::new("attrib").arg("+h").arg(path).status();
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = path;
-    }
+    let _ = path;
 }
 
 fn paths_point_to_same_location(left: &Path, right: &Path) -> bool {
