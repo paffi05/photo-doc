@@ -210,7 +210,7 @@
 
           <div class="settings-section">
             <div class="settings-category-row">
-              <div class="settings-category">INDEXING</div>
+              <div class="settings-category" id="indexingCategoryTitle">INDEXING</div>
             </div>
             <div class="cache-usage-wrap">
               <div class="cache-usage-track" aria-hidden="true">
@@ -276,7 +276,18 @@
                 </label>
               </div>
               <div class="settings-row delete-action-row local-cache-delete-row inactive" id="deleteLocalCacheRow">
-                <div class="settings-value" id="deleteLocalCacheLabel">Delete local files</div>
+                <div class="settings-value local-cache-delete-label-wrap">
+                  <span id="deleteLocalCacheLabel">Delete local files</span>
+                  <button
+                    type="button"
+                    class="cache-open-btn local-cache-open-btn"
+                    id="openLocalCacheCopyFolderBtn"
+                    aria-label="Open local cache copy folder"
+                    title="Open local cache copy folder"
+                  >
+                    &gt;
+                  </button>
+                </div>
                 <button class="folder-change-btn delete-folder-btn" id="deleteLocalCacheBtn" aria-label="delete local cache files" disabled>
                   <svg class="delete-folder-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                     <path d="M7 7L17 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>

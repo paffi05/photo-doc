@@ -1,6 +1,7 @@
 export function initSidebarLayout({
   appView,
   openBtn,
+  importWizardBtn,
   closeBtn,
   overlay,
   panel,
@@ -86,17 +87,20 @@ export function initSidebarLayout({
 
     addPatientBtn.style.marginRight = "";
 
-    const gearRect = openBtn.getBoundingClientRect();
     const addRect = addPatientBtn.getBoundingClientRect();
+    const minGap = 5;
+    let shiftNeeded = 0;
+    const blockers = [openBtn, importWizardBtn].filter(Boolean);
 
-    const verticallyOverlapping = addRect.bottom > gearRect.top && addRect.top < gearRect.bottom;
-    if (!verticallyOverlapping) {
-      addPatientBtn.style.marginRight = "";
-      return;
+    for (const blocker of blockers) {
+      if (!blocker || blocker.hidden || blocker.getClientRects().length < 1) continue;
+      const blockerRect = blocker.getBoundingClientRect();
+      const verticallyOverlapping = addRect.bottom > blockerRect.top && addRect.top < blockerRect.bottom;
+      if (!verticallyOverlapping) continue;
+      const overlapShift = addRect.right - (blockerRect.left - minGap);
+      shiftNeeded = Math.max(shiftNeeded, overlapShift);
     }
 
-    const minGap = 5;
-    const shiftNeeded = addRect.right - (gearRect.left - minGap);
     addPatientBtn.style.marginRight = shiftNeeded > 0 ? `${Math.ceil(shiftNeeded)}px` : "";
   }
 

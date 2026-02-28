@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::Cursor;
+use std::io::Write;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -310,6 +312,12 @@ struct PatientSearchPageRow {
 }
 
 #[derive(Serialize)]
+struct PatientImagePathsPageRow {
+    rows: Vec<String>,
+    has_more: bool,
+}
+
+#[derive(Serialize)]
 struct ImportWizardFileRow {
     path: String,
     name: String,
@@ -369,6 +377,7 @@ struct PreviewCacheStatsRow {
 struct PreviewDebugCountsRow {
     db_image_count: u64,
     cache_image_count: u64,
+    loading: bool,
 }
 
 #[derive(Clone, Default)]
@@ -383,6 +392,8 @@ struct LocalCacheCopyStatusRow {
     enabled: bool,
     running: bool,
     state: String,
+    completed: u64,
+    total: u64,
     last_sync_ms: Option<u64>,
     local_cache_exists: bool,
     local_cache_file_count: u64,
@@ -391,6 +402,8 @@ struct LocalCacheCopyStatusRow {
 #[derive(Default)]
 struct LocalCacheCopyRuntime {
     state: String,
+    completed: u64,
+    total: u64,
     last_sync_ms: Option<u64>,
 }
 
@@ -439,6 +452,14 @@ struct PreviewFillStatusEvent {
 struct PreviewFillProgressEvent {
     running: bool,
     message: String,
+    completed: u64,
+    total: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct LocalCacheCopyProgressEvent {
+    running: bool,
+    state: String,
     completed: u64,
     total: u64,
 }
@@ -727,6 +748,8 @@ fn import_wizard_preview_path_store() -> &'static Mutex<String> {
 fn local_cache_copy_runtime() -> &'static Mutex<LocalCacheCopyRuntime> {
     LOCAL_CACHE_COPY_RUNTIME.get_or_init(|| Mutex::new(LocalCacheCopyRuntime {
         state: "up_to_date".to_string(),
+        completed: 0,
+        total: 0,
         last_sync_ms: None,
     }))
 }
@@ -760,13 +783,26 @@ impl Drop for HeavyIoTaskGuard {
     }
 }
 
-fn set_local_cache_copy_runtime_state(state: &str, last_sync_ms: Option<u64>) {
+fn set_local_cache_copy_runtime_state(
+    state: &str,
+    completed: u64,
+    total: u64,
+    last_sync_ms: Option<u64>,
+) {
     if let Ok(mut runtime) = local_cache_copy_runtime().lock() {
         runtime.state = state.to_string();
+        runtime.completed = completed;
+        runtime.total = total.max(completed);
         if last_sync_ms.is_some() {
             runtime.last_sync_ms = last_sync_ms;
         }
     }
+}
+
+fn should_emit_copy_progress(completed: u64, total: u64) -> bool {
+    let _ = total;
+    let _ = completed;
+    true
 }
 
 fn get_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -931,9 +967,18 @@ fn copy_if_newer(src_path: &Path, src_size: u64, src_modified_ms: u64, dst_path:
     Ok(true)
 }
 
-fn copy_preview_cache_main_to_local(main_cache_dir: &Path, local_cache_dir: &Path) -> Result<(), String> {
+fn copy_preview_cache_main_to_local_with_progress(
+    main_cache_dir: &Path,
+    local_cache_dir: &Path,
+    mut on_progress: Option<&mut dyn FnMut(u64, u64)>,
+) -> Result<(), String> {
     fs::create_dir_all(local_cache_dir).map_err(|e| e.to_string())?;
     let main_files = list_cache_files(main_cache_dir);
+    let total = main_files.len() as u64;
+    let mut completed = 0_u64;
+    if let Some(progress_cb) = on_progress.as_mut() {
+        progress_cb(completed, total);
+    }
     for (_, (src_path, src_size, src_modified_ms)) in main_files {
         if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
             || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
@@ -945,17 +990,35 @@ fn copy_preview_cache_main_to_local(main_cache_dir: &Path, local_cache_dir: &Pat
         };
         let dst_path = local_cache_dir.join(file_name);
         let _ = copy_if_newer(&src_path, src_size, src_modified_ms, &dst_path)?;
+        completed = completed.saturating_add(1);
+        if let Some(progress_cb) = on_progress.as_mut() {
+            if should_emit_copy_progress(completed, total) {
+                progress_cb(completed, total);
+            }
+        }
+    }
+    if let Some(progress_cb) = on_progress.as_mut() {
+        progress_cb(completed, total);
     }
     Ok(())
 }
 
-fn reconcile_preview_cache_dirs(main_cache_dir: &Path, local_cache_dir: &Path) -> Result<(), String> {
+fn reconcile_preview_cache_dirs_with_progress(
+    main_cache_dir: &Path,
+    local_cache_dir: &Path,
+    mut on_progress: Option<&mut dyn FnMut(u64, u64)>,
+) -> Result<(), String> {
     fs::create_dir_all(local_cache_dir).map_err(|e| e.to_string())?;
     let main_files = list_cache_files(main_cache_dir);
     let local_files = list_cache_files(local_cache_dir);
 
     let mut file_names: HashSet<String> = main_files.keys().cloned().collect();
     file_names.extend(local_files.keys().cloned());
+    let total = file_names.len() as u64;
+    let mut completed = 0_u64;
+    if let Some(progress_cb) = on_progress.as_mut() {
+        progress_cb(completed, total);
+    }
 
     for file_name in file_names {
         if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
@@ -981,14 +1044,32 @@ fn reconcile_preview_cache_dirs(main_cache_dir: &Path, local_cache_dir: &Path) -
             }
             (None, None) => {}
         }
+        completed = completed.saturating_add(1);
+        if let Some(progress_cb) = on_progress.as_mut() {
+            if should_emit_copy_progress(completed, total) {
+                progress_cb(completed, total);
+            }
+        }
+    }
+    if let Some(progress_cb) = on_progress.as_mut() {
+        progress_cb(completed, total);
     }
     Ok(())
 }
 
-fn mirror_cache_dir_from_source(source_cache_dir: &Path, target_cache_dir: &Path) -> Result<(), String> {
+fn mirror_cache_dir_from_source_with_progress(
+    source_cache_dir: &Path,
+    target_cache_dir: &Path,
+    mut on_progress: Option<&mut dyn FnMut(u64, u64)>,
+) -> Result<(), String> {
     fs::create_dir_all(target_cache_dir).map_err(|e| e.to_string())?;
     let source_files = list_cache_files(source_cache_dir);
     let target_files = list_cache_files(target_cache_dir);
+    let total = (source_files.len() + target_files.len()) as u64;
+    let mut completed = 0_u64;
+    if let Some(progress_cb) = on_progress.as_mut() {
+        progress_cb(completed, total);
+    }
 
     for (file_name, (src_path, src_size, src_modified_ms)) in &source_files {
         if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
@@ -998,6 +1079,12 @@ fn mirror_cache_dir_from_source(source_cache_dir: &Path, target_cache_dir: &Path
         }
         let dst_path = target_cache_dir.join(file_name);
         let _ = copy_if_newer(src_path, *src_size, *src_modified_ms, &dst_path)?;
+        completed = completed.saturating_add(1);
+        if let Some(progress_cb) = on_progress.as_mut() {
+            if should_emit_copy_progress(completed, total) {
+                progress_cb(completed, total);
+            }
+        }
     }
 
     for file_name in target_files.keys() {
@@ -1010,8 +1097,17 @@ fn mirror_cache_dir_from_source(source_cache_dir: &Path, target_cache_dir: &Path
             continue;
         }
         let _ = fs::remove_file(target_cache_dir.join(file_name));
+        completed = completed.saturating_add(1);
+        if let Some(progress_cb) = on_progress.as_mut() {
+            if should_emit_copy_progress(completed, total) {
+                progress_cb(completed, total);
+            }
+        }
     }
 
+    if let Some(progress_cb) = on_progress.as_mut() {
+        progress_cb(completed, total);
+    }
     Ok(())
 }
 
@@ -1060,6 +1156,8 @@ fn local_cache_copy_status_row(
         enabled,
         running,
         state,
+        completed: runtime.completed,
+        total: runtime.total,
         last_sync_ms: runtime.last_sync_ms,
         local_cache_exists: preview_cache_dir_path(app_handle).exists(),
         local_cache_file_count: walk_cache_files(&preview_cache_dir_path(app_handle)).len() as u64,
@@ -1079,37 +1177,54 @@ fn run_local_cache_copy_sync(
     let local_cache_dir = get_preview_cache_dir(app_handle);
     fs::create_dir_all(&main_cache_dir).map_err(|e| e.to_string())?;
     let phase = if initial_copy { "copying" } else { "updating" };
-    set_local_cache_copy_runtime_state(phase, None);
+    set_local_cache_copy_runtime_state(phase, 0, 0, None);
+    emit_local_cache_copy_progress(app_handle, true, phase, 0, 0);
 
     let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
     LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    let mut progress_cb = |completed: u64, total: u64| {
+        set_local_cache_copy_runtime_state(phase, completed, total, None);
+        emit_local_cache_copy_progress(app_handle, true, phase, completed, total);
+    };
     if initial_copy {
         // On first enable, prime local cache and then reconcile both directions.
         // This guarantees missing files are copied no matter which side has them.
-        copy_preview_cache_main_to_local(&main_cache_dir, &local_cache_dir)?;
+        copy_preview_cache_main_to_local_with_progress(
+            &main_cache_dir,
+            &local_cache_dir,
+            Some(&mut progress_cb),
+        )?;
+    } else {
+        reconcile_preview_cache_dirs_with_progress(
+            &main_cache_dir,
+            &local_cache_dir,
+            Some(&mut progress_cb),
+        )?;
+        if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            set_local_cache_copy_runtime_state("paused", 0, 0, None);
+            emit_local_cache_copy_progress(app_handle, false, "paused", 0, 0);
+            return Err("cancelled".to_string());
+        }
+        // Keep local copy as exact mirror of the workspace main cache after each sync.
+        mirror_cache_dir_from_source_with_progress(
+            &main_cache_dir,
+            &local_cache_dir,
+            Some(&mut progress_cb),
+        )?;
+        enforce_cache_files_match_index(&main_cache_dir)?;
+        enforce_cache_files_match_index(&local_cache_dir)?;
+        if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
+            || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+        {
+            set_local_cache_copy_runtime_state("paused", 0, 0, None);
+            emit_local_cache_copy_progress(app_handle, false, "paused", 0, 0);
+            return Err("cancelled".to_string());
+        }
     }
-    reconcile_preview_cache_dirs(&main_cache_dir, &local_cache_dir)?;
-    let settings = read_settings(app_handle).unwrap_or_default();
-    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
-    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
-    cleanup_preview_cache_for_workspace_dir(app_handle, &main_cache_dir, workspace, max_cache_bytes);
-    if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
-        || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
-    {
-        set_local_cache_copy_runtime_state("paused", None);
-        return Err("cancelled".to_string());
-    }
-    enforce_cache_files_match_index(&main_cache_dir)?;
-    // Keep local copy as exact mirror of the workspace main cache after each sync.
-    mirror_cache_dir_from_source(&main_cache_dir, &local_cache_dir)?;
-    enforce_cache_files_match_index(&local_cache_dir)?;
-    if LOCAL_CACHE_COPY_CANCEL_REQUESTED.load(Ordering::Relaxed)
-        || PREVIEW_FILL_CANCEL_REQUESTED.load(Ordering::Relaxed)
-    {
-        set_local_cache_copy_runtime_state("paused", None);
-        return Err("cancelled".to_string());
-    }
-    set_local_cache_copy_runtime_state("up_to_date", Some(now_ms()));
+    set_local_cache_copy_runtime_state("up_to_date", 0, 0, Some(now_ms()));
+    emit_local_cache_copy_progress(app_handle, false, "up_to_date", 0, 0);
     Ok(())
 }
 
@@ -1453,6 +1568,24 @@ fn emit_preview_fill_progress(
     );
 }
 
+fn emit_local_cache_copy_progress(
+    app_handle: &tauri::AppHandle,
+    running: bool,
+    state: &str,
+    completed: u64,
+    total: u64,
+) {
+    let _ = app_handle.emit(
+        "local-cache-copy-progress",
+        LocalCacheCopyProgressEvent {
+            running,
+            state: state.to_string(),
+            completed,
+            total,
+        },
+    );
+}
+
 fn set_workspace_reindex_status(
     app_handle: &tauri::AppHandle,
     running: bool,
@@ -1686,6 +1819,52 @@ fn emit_import_preview_ready_events(
     }
 }
 
+fn schedule_local_preview_mirror_to_workspace_main(
+    local_cache_dir: PathBuf,
+    workspace_main_cache_dir: PathBuf,
+    preview_paths: Vec<PathBuf>,
+) {
+    if preview_paths.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = fs::create_dir_all(&workspace_main_cache_dir);
+        let mut seen_file_names: HashSet<String> = HashSet::new();
+        for src_preview_path in preview_paths {
+            if src_preview_path.parent() != Some(local_cache_dir.as_path()) {
+                continue;
+            }
+            let Some(file_name) = src_preview_path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if !seen_file_names.insert(file_name.to_string()) {
+                continue;
+            }
+            let dst_preview_path = workspace_main_cache_dir.join(file_name);
+            if dst_preview_path.exists() {
+                continue;
+            }
+            let bytes = match fs::read(&src_preview_path) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dst_preview_path)
+            {
+                Ok(mut dst_file) => {
+                    if dst_file.write_all(&bytes).is_err() {
+                        let _ = fs::remove_file(&dst_preview_path);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => {}
+            }
+        }
+    });
+}
+
 fn resolve_cached_previews(
     app_handle: &tauri::AppHandle,
     paths: &[String],
@@ -1702,14 +1881,39 @@ fn resolve_cached_previews(
             .as_deref()
             .unwrap_or(PREVIEW_PERF_AUTO),
     );
-    resolve_cached_previews_in_cache_dir(
+    let rows = resolve_cached_previews_in_cache_dir(
         paths,
         include_data_url,
         generate_if_missing,
         &cache_dir,
         max_cache_bytes,
         &preview_perf_mode,
-    )
+    )?;
+
+    if settings.keep_local_cache_copy.unwrap_or(false) {
+        let local_cache_dir = preview_cache_dir_path(app_handle);
+        if paths_point_to_same_location(&cache_dir, &local_cache_dir) {
+            if let Some(workspace_dir) = settings.workspace_dir {
+                let workspace = PathBuf::from(workspace_dir.trim());
+                if workspace.exists() && workspace.is_dir() {
+                    let workspace_main_cache_dir = get_local_cache_copy_dir(&workspace);
+                    let preview_paths: Vec<PathBuf> = rows
+                        .iter()
+                        .filter_map(|row| row.preview_path.as_ref())
+                        .map(|path| PathBuf::from(path.trim()))
+                        .filter(|path| path.exists())
+                        .collect();
+                    schedule_local_preview_mirror_to_workspace_main(
+                        local_cache_dir,
+                        workspace_main_cache_dir,
+                        preview_paths,
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(rows)
 }
 
 fn resolve_cached_previews_in_cache_dir(
@@ -1720,11 +1924,9 @@ fn resolve_cached_previews_in_cache_dir(
     max_cache_bytes: u64,
     preview_perf_mode: &str,
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
-    let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
     fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
     let mut index = load_preview_cache_index(cache_dir);
     let current_ms = now_ms();
-    let mut index_changed = false;
 
     struct PlannedRow {
         path: String,
@@ -1738,7 +1940,6 @@ fn resolve_cached_previews_in_cache_dir(
         row_index: usize,
         source_path: PathBuf,
         cache_file_path: PathBuf,
-        file_name: String,
     }
     enum RowState {
         Skip,
@@ -1809,7 +2010,6 @@ fn resolve_cached_previews_in_cache_dir(
                 row_index: rows.len(),
                 source_path: path_buf.clone(),
                 cache_file_path: cache_file_path.clone(),
-                file_name: file_name.clone(),
             });
         }
 
@@ -1832,7 +2032,7 @@ fn resolve_cached_previews_in_cache_dir(
         let (tx, rx) = std::sync::mpsc::channel::<(usize, u64)>();
         let mut handles = Vec::new();
 
-        for worker_id in 0..worker_count {
+        for _worker_id in 0..worker_count {
             let queue_clone = Arc::clone(&queue);
             let tx_clone = tx.clone();
             handles.push(std::thread::spawn(move || {
@@ -1862,19 +2062,26 @@ fn resolve_cached_previews_in_cache_dir(
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    let tmp_path = task.cache_file_path.with_file_name(format!(
-                        "{}.tmp{}",
-                        task.file_name, worker_id
-                    ));
-                    if fs::write(&tmp_path, &bytes).is_err() {
-                        let _ = fs::remove_file(&tmp_path);
-                        continue;
+                    let write_result = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&task.cache_file_path);
+                    match write_result {
+                        Ok(mut output_file) => {
+                            if output_file.write_all(&bytes).is_err() {
+                                let _ = fs::remove_file(&task.cache_file_path);
+                                continue;
+                            }
+                            let _ = tx_clone.send((task.row_index, bytes.len() as u64));
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let size = fs::metadata(&task.cache_file_path).map(|m| m.len()).unwrap_or(0);
+                            let _ = tx_clone.send((task.row_index, size));
+                        }
+                        Err(_) => {
+                            continue;
+                        }
                     }
-                    if fs::rename(&tmp_path, &task.cache_file_path).is_err() {
-                        let _ = fs::remove_file(&tmp_path);
-                        continue;
-                    }
-                    let _ = tx_clone.send((task.row_index, bytes.len() as u64));
                 }
             }));
         }
@@ -1900,7 +2107,6 @@ fn resolve_cached_previews_in_cache_dir(
                     last_access_ms: current_ms,
                 },
             );
-            index_changed = true;
         }
     }
 
@@ -1932,7 +2138,6 @@ fn resolve_cached_previews_in_cache_dir(
                             last_access_ms: current_ms,
                         },
                     );
-                    index_changed = true;
                 }
 
                 out.push(CachedImagePreviewRow {
@@ -1956,7 +2161,6 @@ fn resolve_cached_previews_in_cache_dir(
                                             last_access_ms: current_ms,
                                         },
                                     );
-                                    index_changed = true;
                                     bytes = regenerated;
                                     valid_cached_preview = true;
                                 }
@@ -1981,10 +2185,17 @@ fn resolve_cached_previews_in_cache_dir(
 
     if generate_if_missing {
         cleanup_preview_cache(cache_dir, &mut index, max_cache_bytes);
-        index_changed = true;
     }
-    if index_changed {
-        let _ = save_preview_cache_index(cache_dir, &index);
+    {
+        let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
+        let mut latest_index = load_preview_cache_index(cache_dir);
+        for (key, entry) in index.entries {
+            latest_index.entries.insert(key, entry);
+        }
+        if generate_if_missing {
+            cleanup_preview_cache(cache_dir, &mut latest_index, max_cache_bytes);
+        }
+        let _ = save_preview_cache_index(cache_dir, &latest_index);
     }
     Ok(out)
 }
@@ -2546,6 +2757,36 @@ fn open_preview_cache_dir(app_handle: tauri::AppHandle, workspace_dir: Option<St
 }
 
 #[tauri::command]
+fn open_local_cache_copy_dir(app_handle: tauri::AppHandle) -> Result<(), String> {
+    let cache_dir = preview_cache_dir_path(&app_handle);
+    fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = Command::new("open");
+        c.arg(&cache_dir);
+        c
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = Command::new("explorer");
+        c.arg(&cache_dir);
+        c
+    };
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = Command::new("xdg-open");
+        c.arg(&cache_dir);
+        c
+    };
+
+    cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+#[tauri::command]
 fn open_path_with_default(path: String) -> Result<(), String> {
     let target = path.trim().to_string();
     if target.is_empty() {
@@ -2897,7 +3138,7 @@ fn list_patient_overview(
                 "SELECT folder_name, folder_date, treatment_name
                  FROM patient_treatment_index
                  WHERE workspace_dir = ?1 AND patient_folder = ?2
-                 ORDER BY folder_date DESC, folder_name DESC",
+                 ORDER BY folder_date ASC, folder_name ASC",
             )
             .map_err(|e| e.to_string())?;
 
@@ -2959,6 +3200,121 @@ fn list_patient_overview(
         treatment_folders: folder_rows,
         root_files,
     })
+}
+
+#[tauri::command]
+fn list_patient_image_paths_page(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<PatientImagePathsPageRow, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+
+    let patient_path = workspace.join(patient_folder);
+    if !patient_path.exists() || !patient_path.is_dir() {
+        return Err("patient folder does not exist".to_string());
+    }
+
+    let offset = offset.unwrap_or(0);
+    let limit = limit.unwrap_or(5000).clamp(1, 5000);
+    let target_count = offset.saturating_add(limit).saturating_add(1);
+
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut folder_names: Vec<String> = Vec::new();
+    let mut folder_seen: HashSet<String> = HashSet::new();
+
+    for entry in fs::read_dir(&patient_path).map_err(|e| e.to_string())? {
+        if out.len() >= target_count {
+            break;
+        }
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let path_buf = entry.path();
+        if file_type.is_file() {
+            if is_supported_preview_image(&path_buf) {
+                let value = path_buf.to_string_lossy().to_string();
+                if seen.insert(value.clone()) {
+                    out.push(value);
+                }
+            }
+            continue;
+        }
+        if file_type.is_dir() {
+            let folder_name = entry.file_name().to_string_lossy().trim().to_string();
+            if !folder_name.is_empty() && folder_seen.insert(folder_name.clone()) {
+                folder_names.push(folder_name);
+            }
+        }
+    }
+
+    if let Ok(conn) = open_db(&app_handle) {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT folder_name
+             FROM patient_treatment_index
+             WHERE workspace_dir = ?1 AND patient_folder = ?2
+             ORDER BY folder_date ASC, folder_name ASC",
+        ) {
+            if let Ok(mapped) = stmt.query_map(params![workspace_dir, patient_folder], |row| {
+                row.get::<_, String>(0)
+            }) {
+                for folder_name in mapped.flatten() {
+                    let normalized = folder_name.trim().to_string();
+                    if !normalized.is_empty() && folder_seen.insert(normalized.clone()) {
+                        folder_names.push(normalized);
+                    }
+                }
+            }
+        }
+    }
+
+    folder_names.sort();
+    for folder_name in folder_names {
+        if out.len() >= target_count {
+            break;
+        }
+        let folder_path = patient_path.join(&folder_name);
+        if !folder_path.exists() || !folder_path.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&folder_path).map_err(|e| e.to_string())? {
+            if out.len() >= target_count {
+                break;
+            }
+            let entry = entry.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let path_buf = entry.path();
+            if !is_supported_preview_image(&path_buf) {
+                continue;
+            }
+            let value = path_buf.to_string_lossy().to_string();
+            if seen.insert(value.clone()) {
+                out.push(value);
+            }
+        }
+    }
+
+    let has_more = out.len() > offset.saturating_add(limit);
+    let rows = if offset >= out.len() {
+        Vec::new()
+    } else {
+        out.into_iter().skip(offset).take(limit).collect()
+    };
+
+    Ok(PatientImagePathsPageRow { rows, has_more })
 }
 
 #[tauri::command]
@@ -4286,17 +4642,17 @@ async fn set_keep_local_cache_copy(
     workspace_dir: String,
     enabled: bool,
 ) -> Result<LocalCacheCopyStatusRow, String> {
-    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
-        return Err("cannot change local cache mode while preview creation is active".to_string());
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+        return Err("cannot change local cache mode while import is active".to_string());
     }
 
-    let mut settings = read_settings(&app_handle)?;
-    settings.keep_local_cache_copy = Some(enabled);
-    write_settings(&app_handle, &settings)?;
-
     if !enabled {
+        let mut settings = read_settings(&app_handle)?;
+        settings.keep_local_cache_copy = Some(false);
+        write_settings(&app_handle, &settings)?;
         LOCAL_CACHE_COPY_RUNNING.store(false, Ordering::Relaxed);
-        set_local_cache_copy_runtime_state("disabled", None);
+        set_local_cache_copy_runtime_state("disabled", 0, 0, None);
+        emit_local_cache_copy_progress(&app_handle, false, "disabled", 0, 0);
         let runtime = local_cache_copy_runtime()
             .lock()
             .map_err(|e| e.to_string())?;
@@ -4305,10 +4661,29 @@ async fn set_keep_local_cache_copy(
 
     let workspace = PathBuf::from(workspace_dir.trim());
     if !workspace.exists() || !workspace.is_dir() {
+        let mut settings = read_settings(&app_handle)?;
+        settings.keep_local_cache_copy = Some(true);
+        write_settings(&app_handle, &settings)?;
         let runtime = local_cache_copy_runtime()
             .lock()
             .map_err(|e| e.to_string())?;
         return Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime));
+    }
+
+    let preview_was_running = PREVIEW_FILL_RUNNING.load(Ordering::Relaxed);
+    if preview_was_running {
+        PREVIEW_FILL_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+        emit_preview_fill_progress(&app_handle, true, "Pausing...", 0, 0);
+        for _ in 0..240 {
+            if !PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        if PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
+            return Err("failed to pause preview creation for local cache copy".to_string());
+        }
+        PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
     }
 
     if LOCAL_CACHE_COPY_RUNNING
@@ -4332,6 +4707,14 @@ async fn set_keep_local_cache_copy(
     .map_err(|e| e.to_string())?;
     LOCAL_CACHE_COPY_RUNNING.store(false, Ordering::Relaxed);
     result?;
+
+    let mut settings = read_settings(&app_handle)?;
+    settings.keep_local_cache_copy = Some(true);
+    write_settings(&app_handle, &settings)?;
+
+    if preview_was_running {
+        let _ = start_background_preview_fill(app_handle.clone(), workspace_dir);
+    }
 
     let runtime = local_cache_copy_runtime()
         .lock()
@@ -4410,10 +4793,18 @@ async fn sync_local_cache_copy(
 }
 
 #[tauri::command]
-fn delete_local_cache_copy_files(app_handle: tauri::AppHandle) -> Result<(), String> {
+fn delete_local_cache_copy_files(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<(), String> {
     if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {
         return Err("cannot delete local cache while preview creation is active".to_string());
     }
+    let workspace_dir = workspace_dir.trim();
+    if workspace_dir.is_empty() {
+        return Err("workspace directory is required".to_string());
+    }
+    let workspace = PathBuf::from(workspace_dir);
 
     let cache_dir = preview_cache_dir_path(&app_handle);
     let _guard = preview_cache_lock().lock().map_err(|e| e.to_string())?;
@@ -4421,16 +4812,15 @@ fn delete_local_cache_copy_files(app_handle: tauri::AppHandle) -> Result<(), Str
         return Ok(());
     }
 
-    // Safety guard: never allow this command to target workspace main cache.
-    if let Ok(settings) = read_settings(&app_handle) {
-        if let Some(workspace_dir) = settings.workspace_dir {
-            let workspace_main_cache = get_local_cache_copy_dir(Path::new(workspace_dir.trim()));
-            let local_canon = fs::canonicalize(&cache_dir).unwrap_or(cache_dir.clone());
-            let main_canon = fs::canonicalize(&workspace_main_cache).unwrap_or(workspace_main_cache);
-            if local_canon == main_canon {
-                return Err("refusing to delete workspace main cache via local cache delete".to_string());
-            }
-        }
+    // Hard safety guard: never allow this command to target workspace cache.
+    let workspace_main_cache = get_local_cache_copy_dir(&workspace);
+    let local_canon = fs::canonicalize(&cache_dir).unwrap_or(cache_dir.clone());
+    let main_canon = fs::canonicalize(&workspace_main_cache).unwrap_or(workspace_main_cache);
+    if local_canon == main_canon {
+        return Err("refusing to delete workspace main cache via local cache delete".to_string());
+    }
+    if path_is_inside_dir(&local_canon, &workspace) {
+        return Err("refusing to delete cache path inside workspace".to_string());
     }
 
     if let Ok(entries) = fs::read_dir(&cache_dir) {
@@ -4518,16 +4908,19 @@ fn get_preview_debug_counts(
     let now = now_ms();
     let mut row = PreviewDebugCountsRow::default();
     let mut should_start_refresh = false;
+    let mut loading = false;
 
     if let Ok(mut cache) = preview_debug_counts_store().lock() {
         let entry = cache
             .entry(workspace_key.clone())
             .or_insert_with(PreviewDebugCountsCacheEntry::default);
         row = entry.row.clone();
+        loading = entry.running;
         let stale = now.saturating_sub(entry.updated_ms) > PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS;
         if (entry.updated_ms == 0 || stale) && !entry.running {
             entry.running = true;
             should_start_refresh = true;
+            loading = true;
         }
     }
 
@@ -4553,6 +4946,7 @@ fn get_preview_debug_counts(
         });
     }
 
+    row.loading = loading;
     Ok(row)
 }
 
@@ -4656,6 +5050,7 @@ fn compute_preview_debug_counts(
     Ok(PreviewDebugCountsRow {
         db_image_count,
         cache_image_count,
+        loading: false,
     })
 }
 
@@ -4748,7 +5143,7 @@ fn start_background_preview_fill(
     let app_handle_clone = app_handle.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _io_guard = io_guard;
-        const BATCH_SIZE: usize = 18;
+        const BATCH_SIZE: usize = 6;
         const QUEUE_CAPACITY: usize = 220;
         let workspace_dir_value = workspace.to_string_lossy().to_string();
         let (tx, rx) = std::sync::mpsc::sync_channel::<String>(QUEUE_CAPACITY);
@@ -4929,6 +5324,7 @@ pub fn run() {
             delete_database,
             open_workspace_dir,
             open_preview_cache_dir,
+            open_local_cache_copy_dir,
             open_path_with_default,
             copy_treatment_folder_to_destination,
             copy_file_to_destination,
@@ -4946,6 +5342,7 @@ pub fn run() {
             list_patient_treatment_folders,
             list_patient_timeline_entries,
             list_patient_overview,
+            list_patient_image_paths_page,
             list_treatment_files,
             list_treatment_files_page,
             create_patient_with_metadata,

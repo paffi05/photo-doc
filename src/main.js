@@ -54,10 +54,14 @@ const systemVersionText = document.getElementById("systemVersionText");
 const systemUpdateStatusText = document.getElementById("systemUpdateStatusText");
 const deleteWorkspaceBtn = document.getElementById("deleteWorkspaceBtn");
 const deleteWorkspaceRow = document.getElementById("deleteWorkspaceRow");
+const deleteWorkspaceLabel = document.getElementById("deleteWorkspaceLabel");
 const deleteDatabaseBtn = document.getElementById("deleteDatabaseBtn");
 const deleteDatabaseRow = document.getElementById("deleteDatabaseRow");
+const deleteDatabaseLabel = document.getElementById("deleteDatabaseLabel");
 const deleteLocalCacheBtn = document.getElementById("deleteLocalCacheBtn");
 const deleteLocalCacheRow = document.getElementById("deleteLocalCacheRow");
+const deleteLocalCacheLabel = document.getElementById("deleteLocalCacheLabel");
+const openLocalCacheCopyFolderBtn = document.getElementById("openLocalCacheCopyFolderBtn");
 const patientSearchInput = document.getElementById("patientSearchInput");
 const patientList = document.getElementById("patientList");
 const patientListWrap = document.querySelector(".patient-list-wrap");
@@ -76,6 +80,7 @@ const previewSpeedSlider = document.getElementById("previewSpeedSlider");
 const previewSpeedValue = document.getElementById("previewSpeedValue");
 const cacheUsageBar = document.getElementById("cacheUsageBar");
 const cacheUsageText = document.getElementById("cacheUsageText");
+const indexingCategoryTitle = document.getElementById("indexingCategoryTitle");
 const openCacheFolderBtn = document.getElementById("openCacheFolderBtn");
 const keepLocalCacheCopyToggle = document.getElementById("keepLocalCacheCopy");
 const indexingProgressSpinner = document.getElementById("indexingProgressSpinner");
@@ -179,12 +184,23 @@ function renderInvalidPatientFoldersPanel() {
     const moreBtn = document.createElement("button");
     moreBtn.type = "button";
     moreBtn.className = "small-btn";
-    moreBtn.textContent = "Load more";
+    moreBtn.textContent = invalidPatientLoading ? "Loading Files..." : "Load more";
+    moreBtn.disabled = invalidPatientLoading;
     moreBtn.addEventListener("click", () => {
       void refreshInvalidPatientFolderWarning(currentWorkspaceDir, { append: true });
     });
     action.appendChild(moreBtn);
     invalidPatientFoldersList.appendChild(action);
+  }
+
+  if (invalidPatientLoading) {
+    const loading = document.createElement("li");
+    loading.className = "invalid-patient-folder-item invalid-patient-loading-item";
+    loading.innerHTML = `
+      <span class="invalid-patient-loading-spinner" aria-hidden="true"></span>
+      <span class="invalid-patient-folder-name">Loading Files...</span>
+    `;
+    invalidPatientFoldersList.appendChild(loading);
   }
 }
 
@@ -220,12 +236,15 @@ function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames
 }
 
 async function refreshInvalidPatientFolderWarning(workspaceDir = currentWorkspaceDir, { append = false } = {}) {
+  if (invalidPatientLoading) return invalidPatientFolderCount;
   if (!workspaceDir) {
     invalidPatientOffset = 0;
     setInvalidPatientFolderWarningUi(0, [], [], false);
     return 0;
   }
   const offset = append ? invalidPatientOffset : 0;
+  invalidPatientLoading = true;
+  renderInvalidPatientFoldersPanel();
   try {
     const row = await invoke("get_invalid_patient_folders_page", {
       workspaceDir,
@@ -249,6 +268,9 @@ async function refreshInvalidPatientFolderWarning(workspaceDir = currentWorkspac
     console.error("get_invalid_patient_folders_page failed:", err);
     setInvalidPatientFolderWarningUi(0, [], [], false);
     return 0;
+  } finally {
+    invalidPatientLoading = false;
+    renderInvalidPatientFoldersPanel();
   }
 }
 
@@ -317,6 +339,7 @@ let invalidPatientFileNames = [];
 let invalidPatientHasMore = false;
 let invalidPatientOffset = 0;
 let invalidPatientFoldersPanelExpanded = false;
+let invalidPatientLoading = false;
 let invalidPanelHideTimerId = null;
 let patientSearchDebounceId = null;
 let isDbUpdating = false;
@@ -329,19 +352,29 @@ let isCacheMaintenanceRunning = false;
 let indexingLivePollIntervalId = null;
 let indexingDebugCountsInFlight = false;
 let indexingStatusInFlight = false;
+let indexingCountsWarmRetryTimerId = null;
+let indexingCountsWarmRetryWorkspace = "";
 let indexingProgressRunning = false;
 let indexingProgressMessage = "Up to date";
 let indexingCountsSuffix = "";
 let indexingCustomSuffix = "";
 let previewFillProgressMessage = "";
+let previewFillProgressCompleted = 0;
+let previewFillProgressTotal = 0;
+let activeViewPreviewLoading = { running: false, completed: 0, total: 0 };
+let previewFillPausedForActiveView = false;
+let activeViewPrioritySyncInFlight = false;
 let manualCacheHoldMode = "";
 let keepLocalCacheCopyEnabled = false;
 let localCacheSyncInFlight = false;
 let localCacheStatusPollIntervalId = null;
 let localCacheStatusState = "up_to_date";
 let localCacheStatusRunning = false;
+let localCacheStatusCompleted = 0;
+let localCacheStatusTotal = 0;
 let localCacheFolderExists = false;
 let localCacheFileCount = 0;
+let isDeleteLocalCacheInFlight = false;
 let previewFillIdleTimerId = null;
 let previewFillLastAttemptMs = 0;
 let selectedPatient = null;
@@ -455,6 +488,7 @@ document.body.appendChild(patientDragGhost);
 const sidebarLayout = initSidebarLayout({
   appView,
   openBtn,
+  importWizardBtn: openImportWizardBtn,
   closeBtn,
   overlay,
   panel,
@@ -503,6 +537,14 @@ const mainContent = initMainContent({
     if (!state) return;
     setDebugState(state);
   },
+  onPreviewLoadingStatusChange: (status) => {
+    const running = Boolean(status?.running);
+    const completed = Math.max(0, Number(status?.completed) || 0);
+    const total = Math.max(0, Number(status?.total) || 0);
+    activeViewPreviewLoading = { running, completed, total };
+    void syncActiveViewPreviewPriority();
+    void refreshIndexingStatus();
+  },
   onCheckMissingPatientIdTaken: async (patientId) => {
     if (!currentWorkspaceDir) return false;
     const normalizedId = normalizePatientFieldValue(patientId);
@@ -546,14 +588,23 @@ function updateWindowDebugSize() {
 }
 
 function setDeleteWorkspaceAvailability(enabled) {
-  if (deleteWorkspaceBtn) deleteWorkspaceBtn.disabled = !enabled;
+  if (deleteWorkspaceBtn) deleteWorkspaceBtn.disabled = !enabled || isDeleteLocalCacheInFlight;
   deleteWorkspaceRow?.classList.toggle("inactive", !enabled);
 }
 
 function setDeleteDatabaseAvailability(enabled) {
   const available = Boolean(enabled) && !isDbUpdating && !databaseDeleteLocked;
-  if (deleteDatabaseBtn) deleteDatabaseBtn.disabled = !available;
+  if (deleteDatabaseBtn) deleteDatabaseBtn.disabled = !available || isDeleteLocalCacheInFlight;
   deleteDatabaseRow?.classList.toggle("inactive", !available);
+}
+
+function setDeleteLocalCacheDeletingUi(deleting) {
+  const isDeleting = Boolean(deleting);
+  deleteLocalCacheRow?.classList.toggle("deleting", isDeleting);
+  if (deleteLocalCacheLabel) {
+    deleteLocalCacheLabel.textContent = isDeleting ? "Deleting Files..." : "Delete local files";
+    deleteLocalCacheLabel.classList.toggle("deleting", isDeleting);
+  }
 }
 
 function setDebugOnlyRowsVisibility(show) {
@@ -586,10 +637,10 @@ function setTimelineNamesAlwaysVisible(enabled) {
 function readTimelineNamesPref() {
   try {
     const raw = localStorage.getItem(TIMELINE_NAMES_PREF_KEY);
-    if (raw === null) return false;
+    if (raw === null) return true;
     return raw === "true";
   } catch {
-    return false;
+    return true;
   }
 }
 
@@ -687,8 +738,8 @@ function setCacheUsageUi({ usedBytes = 0, maxBytes = 0, percent = 0 } = {}) {
 }
 
 function formatLocalCacheCopyStatusText(state, lastSyncMs = null) {
-  if (state === "copying") return "Copying Cache...";
-  if (state === "updating") return "Syncing Cache...";
+  if (state === "copying") return "Copying Images...";
+  if (state === "updating") return "Syncing Images...";
   if (state === "paused") return "Paused";
   return "";
 }
@@ -710,12 +761,21 @@ function updateLocalCacheDeleteButtonState() {
     !blocked;
   const busy = Boolean(localCacheStatusRunning || localCacheSyncInFlight);
   if (deleteLocalCacheBtn) {
-    deleteLocalCacheBtn.disabled = !enabled || busy;
+    deleteLocalCacheBtn.disabled = !enabled || busy || isDeleteLocalCacheInFlight;
+  }
+  if (openLocalCacheCopyFolderBtn) {
+    openLocalCacheCopyFolderBtn.disabled = !currentWorkspaceDir || isDeleteLocalCacheInFlight;
   }
   deleteLocalCacheRow?.classList.toggle("inactive", !enabled);
   if (keepLocalCacheCopyToggle) {
     keepLocalCacheCopyToggle.disabled =
       !currentWorkspaceDir || localCacheSyncInFlight || blocked;
+  }
+  if (deleteWorkspaceBtn) {
+    deleteWorkspaceBtn.disabled = deleteWorkspaceBtn.disabled || isDeleteLocalCacheInFlight;
+  }
+  if (deleteDatabaseBtn) {
+    deleteDatabaseBtn.disabled = deleteDatabaseBtn.disabled || isDeleteLocalCacheInFlight;
   }
 }
 
@@ -726,11 +786,14 @@ function applyLocalCacheCopyStatus(status = {}) {
 
   const stateRaw = String(status?.state ?? "").trim().toLowerCase();
   const state = enabled ? (stateRaw || "up_to_date") : "up_to_date";
-  const running = enabled && (Boolean(status?.running) || state === "copying" || state === "updating");
+  const stateIsWorking = state === "copying" || state === "updating";
+  const running = enabled && stateIsWorking;
   localCacheFolderExists = Boolean(status?.local_cache_exists ?? status?.localCacheExists ?? false);
   localCacheFileCount = Number(status?.local_cache_file_count ?? status?.localCacheFileCount ?? 0) || 0;
   localCacheStatusState = state;
   localCacheStatusRunning = running;
+  localCacheStatusCompleted = Math.max(0, Number(status?.completed ?? 0) || 0);
+  localCacheStatusTotal = Math.max(localCacheStatusCompleted, Number(status?.total ?? 0) || 0);
   updateLocalCacheDeleteButtonState();
   void refreshIndexingStatus();
 }
@@ -808,6 +871,50 @@ function setIndexingCustomSuffixUi(suffix = "") {
   renderIndexingProgressText();
 }
 
+function setIndexingCategoryTitle(dbImageCount = null, { loading = false } = {}) {
+  if (!indexingCategoryTitle) return;
+  if (!currentWorkspaceDir) {
+    indexingCategoryTitle.textContent = "INDEXING";
+    return;
+  }
+  if (loading) {
+    indexingCategoryTitle.textContent = "INDEXING (...)";
+    return;
+  }
+  const count = Number(dbImageCount);
+  if (!Number.isFinite(count) || count < 0) {
+    indexingCategoryTitle.textContent = "INDEXING";
+    return;
+  }
+  indexingCategoryTitle.textContent = `INDEXING (${Math.floor(count)})`;
+}
+
+async function syncActiveViewPreviewPriority() {
+  if (activeViewPrioritySyncInFlight) return;
+  activeViewPrioritySyncInFlight = true;
+  try {
+    const activeViewLoading = Boolean(activeViewPreviewLoading.running && activeViewPreviewLoading.total > 0);
+    if (activeViewLoading) {
+      if (previewFillPausedForActiveView || !isPreviewFillRunning || isPreviewFillStopInFlight) return;
+      try {
+        const paused = await invoke("stop_background_preview_fill");
+        previewFillPausedForActiveView = Boolean(paused);
+      } catch (err) {
+        console.error("stop_background_preview_fill for active view failed:", err);
+      }
+      return;
+    }
+
+    if (!previewFillPausedForActiveView) return;
+    previewFillPausedForActiveView = false;
+    if (!previewFillPausedByUser && !cacheMarkedNotSynchronized) {
+      void ensureBackgroundPreviewFill();
+    }
+  } finally {
+    activeViewPrioritySyncInFlight = false;
+  }
+}
+
 function shouldShowIndexingDebugCounts() {
   return Boolean(currentWorkspaceDir) && Boolean(showFrontendDebugToggle?.checked);
 }
@@ -822,6 +929,7 @@ function isIdleForBackgroundPreviewFill() {
   if (isWorkspaceSetupInProgress) return false;
   if (isDbUpdating || isPatientListLoading || patientSearchInFlight) return false;
   if (importWizardIsImporting || hasActiveImportJobs()) return false;
+  if (activeViewPreviewLoading.running) return false;
   if (isPreviewFillRunning || isPreviewFillStopInFlight || previewFillPausedByUser) return false;
   if (isStoppingCacheProcesses || isCacheMaintenanceRunning) return false;
   if (localCacheSyncInFlight || localCacheStatusRunning) return false;
@@ -861,6 +969,7 @@ function setCacheReloadButtonMode(mode = "update") {
 function updateCacheReloadButtonState() {
   if (!cacheReloadBtn) return;
   const pauseMode =
+    activeViewPreviewLoading.running ||
     isPreviewFillRunning ||
     isCacheMaintenanceRunning ||
     localCacheSyncInFlight ||
@@ -874,7 +983,8 @@ function updateCacheReloadButtonState() {
 }
 
 async function refreshIndexingDebugCounts() {
-  if (!shouldShowIndexingDebugCounts()) {
+  if (!currentWorkspaceDir) {
+    setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: false });
     return;
   }
@@ -882,12 +992,36 @@ async function refreshIndexingDebugCounts() {
   indexingDebugCountsInFlight = true;
   try {
     const stats = await invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir });
+    const loading = Boolean(stats?.loading);
     const dbImageCount = Number(stats?.db_image_count ?? stats?.dbImageCount ?? 0) || 0;
     const cacheImageCount = Number(stats?.cache_image_count ?? stats?.cacheImageCount ?? 0) || 0;
-    setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: true });
+    setIndexingCategoryTitle(dbImageCount, { loading });
+    setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: shouldShowIndexingDebugCounts() });
+    if (dbImageCount === 0 && cacheImageCount === 0) {
+      const workspaceKey = String(currentWorkspaceDir ?? "").trim();
+      if (
+        workspaceKey &&
+        workspaceKey !== indexingCountsWarmRetryWorkspace &&
+        indexingCountsWarmRetryTimerId === null
+      ) {
+        indexingCountsWarmRetryWorkspace = workspaceKey;
+        indexingCountsWarmRetryTimerId = setTimeout(() => {
+          indexingCountsWarmRetryTimerId = null;
+          if (String(currentWorkspaceDir ?? "").trim() !== workspaceKey) return;
+          void refreshIndexingDebugCounts();
+        }, 450);
+      }
+    } else {
+      indexingCountsWarmRetryWorkspace = "";
+      if (indexingCountsWarmRetryTimerId !== null) {
+        clearTimeout(indexingCountsWarmRetryTimerId);
+        indexingCountsWarmRetryTimerId = null;
+      }
+    }
   } catch (err) {
     console.error("get_preview_debug_counts failed:", err);
-    setIndexingDebugCountsUi(0, 0, { show: true });
+    setIndexingCategoryTitle(null);
+    setIndexingDebugCountsUi(0, 0, { show: shouldShowIndexingDebugCounts() });
   } finally {
     indexingDebugCountsInFlight = false;
   }
@@ -920,9 +1054,16 @@ async function refreshIndexingStatus() {
     const cacheWorkActive = running || importingActive || manualHoldActive;
     const localCopySyncActive = keepLocalCacheCopyEnabled && (localCacheStatusRunning || localCacheSyncInFlight);
     const localCopyStatusMessage = formatLocalCacheCopyStatusText(localCacheStatusState);
+    const activeViewLoading = Boolean(activeViewPreviewLoading.running && activeViewPreviewLoading.total > 0);
 
     setPreviewFillRunning(running);
-    if (isStoppingCacheProcesses) {
+    if (activeViewLoading) {
+      const completed = Math.max(0, Number(activeViewPreviewLoading.completed) || 0);
+      const total = Math.max(0, Number(activeViewPreviewLoading.total) || 0);
+      setIndexingProgressUi({ running: true, message: "Creating Previews" });
+      setIndexingCustomSuffixUi(total > 0 ? `(${Math.min(completed, total)}/${total})` : "");
+      setIndexingDebugCountsUi(0, 0, { show: false });
+    } else if (isStoppingCacheProcesses) {
       if (anyCacheTaskRunning) {
         setIndexingProgressUi({ running: true, message: "Stopping processes ..." });
         setIndexingCustomSuffixUi("");
@@ -938,18 +1079,18 @@ async function refreshIndexingStatus() {
       setIndexingProgressUi({ running: false, message: "Not synchronized" });
       setIndexingCustomSuffixUi("");
       setIndexingDebugCountsUi(0, 0, { show: false });
-    } else if (creatingActive) {
-      const match = previewFillProgressMessage.match(/\((\d+)\s*\/\s*(\d+)\)/);
-      const createdNow = match ? (Number(match[1]) || 0) : 0;
-      const expectedNow = match ? (Number(match[2]) || 0) : 0;
-      setIndexingProgressUi({ running: true, message: "Creating Previews" });
-      setIndexingCustomSuffixUi(expectedNow > 0 ? `(${createdNow}/${expectedNow})` : "");
-      setIndexingDebugCountsUi(0, 0, { show: false });
-      void refreshCacheUsageUi();
     } else if (localCopySyncActive && localCopyStatusMessage) {
       setIndexingProgressUi({ running: true, message: localCopyStatusMessage });
-      setIndexingCustomSuffixUi("");
+      setIndexingCustomSuffixUi(`(${localCacheStatusCompleted}/${Math.max(localCacheStatusCompleted, localCacheStatusTotal)})`);
       setIndexingDebugCountsUi(0, 0, { show: false });
+    } else if (creatingActive) {
+      const match = previewFillProgressMessage.match(/\((\d+)\s*\/\s*(\d+)\)/);
+      const createdNow = match ? (Number(match[1]) || 0) : Math.max(0, Number(previewFillProgressCompleted) || 0);
+      const expectedNow = match ? (Number(match[2]) || 0) : Math.max(0, Number(previewFillProgressTotal) || 0);
+      setIndexingProgressUi({ running: true, message: "Creating Previews" });
+      setIndexingCustomSuffixUi(`(${createdNow}/${Math.max(createdNow, expectedNow)})`);
+      setIndexingDebugCountsUi(0, 0, { show: false });
+      void refreshCacheUsageUi();
     } else if (paused) {
       setIndexingProgressUi({ running: false, message: "Paused" });
       setIndexingCustomSuffixUi("");
@@ -1035,6 +1176,11 @@ async function ensureBackgroundPreviewFill(cacheStats = null) {
     const cacheImageCount = Number(counts?.cache_image_count ?? counts?.cacheImageCount ?? 0) || 0;
 
     if (dbImageCount > cacheImageCount) {
+      if (activeViewPreviewLoading.running) {
+        setIndexingProgressUi({ running: false, message: "Not synchronized" });
+        scheduleBackgroundPreviewFillWhenIdle();
+        return;
+      }
       setIndexingProgressUi({ running: true, message: "Creating Previews" });
       const started = await invoke("start_background_preview_fill", { workspaceDir: currentWorkspaceDir });
       if (started) {
@@ -1100,6 +1246,11 @@ async function runManualCacheMaintenance() {
     const cacheImageCount = Number(counts?.cache_image_count ?? counts?.cacheImageCount ?? 0) || 0;
 
     if (dbImageCount > cacheImageCount) {
+      if (activeViewPreviewLoading.running) {
+        setIndexingProgressUi({ running: false, message: "Not synchronized" });
+        scheduleBackgroundPreviewFillWhenIdle();
+        return;
+      }
       manualCacheHoldMode = "creating";
       setIndexingProgressUi({ running: true, message: "Creating Previews" });
       const started = await invoke("start_background_preview_fill", { workspaceDir: currentWorkspaceDir });
@@ -1311,6 +1462,7 @@ function updateImportWizardButtonState() {
   if (importWizardPatientLabel) {
     importWizardPatientLabel.textContent = formatWizardPatientLabel();
   }
+  sidebarLayout.updateTopButtonSpacing();
 }
 
 function setImportWizardLinkedPatient(folderName) {
@@ -2144,6 +2296,8 @@ function clearPatients() {
   stopLocalCacheStatusPolling();
   clearPreviewFillIdleStartTimer();
   previewFillLastAttemptMs = 0;
+  previewFillPausedForActiveView = false;
+  activeViewPrioritySyncInFlight = false;
   localCacheFolderExists = false;
   localCacheFileCount = 0;
   applyLocalCacheCopyStatus({
@@ -2589,13 +2743,20 @@ deleteDatabaseBtn?.addEventListener("click", async () => {
 });
 deleteLocalCacheBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || deleteLocalCacheBtn.disabled) return;
+  isDeleteLocalCacheInFlight = true;
+  setDeleteLocalCacheDeletingUi(true);
+  updateLocalCacheDeleteButtonState();
+  setDeleteWorkspaceAvailability(Boolean(showFrontendDebugToggle?.checked));
+  setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
   try {
     localCacheSyncInFlight = true;
-    applyLocalCacheCopyStatus({ enabled: keepLocalCacheCopyEnabled, running: true, state: "updating" });
-    await invoke("delete_local_cache_copy_files");
     await invoke("set_keep_local_cache_copy", {
       workspaceDir: currentWorkspaceDir,
       enabled: false,
+    });
+    applyLocalCacheCopyStatus({ enabled: false, running: false, state: "disabled" });
+    await invoke("delete_local_cache_copy_files", {
+      workspaceDir: currentWorkspaceDir,
     });
     mainContent.invalidateTreatmentPreviewCache();
     await refreshCacheUsageUi();
@@ -2605,8 +2766,12 @@ deleteLocalCacheBtn?.addEventListener("click", async () => {
   } catch (err) {
     console.error("delete_local_cache_copy_files failed:", err);
   } finally {
+    isDeleteLocalCacheInFlight = false;
+    setDeleteLocalCacheDeletingUi(false);
     localCacheSyncInFlight = false;
     updateLocalCacheDeleteButtonState();
+    setDeleteWorkspaceAvailability(Boolean(showFrontendDebugToggle?.checked));
+    setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
   }
 });
 dbReloadBtn?.addEventListener("click", async () => {
@@ -2668,9 +2833,6 @@ keepLocalCacheCopyToggle?.addEventListener("change", async (e) => {
       mainContent.invalidateTreatmentPreviewCache();
     }
     await mainContent.refreshTreatmentFilesForSelection();
-    if (enabled) {
-      void syncLocalCacheCopy();
-    }
   } catch (err) {
     console.error("set_keep_local_cache_copy failed:", err);
     if (keepLocalCacheCopyToggle) keepLocalCacheCopyToggle.checked = keepLocalCacheCopyEnabled;
@@ -2830,6 +2992,14 @@ openCacheFolderBtn?.addEventListener("click", async () => {
     console.error("open_preview_cache_dir failed:", err);
   }
 });
+openLocalCacheCopyFolderBtn?.addEventListener("click", async () => {
+  if (!currentWorkspaceDir || openLocalCacheCopyFolderBtn.disabled) return;
+  try {
+    await invoke("open_local_cache_copy_dir");
+  } catch (err) {
+    console.error("open_local_cache_copy_dir failed:", err);
+  }
+});
 systemUpdateBtn?.addEventListener("click", () => {
   void runSystemUpdateNow();
 });
@@ -2897,8 +3067,11 @@ renderPatientList([], "");
 void listen("preview-fill-status", (event) => {
   const running = Boolean(event?.payload?.running);
   setPreviewFillRunning(running);
+  void syncActiveViewPreviewPriority();
   if (!running) {
     previewFillProgressMessage = "";
+    previewFillProgressCompleted = 0;
+    previewFillProgressTotal = 0;
     void refreshCacheUsageUi();
     void refreshIndexingDebugCounts();
   }
@@ -2909,9 +3082,26 @@ void listen("preview-fill-progress", (event) => {
   const completed = Number(payload?.completed ?? 0) || 0;
   const total = Number(payload?.total ?? 0) || 0;
   previewFillProgressMessage = message;
-  if (total > 0 && message.toLowerCase().includes("creating")) {
-    setIndexingCustomSuffixUi(`(${completed}/${total})`);
+  previewFillProgressCompleted = Math.max(0, completed);
+  previewFillProgressTotal = Math.max(0, total);
+  if (message.toLowerCase().includes("creating")) {
+    setIndexingCustomSuffixUi(`(${previewFillProgressCompleted}/${Math.max(previewFillProgressCompleted, previewFillProgressTotal)})`);
   }
+  void refreshIndexingStatus();
+});
+void listen("local-cache-copy-progress", (event) => {
+  const payload = event?.payload ?? {};
+  const stateRaw = String(payload?.state ?? "").trim().toLowerCase();
+  const state = stateRaw || localCacheStatusState || "up_to_date";
+  const stateIsWorking = state === "copying" || state === "updating";
+  const running = keepLocalCacheCopyEnabled && stateIsWorking;
+  const completed = Math.max(0, Number(payload?.completed ?? 0) || 0);
+  const total = Math.max(completed, Number(payload?.total ?? 0) || 0);
+  localCacheStatusState = state;
+  localCacheStatusRunning = running;
+  localCacheStatusCompleted = completed;
+  localCacheStatusTotal = total;
+  updateLocalCacheDeleteButtonState();
   void refreshIndexingStatus();
 });
 void listen("import-wizard-completed", async (event) => {

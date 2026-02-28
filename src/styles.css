@@ -170,6 +170,20 @@ body{
   line-height: 1.25;
 }
 
+.invalid-patient-loading-item{
+  color: rgba(255,255,255,0.92);
+}
+
+.invalid-patient-loading-spinner{
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid rgba(255,255,255,0.28);
+  border-top-color: #ffffff;
+  animation: dbSpin 0.8s linear infinite;
+  flex: 0 0 11px;
+}
+
 .invalid-patient-folder-name{
   min-width: 0;
   flex: 1;
@@ -794,10 +808,15 @@ body{
   scrollbar-width: thin;
   scrollbar-width: none;
   -ms-overflow-style: none;
+  cursor: grab;
 }
 
 .main-timeline-scroll::-webkit-scrollbar{
   display: none;
+}
+
+.main-timeline-scroll.dragging{
+  cursor: grabbing;
 }
 
 .main-timeline-track{
@@ -1120,6 +1139,29 @@ body{
 .treatment-files-counts{
   font-size: 12px;
   color: rgba(15,23,42,0.5);
+}
+
+.treatment-previews-progress{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 16px;
+  font-size: 11px;
+  color: rgba(15,23,42,0.5);
+}
+
+.treatment-previews-spinner{
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(225,29,138,0.26);
+  border-top-color: #e11d8a;
+  animation: treatmentPreviewSpin 0.75s linear infinite;
+}
+
+@keyframes treatmentPreviewSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 .treatment-files-view-toggle{
@@ -2707,6 +2749,31 @@ body{
   margin-top: 4px;
 }
 
+.delete-action-row.deleting .settings-value{
+  color: rgba(0,0,0,0.42);
+}
+
+.delete-action-row.deleting .folder-change-btn{
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#deleteLocalCacheLabel.deleting{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#deleteLocalCacheLabel.deleting::before{
+  content: "";
+  width: 11px;
+  height: 11px;
+  border-radius: 50%;
+  border: 2px solid rgba(220,38,38,0.22);
+  border-top-color: #dc2626;
+  animation: dbSpin 0.8s linear infinite;
+}
+
 .cache-open-btn{
   border: 0;
   background: transparent;
@@ -2720,6 +2787,26 @@ body{
 
 .cache-open-btn:hover{
   color: #1d4ed8;
+}
+
+.local-cache-open-btn{
+  margin-top: 0;
+}
+
+.local-cache-delete-label-wrap{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#deleteLocalCacheLabel{
+  display: inline-flex;
+  align-items: center;
+}
+
+.cache-open-btn:disabled{
+  color: rgba(0,0,0,0.28);
+  cursor: not-allowed;
 }
 
 .system-update-row{

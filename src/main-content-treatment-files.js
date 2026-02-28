@@ -11,6 +11,7 @@ const FILL_RUNNING_QUICK_BATCH_SIZE = 6;
 const FALLBACK_RECOVERY_BATCH_SIZE = 20;
 const THUMB_RECOVERY_RETRY_DELAYS_MS = [350, 900, 1800];
 const FILE_LIST_PAGE_SIZE = 220;
+const ACTIVE_PREVIEW_BATCH_SIZE = 2;
 
 function normalizePath(pathLike = "") {
   if (typeof pathLike === "string") return pathLike;
@@ -66,7 +67,12 @@ function normalizeDialogPathSelection(selected) {
   return path;
 }
 
-export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatmentFolder }) {
+export function createTreatmentFilesPanel({
+  container,
+  onOpenPath,
+  onOpenTreatmentFolder,
+  onPreviewLoadingStatusChange,
+}) {
   const panel = document.createElement("section");
   panel.className = "treatment-files-panel";
   panel.hidden = true;
@@ -76,6 +82,10 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
         <div class="treatment-files-title">Treatment Files</div>
         <div class="treatment-files-folder"></div>
         <div class="treatment-files-counts"></div>
+        <div class="treatment-previews-progress" hidden>
+          <span class="treatment-previews-spinner" aria-hidden="true"></span>
+          <span class="treatment-previews-progress-text">Loading Previews... (0/0)</span>
+        </div>
       </div>
       <div class="treatment-files-view-toggle" role="group" aria-label="Treatment files view mode">
         <button
@@ -129,6 +139,8 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
   const titleEl = panel.querySelector(".treatment-files-title");
   const folderEl = panel.querySelector(".treatment-files-folder");
   const countsEl = panel.querySelector(".treatment-files-counts");
+  const previewsProgressEl = panel.querySelector(".treatment-previews-progress");
+  const previewsProgressTextEl = panel.querySelector(".treatment-previews-progress-text");
   const viewToggleEl = panel.querySelector(".treatment-files-view-toggle");
   const viewBtns = Array.from(panel.querySelectorAll(".treatment-files-view-btn"));
   const loadingEl = panel.querySelector(".treatment-files-loading");
@@ -154,6 +166,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
   let activeImageFiles = [];
   let activeLoadedFiles = [];
   let activeFileOffset = 0;
+  let previewLoadingStatus = { running: false, completed: 0, total: 0 };
 
   const VIEW_MODE_STORAGE_KEY = "mpm.treatmentFilesViewMode";
   const normalizeViewMode = (value) => (value === "list" ? "list" : "tile");
@@ -247,6 +260,12 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     titleEl.textContent = "Treatment Files";
     folderEl.textContent = "";
     countsEl.textContent = "";
+    if (previewsProgressEl) previewsProgressEl.hidden = true;
+    if (previewsProgressTextEl) previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
+    previewLoadingStatus = { running: false, completed: 0, total: 0 };
+    if (typeof onPreviewLoadingStatusChange === "function") {
+      onPreviewLoadingStatusChange(previewLoadingStatus);
+    }
     viewToggleEl.hidden = false;
     loadingEl.hidden = true;
     emptyEl.hidden = true;
@@ -268,6 +287,12 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     titleEl.textContent = title || folderName;
     folderEl.textContent = date;
     countsEl.textContent = "";
+    if (previewsProgressEl) previewsProgressEl.hidden = true;
+    if (previewsProgressTextEl) previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
+    previewLoadingStatus = { running: false, completed: 0, total: 0 };
+    if (typeof onPreviewLoadingStatusChange === "function") {
+      onPreviewLoadingStatusChange(previewLoadingStatus);
+    }
     viewToggleEl.hidden = false;
     loadingEl.hidden = false;
     emptyEl.hidden = true;
@@ -284,18 +309,71 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     otherListEl.innerHTML = "";
   }
 
+  function setPreviewLoadingProgress(completed = 0, total = 0) {
+    const safeTotal = Math.max(0, Number(total) || 0);
+    const safeCompleted = Math.min(safeTotal, Math.max(0, Number(completed) || 0));
+    if (!previewsProgressEl || !previewsProgressTextEl) return;
+    if (safeTotal < 1) {
+      previewsProgressEl.hidden = true;
+      previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
+      previewLoadingStatus = { running: false, completed: 0, total: 0 };
+      if (typeof onPreviewLoadingStatusChange === "function") {
+        onPreviewLoadingStatusChange(previewLoadingStatus);
+      }
+      return;
+    }
+    previewsProgressTextEl.textContent = `Loading Previews... (${safeCompleted}/${safeTotal})`;
+    previewsProgressEl.hidden = safeCompleted >= safeTotal;
+    previewLoadingStatus = {
+      running: safeCompleted < safeTotal,
+      completed: safeCompleted,
+      total: safeTotal,
+    };
+    if (typeof onPreviewLoadingStatusChange === "function") {
+      onPreviewLoadingStatusChange(previewLoadingStatus);
+    }
+  }
+
+  async function requestActivePreviewPriority(requestId) {
+    if (requestId !== activeRequestId) return;
+    // Keep global background creation running; active-view work is prioritized by micro-batching.
+    if (!isBackgroundFillRunning) return;
+  }
+
   function createFolderStackItem(src = "", orderClass = "") {
     const item = document.createElement("span");
     item.className = `treatment-folder-stack-item ${orderClass}`.trim();
     const thumb = document.createElement("span");
-    thumb.className = "treatment-image-thumb treatment-folder-stack-thumb";
+    thumb.className = "treatment-image-thumb treatment-folder-stack-thumb fallback";
+    thumb.textContent = "IMG";
+    if (!src) {
+      item.appendChild(thumb);
+      return item;
+    }
     const img = document.createElement("img");
     img.className = "full-preview";
     img.alt = "";
-    img.loading = "lazy";
+    img.loading = "eager";
     img.decoding = "async";
-    img.src = src;
+    const showLoaded = () => {
+      thumb.classList.remove("fallback");
+      thumb.textContent = "";
+      thumb.appendChild(img);
+    };
+    img.addEventListener("load", showLoaded, { once: true });
+    img.addEventListener("error", () => {
+      if (img.parentElement === thumb) {
+        img.remove();
+      }
+      thumb.classList.add("fallback");
+      thumb.textContent = "IMG";
+    }, { once: true });
+    // Attach immediately so each stack slot can update itself as soon as it is ready.
     thumb.appendChild(img);
+    img.src = src;
+    if (img.complete && img.naturalWidth > 0) {
+      showLoaded();
+    }
     item.appendChild(thumb);
     return item;
   }
@@ -421,42 +499,194 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     emptyEl.hidden = folders.length > 0 || rootFiles.length > 0;
     countsEl.textContent = `${folders.length} folders, ${rootFiles.length} root files`;
 
-    if (folders.length > 0) {
-      const previewPaths = [];
+    otherWrapEl.hidden = rootFiles.length < 1;
+    const rootImageCardsByPath = renderOtherFiles(rootFiles);
+    const rootImagePaths = rootFiles
+      .filter((file) => Boolean(file?.is_image ?? file?.isImage))
+      .map((file) => normalizePath(file?.path ?? ""))
+      .filter((path) => path.length > 0);
+
+    if (folders.length > 0 || rootImagePaths.length > 0) {
+      const stackPreviewPaths = [];
       for (const folder of folders) {
         const paths = Array.isArray(folder?.preview_paths ?? folder?.previewPaths)
           ? (folder?.preview_paths ?? folder?.previewPaths)
           : [];
         for (const path of paths) {
           const normalized = String(path ?? "").trim();
-          if (normalized) previewPaths.push(normalized);
+          if (normalized) stackPreviewPaths.push(normalized);
         }
       }
+      const priorityPaths = Array.from(new Set([...stackPreviewPaths, ...rootImagePaths]));
+
       let previewSrcByPath = new Map();
       try {
-        previewSrcByPath = await loadExistingCachedPreviewSrcMap(previewPaths);
+        previewSrcByPath = await loadExistingCachedPreviewDataSrcMap(priorityPaths);
       } catch {
         previewSrcByPath = new Map();
       }
       if (requestId !== activeRequestId) return;
 
-      foldersOverviewWrapEl.hidden = false;
-      for (const folder of folders) {
-        const card = createFolderOverviewCard(folder, previewSrcByPath);
-        foldersOverviewGridEl.appendChild(card);
-      }
-    }
+      foldersOverviewWrapEl.hidden = folders.length < 1;
+      const renderOverviewCards = () => {
+        foldersOverviewGridEl.innerHTML = "";
+        for (const folder of folders) {
+          const card = createFolderOverviewCard(folder, previewSrcByPath);
+          foldersOverviewGridEl.appendChild(card);
+        }
+      };
+      renderOverviewCards();
 
-    otherWrapEl.hidden = rootFiles.length < 1;
-    renderOtherFiles(rootFiles);
+      for (const path of rootImagePaths) {
+        const src = previewSrcByPath.get(path) ?? "";
+        if (!src) continue;
+        setThumbImage(path, rootImageCardsByPath, src, {
+          requestId,
+          allowPathFallback: true,
+          previewQuality: "full",
+        });
+      }
+
+      const missingPriorityPaths = priorityPaths.filter((path) => !previewSrcByPath.has(path));
+      const loadedPriorityCount = priorityPaths.length - missingPriorityPaths.length;
+      if (priorityPaths.length > 0) {
+        setPreviewLoadingProgress(loadedPriorityCount, priorityPaths.length);
+      }
+      if (missingPriorityPaths.length > 0) {
+        await requestActivePreviewPriority(requestId);
+        let doneMissing = 0;
+        for (let i = 0; i < missingPriorityPaths.length; i += ACTIVE_PREVIEW_BATCH_SIZE) {
+          if (requestId !== activeRequestId) return;
+          const batch = missingPriorityPaths.slice(i, i + ACTIVE_PREVIEW_BATCH_SIZE);
+          let rows = [];
+          try {
+            rows = await invoke("get_cached_image_previews", {
+              paths: batch,
+              includeDataUrl: true,
+              generateIfMissing: true,
+            });
+          } catch {
+            rows = [];
+          }
+          if (requestId !== activeRequestId) return;
+          for (const row of Array.isArray(rows) ? rows : []) {
+            const path = normalizePath(row?.path ?? "");
+            const dataUrl = normalizePath(row?.data_url ?? row?.dataUrl ?? "");
+            const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+            if (!path) continue;
+            if (dataUrl) {
+              previewSrcByPath.set(path, dataUrl);
+              continue;
+            }
+            if (!previewPath) continue;
+            try {
+              previewSrcByPath.set(path, convertFileSrc(previewPath));
+            } catch {
+              // ignore conversion failures
+            }
+          }
+          doneMissing += batch.length;
+          setPreviewLoadingProgress(loadedPriorityCount + doneMissing, priorityPaths.length);
+          renderOverviewCards();
+          for (const path of rootImagePaths) {
+            const src = previewSrcByPath.get(path) ?? "";
+            if (!src) continue;
+            setThumbImage(path, rootImageCardsByPath, src, {
+              requestId,
+              allowPathFallback: true,
+              previewQuality: "full",
+            });
+          }
+          await new Promise((resolve) => setTimeout(resolve, 0));
+        }
+      }
+
+      const priorityPathSet = new Set(priorityPaths);
+      let stageTwoOffset = 0;
+      let stageTwoHasMore = true;
+      let stageTwoLoaded = 0;
+      let stageTwoTotal = 0;
+      while (stageTwoHasMore) {
+        if (requestId !== activeRequestId) return;
+        let pageRows = [];
+        try {
+          const page = await invoke("list_patient_image_paths_page", {
+            workspaceDir: w,
+            patientFolder: p,
+            offset: stageTwoOffset,
+            limit: 5000,
+          });
+          pageRows = Array.isArray(page?.rows)
+            ? page.rows.map((entry) => normalizePath(entry)).filter((path) => path.length > 0)
+            : [];
+          stageTwoHasMore = Boolean(page?.has_more ?? page?.hasMore ?? false);
+        } catch {
+          pageRows = [];
+          stageTwoHasMore = false;
+        }
+        if (requestId !== activeRequestId) return;
+        stageTwoOffset += pageRows.length;
+
+        const pageStageTwoPaths = pageRows.filter((path) => !priorityPathSet.has(path));
+        if (pageStageTwoPaths.length < 1) {
+          if (!stageTwoHasMore) break;
+          continue;
+        }
+
+        stageTwoTotal += pageStageTwoPaths.length;
+        let stageTwoCacheMap = new Map();
+        try {
+          stageTwoCacheMap = await loadExistingCachedPreviewDataSrcMap(pageStageTwoPaths);
+        } catch {
+          stageTwoCacheMap = new Map();
+        }
+        if (requestId !== activeRequestId) return;
+
+        const stageTwoMissing = pageStageTwoPaths.filter((path) => !stageTwoCacheMap.has(path));
+        stageTwoLoaded += pageStageTwoPaths.length - stageTwoMissing.length;
+        setPreviewLoadingProgress(stageTwoLoaded, stageTwoTotal);
+        if (stageTwoMissing.length > 0) {
+          await requestActivePreviewPriority(requestId);
+          for (let i = 0; i < stageTwoMissing.length; i += ACTIVE_PREVIEW_BATCH_SIZE) {
+            if (requestId !== activeRequestId) return;
+            const batch = stageTwoMissing.slice(i, i + ACTIVE_PREVIEW_BATCH_SIZE);
+            try {
+              await invoke("get_cached_image_previews", {
+                paths: batch,
+                includeDataUrl: false,
+                generateIfMissing: true,
+              });
+            } catch {
+              // ignore failures; continue background retries
+            }
+            stageTwoLoaded += batch.length;
+            setPreviewLoadingProgress(stageTwoLoaded, stageTwoTotal);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+          }
+        }
+      }
+      if (stageTwoTotal < 1) {
+        setPreviewLoadingProgress(0, 0);
+      } else {
+        setPreviewLoadingProgress(stageTwoLoaded, stageTwoTotal);
+      }
+    } else {
+      setPreviewLoadingProgress(0, 0);
+    }
   }
 
   function renderOtherFiles(otherFiles = []) {
     otherListEl.innerHTML = "";
+    const imageCardsByPath = new Map();
     for (const file of otherFiles) {
       const row = createFileListRow(file);
       otherListEl.appendChild(row);
+      if (Boolean(file?.is_image ?? file?.isImage)) {
+        const path = normalizePath(file?.path ?? "");
+        if (path) imageCardsByPath.set(path, row);
+      }
     }
+    return imageCardsByPath;
   }
 
   function createImageCard(file) {
@@ -622,7 +852,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     const img = document.createElement("img");
     img.className = quality === "quick" ? "quick-preview" : "full-preview";
     img.alt = "";
-    img.loading = "lazy";
+    img.loading = "eager";
     img.decoding = "async";
 
     if (allowPathFallback) {
@@ -663,6 +893,37 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
         out.set(path, convertFileSrc(previewPath));
       } catch {
         // ignore conversion failures
+      }
+    }
+    return out;
+  }
+
+  async function loadExistingCachedPreviewDataSrcMap(paths = []) {
+    const normalized = Array.isArray(paths)
+      ? paths.map((p) => normalizePath(p)).filter((p) => p.length > 0)
+      : [];
+    if (normalized.length < 1) return new Map();
+    const rows = await invoke("get_cached_image_previews", {
+      paths: normalized,
+      includeDataUrl: true,
+      generateIfMissing: false,
+    });
+    const out = new Map();
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const path = normalizePath(row?.path ?? "");
+      const dataUrl = normalizePath(row?.data_url ?? row?.dataUrl ?? "");
+      const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+      if (!path) continue;
+      if (dataUrl) {
+        out.set(path, dataUrl);
+        continue;
+      }
+      if (previewPath) {
+        try {
+          out.set(path, convertFileSrc(previewPath));
+        } catch {
+          // ignore conversion failures
+        }
       }
     }
     return out;
@@ -775,57 +1036,75 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     imageFiles,
     requestId,
     {
-      concurrency = PREVIEW_CONCURRENCY,
+      batchSize = ACTIVE_PREVIEW_BATCH_SIZE,
       existingCacheByPath = null,
+      onProgress = null,
     } = {}
   ) {
-    const queue = [...(Array.isArray(imageFiles) ? imageFiles : [])];
+    const queue = Array.isArray(imageFiles) ? imageFiles : [];
+    const allPaths = queue
+      .map((file) => normalizePath(file?.path ?? ""))
+      .filter((path) => path.length > 0);
+    const total = allPaths.length;
+    if (total < 1) {
+      if (typeof onProgress === "function") onProgress(0, 0);
+      return;
+    }
 
-    const adjustedConcurrency = isBackgroundFillRunning
-      ? Math.min(Math.max(1, FILL_RUNNING_PREVIEW_CONCURRENCY), Math.max(1, concurrency))
-      : Math.max(1, concurrency);
-    const workerCount = Math.min(adjustedConcurrency, queue.length);
+    if (typeof onProgress === "function") onProgress(0, total);
+    await requestActivePreviewPriority(requestId);
 
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (queue.length > 0) {
-        if (requestId !== activeRequestId) return;
-        const file = queue.shift();
-        const path = normalizePath(file?.path ?? "");
-        if (!path) continue;
+    let completed = 0;
+    const safeBatchSize = Math.max(1, Number(batchSize) || ACTIVE_PREVIEW_BATCH_SIZE);
+    for (let i = 0; i < allPaths.length; i += safeBatchSize) {
+      if (requestId !== activeRequestId) return;
+      const batch = allPaths.slice(i, i + safeBatchSize);
+      const unknownPaths = batch.filter((path) => !(existingCacheByPath?.has(path)));
 
-        const existingSrc = existingCacheByPath?.get(path) ?? "";
-        if (existingSrc) {
-          setThumbImage(path, cardsByPath, existingSrc, {
-            requestId,
-            allowPathFallback: true,
-            previewQuality: "full",
-          });
-          continue;
-        }
-
-        let cachedSrc = "";
+      if (unknownPaths.length > 0) {
+        let rows = [];
         try {
-          cachedSrc = await loadCachedPreviewSrc(path);
+          rows = await invoke("get_cached_image_previews", {
+            paths: unknownPaths,
+            includeDataUrl: false,
+            generateIfMissing: true,
+          });
         } catch {
-          cachedSrc = "";
+          rows = [];
         }
         if (requestId !== activeRequestId) return;
+        for (const row of Array.isArray(rows) ? rows : []) {
+          const path = normalizePath(row?.path ?? "");
+          const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+          if (!path || !previewPath) continue;
+          try {
+            existingCacheByPath?.set(path, convertFileSrc(previewPath));
+          } catch {
+            // ignore preview conversion failures
+          }
+        }
+      }
 
+      for (const path of batch) {
+        if (requestId !== activeRequestId) return;
+        const cachedSrc = existingCacheByPath?.get(path) ?? "";
         if (cachedSrc) {
           setThumbImage(path, cardsByPath, cachedSrc, {
             requestId,
             allowPathFallback: true,
             previewQuality: "full",
           });
-          continue;
+        } else {
+          setFallbackThumb(path, cardsByPath);
+          recoverSingleThumbWithRetry(path, cardsByPath, requestId, 0);
         }
-
-        setFallbackThumb(path, cardsByPath);
-        warmCachePreviewInBackground(path);
       }
-    });
 
-    await Promise.all(workers);
+      completed += batch.length;
+      if (typeof onProgress === "function") onProgress(completed, total);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
     await recoverFallbackThumbs(cardsByPath, imageFiles, requestId);
   }
 
@@ -886,8 +1165,7 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
 
     loadingEl.hidden = true;
     emptyEl.hidden = files.length > 0;
-    const totalLabel = hasMore ? `${totalCount}+` : `${totalCount}`;
-    countsEl.textContent = `${imageFiles.length} images, ${otherFiles.length} other files (loaded ${files.length}/${totalLabel})`;
+    countsEl.textContent = `${imageFiles.length} images, ${otherFiles.length} other files`;
     const useListView = currentViewMode === "list";
     listWrapEl.hidden = !useListView || files.length < 1;
     imagesWrapEl.hidden = useListView || imageFiles.length < 1;
@@ -916,14 +1194,16 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
         const row = createFileListRow(file);
         listEl.appendChild(row);
         if (Boolean(file?.is_image ?? file?.isImage)) {
-          cardsByPath.set(file.path, row);
+          const path = normalizePath(file?.path ?? "");
+          if (path) cardsByPath.set(path, row);
         }
       }
     } else {
       renderOtherFiles(otherFiles);
       for (const file of imageFiles) {
         const card = createImageCard(file);
-        cardsByPath.set(file.path, card);
+        const path = normalizePath(file?.path ?? "");
+        if (path) cardsByPath.set(path, card);
         imagesGridEl.appendChild(card);
       }
     }
@@ -931,10 +1211,13 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     activeImageFiles = imageFiles;
 
     const needsLoad = [];
+    const runtimeReadyPaths = new Set();
     for (const file of imageFiles) {
       const path = normalizePath(file?.path ?? "");
       if (!path) continue;
-      if (!applyRuntimePreviewIfAvailable(path, cardsByPath)) {
+      if (applyRuntimePreviewIfAvailable(path, cardsByPath)) {
+        runtimeReadyPaths.add(path);
+      } else {
         needsLoad.push(file);
       }
     }
@@ -943,10 +1226,10 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
     const initial = needsLoad.slice(VISIBLE_FIRST_IMAGE_COUNT, INITIAL_IMAGE_PREVIEWS);
     const rest = needsLoad.slice(INITIAL_IMAGE_PREVIEWS);
 
-    const allNeededPaths = needsLoad.map((f) => normalizePath(f?.path ?? "")).filter((p) => p.length > 0);
+    const allImagePaths = imageFiles.map((f) => normalizePath(f?.path ?? "")).filter((p) => p.length > 0);
     let existingCacheByPath = new Map();
     try {
-      existingCacheByPath = await loadExistingCachedPreviewSrcMap(allNeededPaths);
+      existingCacheByPath = await loadExistingCachedPreviewSrcMap(allImagePaths);
     } catch {
       existingCacheByPath = new Map();
     }
@@ -965,29 +1248,44 @@ export function createTreatmentFilesPanel({ container, onOpenPath, onOpenTreatme
       return path && !existingCacheByPath.has(path);
     });
 
-    void fillImagePreviewsProgressively(
-      cardsByPath,
-      firstPhase,
-      requestId,
-      {
-        concurrency: isBackgroundFillRunning ? FILL_RUNNING_PREVIEW_CONCURRENCY : VISIBLE_FIRST_PREVIEW_CONCURRENCY,
-        existingCacheByPath,
+    const restMissing = rest.filter((f) => {
+      const path = normalizePath(f?.path ?? "");
+      return path && !existingCacheByPath.has(path);
+    });
+    const totalMissing = firstPhase.length + restMissing.length;
+    const totalImages = allImagePaths.length;
+    let cachedImageCount = 0;
+    for (const path of allImagePaths) {
+      if (runtimeReadyPaths.has(path) || existingCacheByPath.has(path)) {
+        cachedImageCount += 1;
       }
-    );
-
-    if (rest.length > 0) {
-      const restMissing = rest.filter((f) => {
-        const path = normalizePath(f?.path ?? "");
-        return path && !existingCacheByPath.has(path);
-      });
-      if (restMissing.length > 0) {
-        setTimeout(() => {
-          void fillImagePreviewsProgressively(cardsByPath, restMissing, requestId, {
-            concurrency: isBackgroundFillRunning ? FILL_RUNNING_PREVIEW_CONCURRENCY : PREVIEW_CONCURRENCY,
+    }
+    setPreviewLoadingProgress(cachedImageCount, totalImages);
+    if (totalMissing > 0 && totalImages > 0) {
+      void (async () => {
+        let completed = 0;
+        if (firstPhase.length > 0) {
+          await fillImagePreviewsProgressively(cardsByPath, firstPhase, requestId, {
+            batchSize: ACTIVE_PREVIEW_BATCH_SIZE,
             existingCacheByPath,
+            onProgress: (chunkDone) => setPreviewLoadingProgress(cachedImageCount + completed + chunkDone, totalImages),
           });
-        }, 0);
-      }
+          completed += firstPhase.length;
+        }
+        if (requestId !== activeRequestId) return;
+        if (restMissing.length > 0) {
+          await fillImagePreviewsProgressively(cardsByPath, restMissing, requestId, {
+            batchSize: ACTIVE_PREVIEW_BATCH_SIZE,
+            existingCacheByPath,
+            onProgress: (chunkDone) => setPreviewLoadingProgress(cachedImageCount + completed + chunkDone, totalImages),
+          });
+          completed += restMissing.length;
+        }
+        if (requestId !== activeRequestId) return;
+        setPreviewLoadingProgress(cachedImageCount + completed, totalImages);
+      })();
+    } else if (totalImages < 1) {
+      setPreviewLoadingProgress(0, 0);
     }
   }
 

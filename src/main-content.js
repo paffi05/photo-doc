@@ -12,6 +12,7 @@ export function initMainContent({
   resolveImportContext,
   onImportActivityChange,
   onImportDebugStateChange,
+  onPreviewLoadingStatusChange,
   onCheckMissingPatientIdTaken,
   onSubmitMissingPatientId,
 }) {
@@ -91,6 +92,11 @@ export function initMainContent({
       setSelectedTimelinePoint(point);
       ensureTimelinePointVisible(point);
       positionImportProgressCapsules();
+    },
+    onPreviewLoadingStatusChange: (status) => {
+      if (typeof onPreviewLoadingStatusChange === "function") {
+        onPreviewLoadingStatusChange(status);
+      }
     },
   });
 
@@ -178,6 +184,11 @@ export function initMainContent({
   let timelineFolderDragArmedPoint = null;
   let timelineFolderDragSourcePoint = null;
   let timelineFolderDragSourceExport = null;
+  let timelinePanPointerId = null;
+  let timelinePanStartX = 0;
+  let timelinePanStartScrollLeft = 0;
+  let timelinePanMoved = false;
+  let timelinePanSuppressClickUntil = 0;
 
   const TIMELINE_FOLDER_DRAG_HOLD_MS = 420;
   const TIMELINE_FOLDER_DRAG_MOVE_CANCEL_PX = 12;
@@ -1253,9 +1264,11 @@ export function initMainContent({
       pointsAdded += 1;
       const timelineKey = folderName || `${date} ${treatment}`.trim();
       const point = buildTimelinePoint({ date, treatment, timelineKey, folderName });
+      const dateLabelEl = point.querySelector(".main-timeline-date");
+      const treatmentLabelEl = point.querySelector(".main-timeline-treatment");
       attachTimelineFolderDragExportHandlers(point);
       point.addEventListener("mouseenter", () => ensureTimelinePointVisible(point));
-      point.addEventListener("click", () => {
+      const openTimelinePoint = () => {
         setSelectedTimelinePoint(point);
         if (!importPanel.hidden && importTreatmentName) {
           importTreatmentName.value = "";
@@ -1263,6 +1276,15 @@ export function initMainContent({
         updateImportStartEnabled();
         ensureTimelinePointVisible(point);
         positionImportProgressCapsules();
+      };
+      point.addEventListener("click", openTimelinePoint);
+      dateLabelEl?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openTimelinePoint();
+      });
+      treatmentLabelEl?.addEventListener("click", (event) => {
+        event.stopPropagation();
+        openTimelinePoint();
       });
       if (selectedTimelineKey && timelineKey === selectedTimelineKey) {
         setSelectedTimelinePoint(point);
@@ -1506,6 +1528,81 @@ export function initMainContent({
     if (!dropped.length) return;
     void prepareImportPanel(dropped);
   }
+
+  function clearTimelinePanState(pointerId = null) {
+    if (pointerId !== null && timelinePanPointerId !== pointerId) return;
+    timelinePanPointerId = null;
+    timelinePanMoved = false;
+    if (timelineScroll) {
+      timelineScroll.classList.remove("dragging");
+    }
+  }
+
+  timelineScroll?.addEventListener("wheel", (event) => {
+    if (!timelineScroll) return;
+    const maxScroll = Math.max(0, timelineScroll.scrollWidth - timelineScroll.clientWidth);
+    if (maxScroll < 1) return;
+    let delta = Math.abs(event.deltaY) > Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+    if (event.deltaMode === 1) delta *= 16;
+    if (event.deltaMode === 2) delta *= timelineScroll.clientWidth;
+    if (!Number.isFinite(delta) || Math.abs(delta) < 0.01) return;
+    timelineScroll.scrollLeft += delta;
+    event.preventDefault();
+  }, { passive: false });
+
+  timelineScroll?.addEventListener("pointerdown", (event) => {
+    if (!timelineScroll || event.button !== 0) return;
+    if (event.target instanceof Element && event.target.closest(".main-timeline-dot")) return;
+    if (
+      event.target instanceof Element &&
+      event.target.closest(".main-timeline-date, .main-timeline-treatment")
+    ) {
+      return;
+    }
+    timelinePanPointerId = event.pointerId;
+    timelinePanStartX = Number(event.clientX) || 0;
+    timelinePanStartScrollLeft = timelineScroll.scrollLeft;
+    timelinePanMoved = false;
+    timelineScroll.classList.add("dragging");
+    try {
+      timelineScroll.setPointerCapture(event.pointerId);
+    } catch {
+      // no-op if pointer capture is not available
+    }
+  });
+
+  timelineScroll?.addEventListener("pointermove", (event) => {
+    if (!timelineScroll || timelinePanPointerId !== event.pointerId) return;
+    const currentX = Number(event.clientX) || 0;
+    const deltaX = currentX - timelinePanStartX;
+    if (!timelinePanMoved && Math.abs(deltaX) > 3) {
+      timelinePanMoved = true;
+    }
+    timelineScroll.scrollLeft = timelinePanStartScrollLeft - deltaX;
+    if (timelinePanMoved) {
+      event.preventDefault();
+    }
+  });
+
+  timelineScroll?.addEventListener("pointerup", (event) => {
+    if (timelinePanPointerId !== event.pointerId) return;
+    if (timelinePanMoved) {
+      timelinePanSuppressClickUntil = performance.now() + 200;
+    }
+    clearTimelinePanState(event.pointerId);
+  });
+  timelineScroll?.addEventListener("pointercancel", (event) => {
+    clearTimelinePanState(event.pointerId);
+  });
+  timelineScroll?.addEventListener("lostpointercapture", (event) => {
+    clearTimelinePanState(event.pointerId);
+  });
+  timelineScroll?.addEventListener("click", (event) => {
+    if (performance.now() < timelinePanSuppressClickUntil) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
+  }, true);
 
   // Capture listeners at document/window level for reliable external file drags.
   document.addEventListener("dragstart", () => {
