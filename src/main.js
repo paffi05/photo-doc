@@ -52,6 +52,7 @@ const showFrontendDebugToggle = document.getElementById("showFrontendDebug");
 const alwaysShowTimelineNamesToggle = document.getElementById("alwaysShowTimelineNames");
 const systemUpdateBtn = document.getElementById("systemUpdateBtn");
 const systemUpdateSpinner = document.getElementById("systemUpdateSpinner");
+const systemInstallBtn = document.getElementById("systemInstallBtn");
 const systemVersionText = document.getElementById("systemVersionText");
 const systemUpdateStatusText = document.getElementById("systemUpdateStatusText");
 const deleteWorkspaceBtn = document.getElementById("deleteWorkspaceBtn");
@@ -399,8 +400,9 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "1.0.1";
+let systemAppVersion = "1.0.2";
 let systemUpdateBusy = false;
+let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
 let systemUpdateAvailable = false;
 let systemUpdateAvailableVersion = "";
@@ -1349,21 +1351,31 @@ function formatDateTime(date) {
 
 function setSystemUpdateUi({
   busy = false,
+  installing = systemUpdateInstalling,
   version = systemAppVersion,
   checkedAtMs = systemUpdateCheckedAtMs,
   available = systemUpdateAvailable,
   availableVersion = systemUpdateAvailableVersion,
 } = {}) {
+  const isWorking = Boolean(busy || installing);
   if (systemUpdateBtn) {
-    systemUpdateBtn.disabled = busy;
-    systemUpdateBtn.setAttribute("title", busy ? "Searching..." : "Search for updates");
+    systemUpdateBtn.disabled = isWorking;
+    const buttonTitle = busy ? "Searching..." : (installing ? "Installing update..." : "Search for updates");
+    systemUpdateBtn.setAttribute("title", buttonTitle);
   }
-  if (systemUpdateSpinner) systemUpdateSpinner.hidden = !busy;
-  const safeVersion = String(version || "1.0.1").trim() || "1.0.1";
+  if (systemUpdateSpinner) systemUpdateSpinner.hidden = !isWorking;
+  if (systemInstallBtn) {
+    const showInstallButton = Boolean(available) || Boolean(installing);
+    systemInstallBtn.hidden = !showInstallButton;
+    systemInstallBtn.disabled = isWorking;
+    systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
+  }
+  const safeVersion = String(version || "1.0.2").trim() || "1.0.2";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
   const nextStatus = (() => {
+    if (installing) return "Installing update...";
     if (busy) return "Searching for updates...";
     if (available) {
       const next = String(availableVersion ?? "").trim();
@@ -1386,7 +1398,7 @@ function setSystemUpdateStatusText(text) {
 }
 
 async function searchSystemUpdateNow({ showStartupNotice = false } = {}) {
-  if (systemUpdateBusy) return;
+  if (systemUpdateBusy || systemUpdateInstalling) return;
   systemUpdateBusy = true;
   setSystemUpdateUi({ busy: true });
   try {
@@ -1407,6 +1419,37 @@ async function searchSystemUpdateNow({ showStartupNotice = false } = {}) {
   } finally {
     systemUpdateBusy = false;
     setSystemUpdateUi({ busy: false });
+  }
+}
+
+async function installSystemUpdateNow() {
+  if (systemUpdateBusy || systemUpdateInstalling || !systemUpdateAvailable) return;
+  systemUpdateInstalling = true;
+  setSystemUpdateUi({ busy: false, installing: true });
+  try {
+    const result = await invoke("run_system_update");
+    const updated = Boolean(result?.updated);
+    const version = String(result?.version ?? "").trim();
+    if (updated) {
+      if (version) systemAppVersion = version;
+      systemUpdateAvailable = false;
+      systemUpdateAvailableVersion = "";
+      systemUpdateCheckedAtMs = Date.now();
+      setStartupUpdateNoticeVisible(false);
+      setSystemUpdateStatusText(version ? `Update installed (${version})` : "Update installed");
+    } else {
+      systemUpdateAvailable = false;
+      systemUpdateAvailableVersion = "";
+      systemUpdateCheckedAtMs = Date.now();
+      setStartupUpdateNoticeVisible(false);
+      setSystemUpdateStatusText("Up to date");
+    }
+  } catch (err) {
+    console.error("run_system_update failed:", err);
+    setSystemUpdateStatusText("Update failed");
+  } finally {
+    systemUpdateInstalling = false;
+    setSystemUpdateUi({ busy: false, installing: false });
   }
 }
 
@@ -3202,6 +3245,9 @@ openLocalCacheCopyFolderBtn?.addEventListener("click", async () => {
 });
 systemUpdateBtn?.addEventListener("click", () => {
   void searchSystemUpdateNow({ showStartupNotice: false });
+});
+systemInstallBtn?.addEventListener("click", () => {
+  void installSystemUpdateNow();
 });
 settingsBody?.addEventListener("scroll", syncSettingsHeaderScrollState);
 openBtn?.addEventListener("click", () => {
