@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    photo_doc_lib::run();
+    medical_photo_manager_lib::run();
 }

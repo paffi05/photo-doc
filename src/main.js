@@ -405,7 +405,7 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "1.0.5";
+let systemAppVersion = "1.0.6";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -1432,7 +1432,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.5").trim() || "1.0.5";
+  const safeVersion = String(version || "1.0.6").trim() || "1.0.6";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
