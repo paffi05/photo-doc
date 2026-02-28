@@ -4985,6 +4985,33 @@ async fn get_cached_image_previews(
 }
 
 #[tauri::command]
+fn get_import_files_created_ms(paths: Vec<String>) -> Result<Vec<Option<u64>>, String> {
+    let mut out: Vec<Option<u64>> = Vec::with_capacity(paths.len());
+    for raw in paths {
+        let path_text = raw.trim();
+        if path_text.is_empty() {
+            out.push(None);
+            continue;
+        }
+        let path = PathBuf::from(path_text);
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => {
+                out.push(None);
+                continue;
+            }
+        };
+        if !meta.is_file() {
+            out.push(None);
+            continue;
+        }
+        let (created_ms, _modified_ms) = file_time_ms_from_meta(&meta);
+        out.push(Some(created_ms));
+    }
+    Ok(out)
+}
+
+#[tauri::command]
 async fn get_import_wizard_cached_previews(
     app_handle: tauri::AppHandle,
     folder_dir: String,
@@ -5724,6 +5751,16 @@ fn get_preview_debug_counts(
     let mut should_start_refresh = false;
     let mut loading = false;
 
+    if let Ok(count) = query_db_image_count(&app_handle, &workspace_key) {
+        row.db_image_count = count;
+        if let Ok(mut cache) = preview_debug_counts_store().lock() {
+            let entry = cache
+                .entry(workspace_key.clone())
+                .or_insert_with(PreviewDebugCountsCacheEntry::default);
+            entry.row.db_image_count = count;
+        }
+    }
+
     if let Ok(mut cache) = preview_debug_counts_store().lock() {
         let entry = cache
             .entry(workspace_key.clone())
@@ -5764,20 +5801,40 @@ fn get_preview_debug_counts(
     Ok(row)
 }
 
+fn query_db_image_count(
+    app_handle: &tauri::AppHandle,
+    workspace_dir: &str,
+) -> Result<u64, String> {
+    let conn = open_db(app_handle)?;
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM patient_file_index WHERE workspace_dir = ?1 AND is_image = 1",
+            params![workspace_dir],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    Ok(count.max(0) as u64)
+}
+
+#[tauri::command]
+fn get_db_image_count(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<u64, String> {
+    let workspace_key = workspace_dir.trim().to_string();
+    if workspace_key.is_empty() {
+        return Ok(0);
+    }
+    query_db_image_count(&app_handle, &workspace_key)
+}
+
 fn compute_preview_debug_counts(
     app_handle: &tauri::AppHandle,
     workspace_dir: &str,
 ) -> Result<PreviewDebugCountsRow, String> {
     let workspace = PathBuf::from(workspace_dir.trim());
-    let mut db_image_count = 0_u64;
+    let db_image_count = query_db_image_count(app_handle, workspace_dir)?;
     let conn = open_db(app_handle)?;
-    if let Ok(count) = conn.query_row(
-        "SELECT COUNT(*) FROM patient_file_index WHERE workspace_dir = ?1 AND is_image = 1",
-        params![workspace_dir],
-        |row| row.get::<_, i64>(0),
-    ) {
-        db_image_count = count.max(0) as u64;
-    }
 
     let cache_dir = get_active_preview_cache_dir(app_handle);
     let mut mapped_count = 0_u64;
@@ -6116,6 +6173,7 @@ pub fn run() {
             copy_file_to_destination,
             copy_patient_folder_to_destination,
             list_import_wizard_files,
+            get_import_files_created_ms,
             ensure_import_wizard_preview_cache,
             clear_import_wizard_preview_cache,
             open_import_wizard_preview_window,
@@ -6163,6 +6221,7 @@ pub fn run() {
             get_preview_cache_stats,
             run_system_update,
             check_system_update,
+            get_db_image_count,
             get_preview_debug_counts,
             cleanup_preview_cache_for_workspace,
             get_preview_fill_status,

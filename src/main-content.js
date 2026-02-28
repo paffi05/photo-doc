@@ -196,6 +196,8 @@ export function initMainContent({
   let timelinePanStartScrollLeft = 0;
   let timelinePanMoved = false;
   let timelinePanSuppressClickUntil = 0;
+  let timelineWheelTargetScrollLeft = null;
+  let timelineWheelRafId = null;
 
   const TIMELINE_FOLDER_DRAG_HOLD_MS = 420;
   const TIMELINE_FOLDER_DRAG_MOVE_CANCEL_PX = 12;
@@ -919,6 +921,45 @@ export function initMainContent({
     return `${yyyy}-${mm}-${dd}`;
   }
 
+  function isoDateFromMs(ms) {
+    const n = Number(ms);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    const d = new Date(n);
+    if (Number.isNaN(d.getTime())) return "";
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+
+  async function resolveImportDateForPaths(paths = []) {
+    const normalizedPaths = Array.isArray(paths)
+      ? paths.map((p) => String(p ?? "").trim()).filter(Boolean)
+      : [];
+    if (normalizedPaths.length < 1) return todayIsoDate();
+
+    try {
+      const createdMsList = await invoke("get_import_files_created_ms", {
+        paths: normalizedPaths,
+      });
+      const rows = Array.isArray(createdMsList) ? createdMsList : [];
+      if (rows.length !== normalizedPaths.length) return todayIsoDate();
+
+      const uniqueDates = new Set();
+      for (const value of rows) {
+        const day = isoDateFromMs(value);
+        if (!day) return todayIsoDate();
+        uniqueDates.add(day);
+        if (uniqueDates.size > 1) return todayIsoDate();
+      }
+      const [singleDate] = uniqueDates;
+      return singleDate || todayIsoDate();
+    } catch (err) {
+      console.error("get_import_files_created_ms failed:", err);
+      return todayIsoDate();
+    }
+  }
+
   function extractFolderDate(folderName) {
     const match = /^\d{4}-\d{2}-\d{2}/.exec(folderName ?? "");
     return match?.[0] ?? "";
@@ -1386,7 +1427,7 @@ export function initMainContent({
     if (!append) {
       isImportFilesListExpanded = false;
     }
-    importDate.value = todayIsoDate();
+    importDate.value = await resolveImportDateForPaths(lastDroppedPaths);
     importTreatmentName.value = "";
 
     let existingFolders = [];
@@ -1545,6 +1586,48 @@ export function initMainContent({
     }
   }
 
+  function stopTimelineWheelAnimation() {
+    if (timelineWheelRafId !== null) {
+      cancelAnimationFrame(timelineWheelRafId);
+      timelineWheelRafId = null;
+    }
+    timelineWheelTargetScrollLeft = null;
+  }
+
+  function smoothTimelineWheelBy(delta) {
+    if (!timelineScroll || !Number.isFinite(delta)) return;
+    const maxScroll = Math.max(0, timelineScroll.scrollWidth - timelineScroll.clientWidth);
+    if (maxScroll < 1) return;
+
+    const currentScrollLeft = timelineScroll.scrollLeft;
+    const baseTarget = timelineWheelTargetScrollLeft ?? currentScrollLeft;
+    const nextTarget = Math.max(0, Math.min(maxScroll, baseTarget + delta));
+    timelineWheelTargetScrollLeft = nextTarget;
+
+    if (timelineWheelRafId !== null) return;
+    const tick = () => {
+      if (!timelineScroll || timelineWheelTargetScrollLeft === null) {
+        timelineWheelRafId = null;
+        return;
+      }
+      const current = timelineScroll.scrollLeft;
+      const target = timelineWheelTargetScrollLeft;
+      const diff = target - current;
+      if (Math.abs(diff) < 0.5) {
+        timelineScroll.scrollLeft = target;
+        timelineWheelTargetScrollLeft = null;
+        timelineWheelRafId = null;
+        return;
+      }
+
+      // Cap per-frame movement to prevent large stepped wheel deltas from causing visual direction glitches.
+      const frameStep = Math.sign(diff) * Math.min(Math.abs(diff) * 0.32, 42);
+      timelineScroll.scrollLeft = current + frameStep;
+      timelineWheelRafId = requestAnimationFrame(tick);
+    };
+    timelineWheelRafId = requestAnimationFrame(tick);
+  }
+
   timelineScroll?.addEventListener("wheel", (event) => {
     if (!timelineScroll) return;
     const maxScroll = Math.max(0, timelineScroll.scrollWidth - timelineScroll.clientWidth);
@@ -1553,7 +1636,9 @@ export function initMainContent({
     if (event.deltaMode === 1) delta *= 16;
     if (event.deltaMode === 2) delta *= timelineScroll.clientWidth;
     if (!Number.isFinite(delta) || Math.abs(delta) < 0.01) return;
-    timelineScroll.scrollLeft += delta;
+    // Keep notched wheels predictable by clamping spikes and animating toward a target.
+    const clamped = Math.sign(delta) * Math.min(Math.abs(delta), 120);
+    smoothTimelineWheelBy(clamped);
     event.preventDefault();
   }, { passive: false });
 
@@ -1566,6 +1651,7 @@ export function initMainContent({
     ) {
       return;
     }
+    stopTimelineWheelAnimation();
     timelinePanPointerId = event.pointerId;
     timelinePanStartX = Number(event.clientX) || 0;
     timelinePanStartScrollLeft = timelineScroll.scrollLeft;

@@ -443,6 +443,10 @@ body{
   transition: color 0.2s ease, padding 0.3s ease, background-color 0.3s ease, border-color 0.3s ease;
 }
 
+.patient-list.blend-in-expand .patient-item:not(.selected){
+  animation: patientBlendIn 0.22s ease both;
+}
+
 .patient-item:hover{
   color: #2563eb;
 }
@@ -513,6 +517,17 @@ body{
   border-color: #2563eb;
   color: #ffffff;
   padding: 8px 8px 8px 10px;
+}
+
+@keyframes patientBlendIn {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 .patient-keywords{
@@ -2785,15 +2800,15 @@ body{
 }
 
 .about-avatar{
-  width: 46px;
-  height: 46px;
-  border-radius: 10px;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
   object-fit: cover;
   object-position: center;
   box-shadow: 0 8px 14px rgba(15,23,42,0.12);
   border: 1px solid rgba(15,23,42,0.08);
   background: #ffffff;
-  flex: 0 0 46px;
+  flex: 0 0 36px;
 }
 
 .about-person-lines{
@@ -2810,17 +2825,18 @@ body{
 }
 
 .about-copy-author{
-  font-size: 13px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 400;
   color: #111111;
-  line-height: 1.08;
-  margin-bottom: -4px;
+  line-height: 1.45;
+  margin-bottom: 0;
 }
 
 .about-copy-location{
-  font-size: 12px;
-  color: rgba(0,0,0,0.74);
-  line-height: 1.45;
+  font-size: 10px;
+  color: rgba(100,116,139,0.9);
+  line-height: 1.3;
+  margin-top: -3px;
 }
 
 .settings button:not(.workspace-path-link):not(.cache-open-btn){
