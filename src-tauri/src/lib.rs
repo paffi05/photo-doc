@@ -1552,6 +1552,42 @@ fn copy_if_newer(src_path: &Path, src_size: u64, src_modified_ms: u64, dst_path:
     Ok(true)
 }
 
+fn file_modified_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn ensure_webview_accessible_preview_path(
+    app_handle: &tauri::AppHandle,
+    preview_path: &Path,
+) -> PathBuf {
+    if !preview_path.exists() || !preview_path.is_file() {
+        return preview_path.to_path_buf();
+    }
+    let local_cache_dir = preview_cache_dir_path(app_handle);
+    let _ = fs::create_dir_all(&local_cache_dir);
+    if path_is_inside_dir(preview_path, &local_cache_dir) {
+        return preview_path.to_path_buf();
+    }
+    let Some(file_name) = preview_path.file_name().and_then(|s| s.to_str()) else {
+        return preview_path.to_path_buf();
+    };
+    let dst_path = local_cache_dir.join(file_name);
+    if !paths_point_to_same_location(preview_path, &dst_path) {
+        if let Ok(meta) = fs::metadata(preview_path) {
+            let _ = copy_if_newer(preview_path, meta.len(), file_modified_ms(preview_path), &dst_path);
+        }
+    }
+    if dst_path.exists() {
+        return dst_path;
+    }
+    preview_path.to_path_buf()
+}
+
 fn copy_preview_cache_main_to_local_with_progress(
     main_cache_dir: &Path,
     local_cache_dir: &Path,
@@ -2588,7 +2624,7 @@ fn resolve_cached_previews(
             .unwrap_or(PREVIEW_PERF_AUTO),
     );
     let (source_meta_map, workspace_root) = build_source_meta_map_for_paths(app_handle, paths);
-    let rows = resolve_cached_previews_in_cache_dir(
+    let mut rows = resolve_cached_previews_in_cache_dir(
         paths,
         include_data_url,
         generate_if_missing,
@@ -2598,6 +2634,17 @@ fn resolve_cached_previews(
         Some(&source_meta_map),
         workspace_root.as_deref(),
     )?;
+
+    if !include_data_url {
+        for row in &mut rows {
+            let preview_path = row.preview_path.clone().unwrap_or_default().trim().to_string();
+            if preview_path.is_empty() {
+                continue;
+            }
+            let mapped = ensure_webview_accessible_preview_path(app_handle, Path::new(&preview_path));
+            row.preview_path = Some(mapped.to_string_lossy().to_string());
+        }
+    }
 
     if settings.keep_local_cache_copy.unwrap_or(false) {
         let local_cache_dir = preview_cache_dir_path(app_handle);
@@ -5249,7 +5296,11 @@ async fn get_existing_cached_preview_paths(
 
             out.push(CachedPreviewPathRow {
                 path,
-                preview_path: preview_match.map(|p| p.to_string_lossy().to_string()),
+                preview_path: preview_match.map(|p| {
+                    ensure_webview_accessible_preview_path(&app_handle, &p)
+                        .to_string_lossy()
+                        .to_string()
+                }),
             });
         }
 
