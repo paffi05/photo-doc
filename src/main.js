@@ -399,7 +399,7 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "1.0.0";
+let systemAppVersion = "1.0.1";
 let systemUpdateBusy = false;
 let systemUpdateCheckedAtMs = null;
 let systemUpdateAvailable = false;
@@ -1359,7 +1359,7 @@ function setSystemUpdateUi({
     systemUpdateBtn.setAttribute("title", busy ? "Searching..." : "Search for updates");
   }
   if (systemUpdateSpinner) systemUpdateSpinner.hidden = !busy;
-  const safeVersion = String(version || "1.0.0").trim() || "1.0.0";
+  const safeVersion = String(version || "1.0.1").trim() || "1.0.1";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
