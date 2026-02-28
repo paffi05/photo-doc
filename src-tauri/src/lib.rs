@@ -37,6 +37,7 @@ struct Settings {
     cache_size_gb: Option<u8>,
     keep_local_cache_copy: Option<bool>,
     preview_performance_mode: Option<String>,
+    background_preview_creation: Option<bool>,
 }
 
 fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -53,11 +54,21 @@ fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
 fn read_settings(app_handle: &tauri::AppHandle) -> Result<Settings, String> {
     let path = get_settings_path(app_handle);
     if !path.exists() {
-        return Ok(Settings::default());
+        let mut settings = Settings::default();
+        settings.preview_performance_mode = Some(PREVIEW_PERF_AUTO.to_string());
+        return Ok(settings);
     }
 
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    serde_json::from_str(&content).map_err(|e| e.to_string())
+    let mut settings: Settings = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let normalized_mode = normalize_preview_performance_mode(
+        settings
+            .preview_performance_mode
+            .as_deref()
+            .unwrap_or(PREVIEW_PERF_AUTO),
+    );
+    settings.preview_performance_mode = Some(normalized_mode);
+    Ok(settings)
 }
 
 fn write_settings(app_handle: &tauri::AppHandle, settings: &Settings) -> Result<(), String> {
@@ -158,6 +169,35 @@ fn open_db(app_handle: &tauri::AppHandle) -> Result<Connection, String> {
         );
         CREATE INDEX IF NOT EXISTS idx_treatment_workspace_patient_date
             ON patient_treatment_index(workspace_dir, patient_folder, folder_date, folder_name);
+        CREATE TABLE IF NOT EXISTS patient_file_index (
+            workspace_dir TEXT NOT NULL,
+            patient_folder TEXT NOT NULL,
+            treatment_folder TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            created_ms INTEGER NOT NULL,
+            modified_ms INTEGER NOT NULL,
+            is_image INTEGER NOT NULL,
+            PRIMARY KEY (workspace_dir, patient_folder, treatment_folder, file_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_file_workspace_patient_folder
+            ON patient_file_index(workspace_dir, patient_folder, treatment_folder, file_name);
+        CREATE INDEX IF NOT EXISTS idx_file_workspace_patient_image
+            ON patient_file_index(workspace_dir, patient_folder, is_image, treatment_folder, file_name);
+        CREATE TABLE IF NOT EXISTS patient_scan_state (
+            workspace_dir TEXT NOT NULL,
+            patient_folder TEXT NOT NULL,
+            signature TEXT NOT NULL,
+            PRIMARY KEY (workspace_dir, patient_folder)
+        );
+        CREATE TABLE IF NOT EXISTS workspace_invalid_item_index (
+            workspace_dir TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            is_folder INTEGER NOT NULL,
+            PRIMARY KEY (workspace_dir, item_name)
+        );
+        CREATE INDEX IF NOT EXISTS idx_invalid_workspace_item
+            ON workspace_invalid_item_index(workspace_dir, is_folder, item_name);
         ",
     )
     .map_err(|e| e.to_string())?;
@@ -489,6 +529,7 @@ static WORKSPACE_REINDEX_STATUS: OnceLock<Mutex<WorkspaceReindexStatus>> = OnceL
 static PREVIEW_DEBUG_COUNTS_CACHE: OnceLock<Mutex<HashMap<String, PreviewDebugCountsCacheEntry>>> =
     OnceLock::new();
 static HEAVY_IO_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
+static WORKSPACE_CHANGE_CRAWL_RUNNING: AtomicBool = AtomicBool::new(false);
 
 const PREVIEW_CACHE_DIM: u32 = 200;
 const PREVIEW_CACHE_QUALITY: u8 = 52;
@@ -503,6 +544,7 @@ const PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS: u64 = 15_000;
 const PREVIEW_PERF_GENTLE: &str = "gentle";
 const PREVIEW_PERF_AUTO: &str = "auto";
 const PREVIEW_PERF_FAST: &str = "fast";
+const PREVIEW_CACHE_MAX_BYTES_FIXED: u64 = 10 * 1024 * 1024 * 1024;
 
 fn normalize_preview_performance_mode(raw: &str) -> String {
     let mode = raw.trim().to_ascii_lowercase();
@@ -674,6 +716,249 @@ fn ensure_treatment_index_row(
         params![workspace_dir, patient_folder, folder_name, folder_date, treatment_name],
     )
     .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn file_time_ms_from_meta(meta: &fs::Metadata) -> (u64, u64) {
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let created_ms = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(modified_ms);
+    (created_ms, modified_ms)
+}
+
+fn compute_patient_scan_signature(patient_path: &Path) -> u64 {
+    let mut parts: Vec<(u8, String, u64, u64)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(patient_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let (_, modified_ms) = file_time_ms_from_meta(&meta);
+            let size = if file_type.is_file() { meta.len() } else { 0 };
+            let kind = if file_type.is_dir() { 1 } else { 0 };
+            parts.push((kind, name, size, modified_ms));
+        }
+    }
+    parts.sort_by(|a, b| {
+        a.1.to_lowercase()
+            .cmp(&b.1.to_lowercase())
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (kind, name, size, modified_ms) in parts {
+        kind.hash(&mut hasher);
+        name.to_lowercase().hash(&mut hasher);
+        size.hash(&mut hasher);
+        modified_ms.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn index_single_file_row(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_dir: &str,
+    patient_folder: &str,
+    treatment_folder: &str,
+    file_name: &str,
+    file_path: &Path,
+) -> Result<(), String> {
+    let meta = fs::metadata(file_path).map_err(|e| e.to_string())?;
+    let (created_ms, modified_ms) = file_time_ms_from_meta(&meta);
+    let is_image = if is_supported_preview_image(file_path) { 1_i64 } else { 0_i64 };
+    tx.execute(
+        "INSERT INTO patient_file_index (
+            workspace_dir, patient_folder, treatment_folder, file_name, size_bytes, created_ms, modified_ms, is_image
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            workspace_dir,
+            patient_folder,
+            treatment_folder,
+            file_name,
+            meta.len() as i64,
+            created_ms as i64,
+            modified_ms as i64,
+            is_image
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn reindex_single_patient_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_dir: &str,
+    patient_folder: &str,
+    patient_path: &Path,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM patient_treatment_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_dir, patient_folder],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_file_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_dir, patient_folder],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let (last_name, first_name) = split_patient_name(patient_folder);
+    let metadata = read_patient_metadata(&patient_path.to_path_buf());
+    let metadata_value = read_patient_metadata_value(&patient_path.to_path_buf());
+    let mut patient_id = String::new();
+    let mut metadata_tokens = Vec::new();
+    if let Some(meta) = metadata {
+        patient_id = meta.id.trim().to_string();
+        if !patient_id.is_empty() {
+            metadata_tokens.push(patient_id.to_lowercase());
+        }
+        metadata_tokens.extend(meta.keywords.into_iter().map(|s| s.to_lowercase()));
+        metadata_tokens.extend(meta.searchterms.into_iter().map(|s| s.to_lowercase()));
+    }
+    if let Some(value) = metadata_value {
+        if patient_id.is_empty() {
+            patient_id = metadata_id_from_value(&value);
+        }
+        collect_metadata_tokens(&value, &mut metadata_tokens);
+    }
+    let metadata_text = metadata_tokens.join(" ");
+    let search_text = build_search_text(&last_name, &first_name, &metadata_text);
+    tx.execute(
+        "INSERT INTO patient_index (workspace_dir, folder_name, last_name, first_name, patient_id, search_text)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(workspace_dir, folder_name) DO UPDATE SET
+           last_name = excluded.last_name,
+           first_name = excluded.first_name,
+           patient_id = excluded.patient_id,
+           search_text = excluded.search_text",
+        params![
+            workspace_dir,
+            patient_folder,
+            last_name,
+            first_name,
+            patient_id,
+            search_text
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut treatment_dirs: Vec<(String, PathBuf, String, String)> = Vec::new();
+    for child in fs::read_dir(patient_path).map_err(|e| e.to_string())? {
+        let child = child.map_err(|e| e.to_string())?;
+        let child_name = child.file_name().to_string_lossy().into_owned();
+        if child_name.trim().is_empty() {
+            continue;
+        }
+        let child_path = child.path();
+        let child_type = child.file_type().map_err(|e| e.to_string())?;
+        if child_type.is_dir() {
+            if let Some((folder_date, treatment_name)) = parse_treatment_folder_components(&child_name) {
+                tx.execute(
+                    "INSERT INTO patient_treatment_index (workspace_dir, patient_folder, folder_name, folder_date, treatment_name)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(workspace_dir, patient_folder, folder_name) DO UPDATE SET
+                       folder_date = excluded.folder_date,
+                       treatment_name = excluded.treatment_name",
+                    params![workspace_dir, patient_folder, child_name, folder_date, treatment_name],
+                )
+                .map_err(|e| e.to_string())?;
+                treatment_dirs.push((child_name, child_path, folder_date, treatment_name));
+            }
+            continue;
+        }
+        if child_type.is_file() {
+            index_single_file_row(tx, workspace_dir, patient_folder, "", &child_name, &child_path)?;
+        }
+    }
+
+    for (treatment_folder, treatment_path, _, _) in treatment_dirs {
+        for entry in fs::read_dir(&treatment_path).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let file_type = entry.file_type().map_err(|e| e.to_string())?;
+            if !file_type.is_file() {
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.trim().is_empty() {
+                continue;
+            }
+            let path = entry.path();
+            index_single_file_row(
+                tx,
+                workspace_dir,
+                patient_folder,
+                &treatment_folder,
+                &file_name,
+                &path,
+            )?;
+        }
+    }
+
+    let signature = compute_patient_scan_signature(patient_path);
+    tx.execute(
+        "INSERT INTO patient_scan_state (workspace_dir, patient_folder, signature)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(workspace_dir, patient_folder) DO UPDATE SET
+           signature = excluded.signature",
+        params![workspace_dir, patient_folder, signature.to_string()],
+    )
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn refresh_invalid_workspace_items_in_tx(
+    tx: &rusqlite::Transaction<'_>,
+    workspace_dir: &str,
+    workspace: &Path,
+) -> Result<(), String> {
+    tx.execute(
+        "DELETE FROM workspace_invalid_item_index WHERE workspace_dir = ?1",
+        params![workspace_dir],
+    )
+    .map_err(|e| e.to_string())?;
+
+    if !workspace.exists() || !workspace.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(workspace).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        let item_name = entry.file_name().to_string_lossy().into_owned();
+        if item_name.starts_with('.') {
+            continue;
+        }
+        if file_type.is_dir() && is_valid_patient_folder_name(&item_name) {
+            continue;
+        }
+        let is_folder = if file_type.is_dir() { 1_i64 } else { 0_i64 };
+        tx.execute(
+            "INSERT INTO workspace_invalid_item_index (workspace_dir, item_name, is_folder)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(workspace_dir, item_name) DO UPDATE SET
+               is_folder = excluded.is_folder",
+            params![workspace_dir, item_name, is_folder],
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
 }
@@ -1435,23 +1720,6 @@ fn compute_preview_cache_used_bytes(cache_dir: &Path) -> u64 {
     used_bytes
 }
 
-fn compute_preview_cache_image_count(cache_dir: &Path) -> u64 {
-    let mut image_count = 0_u64;
-    if let Ok(entries) = fs::read_dir(cache_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let is_preview_jpg = is_cache_preview_jpeg(&path);
-            if is_preview_jpg {
-                image_count = image_count.saturating_add(1);
-            }
-        }
-    }
-    image_count
-}
-
 fn resolve_existing_cache_file_path(cache_dir: &Path, path_buf: &Path, file_size: u64, modified_ms: u64) -> PathBuf {
     let key = build_preview_cache_key(path_buf, file_size, modified_ms);
     let cache_file_path = cache_dir.join(format!("{key}.jpg"));
@@ -1616,9 +1884,7 @@ fn run_preview_cache_cleanup(app_handle: &tauri::AppHandle) {
         return;
     };
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let settings = read_settings(app_handle).unwrap_or_default();
-    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
-    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
     let mut index = load_preview_cache_index(&cache_dir);
     cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
     index.entries.retain(|_, entry| {
@@ -1749,9 +2015,7 @@ fn run_preview_cache_cleanup_for_workspace(app_handle: &tauri::AppHandle, worksp
         return;
     };
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let settings = read_settings(app_handle).unwrap_or_default();
-    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
-    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
     cleanup_preview_cache_for_workspace_dir(app_handle, &cache_dir, workspace, max_cache_bytes);
 }
 
@@ -1865,6 +2129,119 @@ fn schedule_local_preview_mirror_to_workspace_main(
     });
 }
 
+fn parse_workspace_file_index_key(
+    workspace_root: &Path,
+    source_path: &Path,
+) -> Option<(String, String, String)> {
+    let relative = source_path.strip_prefix(workspace_root).ok()?;
+    let mut comps = relative.components();
+    let patient_folder = comps.next()?.as_os_str().to_string_lossy().to_string();
+    let second = comps.next()?.as_os_str().to_string_lossy().to_string();
+    let third = comps.next().map(|c| c.as_os_str().to_string_lossy().to_string());
+    if comps.next().is_some() {
+        return None;
+    }
+    if patient_folder.trim().is_empty() || second.trim().is_empty() {
+        return None;
+    }
+    match third {
+        Some(file_name) => {
+            if file_name.trim().is_empty() {
+                None
+            } else {
+                Some((patient_folder, second, file_name))
+            }
+        }
+        None => Some((patient_folder, String::new(), second)),
+    }
+}
+
+fn build_source_meta_map_for_paths(
+    app_handle: &tauri::AppHandle,
+    paths: &[String],
+) -> (HashMap<String, (u64, u64)>, Option<PathBuf>) {
+    let settings = read_settings(app_handle).unwrap_or_default();
+    let workspace_root = settings.workspace_dir.and_then(|raw| {
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    });
+
+    let mut source_meta: HashMap<String, (u64, u64)> = HashMap::new();
+    let workspace_dir = workspace_root
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let conn = if workspace_root.is_some() {
+        open_db(app_handle).ok()
+    } else {
+        None
+    };
+    let mut stmt = conn.as_ref().and_then(|db| {
+        db.prepare(
+            "SELECT size_bytes, modified_ms
+             FROM patient_file_index
+             WHERE workspace_dir = ?1
+               AND patient_folder = ?2
+               AND treatment_folder = ?3
+               AND file_name = ?4
+             LIMIT 1",
+        )
+        .ok()
+    });
+
+    for raw_path in paths {
+        let path = raw_path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let path_buf = PathBuf::from(path);
+        let mut is_workspace_path = false;
+        if let (Some(workspace), Some(db_stmt)) = (workspace_root.as_ref(), stmt.as_mut()) {
+            if path_buf.starts_with(workspace) {
+                is_workspace_path = true;
+                if let Some((patient_folder, treatment_folder, file_name)) =
+                    parse_workspace_file_index_key(workspace, &path_buf)
+                {
+                    let row = db_stmt.query_row(
+                        params![
+                            workspace_dir,
+                            patient_folder,
+                            treatment_folder,
+                            file_name
+                        ],
+                        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                    );
+                    if let Ok((size_bytes, modified_ms)) = row {
+                        source_meta.insert(
+                            path.to_string(),
+                            (size_bytes.max(0) as u64, modified_ms.max(0) as u64),
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        if is_workspace_path {
+            continue;
+        }
+        if let Ok(meta) = fs::metadata(&path_buf) {
+            let modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            source_meta.insert(path.to_string(), (meta.len(), modified_ms));
+        }
+    }
+
+    (source_meta, workspace_root)
+}
+
 fn resolve_cached_previews(
     app_handle: &tauri::AppHandle,
     paths: &[String],
@@ -1873,14 +2250,14 @@ fn resolve_cached_previews(
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
     let settings = read_settings(app_handle).unwrap_or_default();
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
-    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
     let preview_perf_mode = normalize_preview_performance_mode(
         settings
             .preview_performance_mode
             .as_deref()
             .unwrap_or(PREVIEW_PERF_AUTO),
     );
+    let (source_meta_map, workspace_root) = build_source_meta_map_for_paths(app_handle, paths);
     let rows = resolve_cached_previews_in_cache_dir(
         paths,
         include_data_url,
@@ -1888,6 +2265,8 @@ fn resolve_cached_previews(
         &cache_dir,
         max_cache_bytes,
         &preview_perf_mode,
+        Some(&source_meta_map),
+        workspace_root.as_deref(),
     )?;
 
     if settings.keep_local_cache_copy.unwrap_or(false) {
@@ -1923,6 +2302,8 @@ fn resolve_cached_previews_in_cache_dir(
     cache_dir: &Path,
     max_cache_bytes: u64,
     preview_perf_mode: &str,
+    source_meta_map: Option<&HashMap<String, (u64, u64)>>,
+    workspace_root: Option<&Path>,
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
     fs::create_dir_all(cache_dir).map_err(|e| e.to_string())?;
     let mut index = load_preview_cache_index(cache_dir);
@@ -1973,9 +2354,26 @@ fn resolve_cached_previews_in_cache_dir(
             Err(_) => "other".to_string(),
         };
 
-        let file_meta = match fs::metadata(&path_buf) {
-            Ok(meta) => meta,
-            Err(_) => {
+        let source_meta = source_meta_map
+            .and_then(|map| map.get(&path).copied())
+            .or_else(|| {
+                let should_avoid_workspace_fs = workspace_root
+                    .map(|workspace| path_buf.starts_with(workspace))
+                    .unwrap_or(false);
+                if should_avoid_workspace_fs {
+                    return None;
+                }
+                fs::metadata(&path_buf).ok().map(|meta| {
+                    let modified_ms = meta
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    (meta.len(), modified_ms)
+                })
+            });
+        let Some((file_size, modified_ms)) = source_meta else {
                 rows.push(RowState::Ready(CachedImagePreviewRow {
                     path,
                     kind,
@@ -1983,15 +2381,7 @@ fn resolve_cached_previews_in_cache_dir(
                     data_url: None,
                 }));
                 continue;
-            }
         };
-        let file_size = file_meta.len();
-        let modified_ms = file_meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
         let cache_key = build_preview_cache_key(&path_buf, file_size, modified_ms);
         let file_name = format!("{cache_key}.jpg");
         let cache_file_path = cache_dir.join(&file_name);
@@ -2668,6 +3058,12 @@ fn clear_workspace(app_handle: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     conn.execute("DELETE FROM patient_treatment_index", [])
         .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM patient_file_index", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM patient_scan_state", [])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM workspace_invalid_item_index", [])
+        .map_err(|e| e.to_string())?;
 
     Ok(())
 }
@@ -2889,37 +3285,6 @@ fn non_conflicting_file_path(destination_root: &Path, file_name: &str) -> PathBu
     }
 }
 
-fn treatment_file_row_from_entry(entry: fs::DirEntry) -> Result<Option<TreatmentFileRow>, String> {
-    let file_type = entry.file_type().map_err(|e| e.to_string())?;
-    if !file_type.is_file() {
-        return Ok(None);
-    }
-
-    let path_buf = entry.path();
-    let metadata = entry.metadata().map_err(|e| e.to_string())?;
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let created_ms = metadata
-        .created()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(modified_ms);
-
-    Ok(Some(TreatmentFileRow {
-        path: path_buf.to_string_lossy().to_string(),
-        name: entry.file_name().to_string_lossy().to_string(),
-        size: metadata.len(),
-        created_ms,
-        modified_ms,
-        is_image: is_supported_preview_image(&path_buf),
-    }))
-}
-
 #[tauri::command]
 fn copy_treatment_folder_to_destination(
     workspace_dir: String,
@@ -3019,6 +3384,7 @@ fn copy_patient_folder_to_destination(
 
 #[tauri::command]
 fn list_treatment_files(
+    app_handle: tauri::AppHandle,
     workspace_dir: String,
     patient_folder: String,
     treatment_folder: String,
@@ -3027,6 +3393,7 @@ fn list_treatment_files(
     let mut out = Vec::new();
     loop {
         let page = list_treatment_files_page(
+            app_handle.clone(),
             workspace_dir.clone(),
             patient_folder.clone(),
             treatment_folder.clone(),
@@ -3045,16 +3412,15 @@ fn list_treatment_files(
 
 #[tauri::command]
 fn list_treatment_files_page(
+    app_handle: tauri::AppHandle,
     workspace_dir: String,
     patient_folder: String,
     treatment_folder: String,
     offset: usize,
     limit: usize,
 ) -> Result<TreatmentFilePageRow, String> {
-    let workspace = PathBuf::from(workspace_dir.trim());
-    if !workspace.exists() || !workspace.is_dir() {
-        return Err("workspace directory does not exist".to_string());
-    }
+    let workspace_dir = workspace_dir.trim().to_string();
+    let workspace = PathBuf::from(&workspace_dir);
 
     let patient_folder = patient_folder.trim();
     if patient_folder.is_empty() {
@@ -3065,32 +3431,54 @@ fn list_treatment_files_page(
         return Err("treatment folder is required".to_string());
     }
 
-    let treatment_path = workspace.join(patient_folder).join(treatment_folder);
-    if !treatment_path.exists() || !treatment_path.is_dir() {
-        return Err("treatment folder does not exist".to_string());
-    }
-
     let page_size = limit.clamp(1, 500);
-    let mut scanned_count = 0usize;
-    let mut out = Vec::with_capacity(page_size.saturating_add(1));
-    for entry in fs::read_dir(&treatment_path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        if !file_type.is_file() {
-            continue;
-        }
-        scanned_count = scanned_count.saturating_add(1);
-        if scanned_count <= offset {
-            continue;
-        }
-        let row = match treatment_file_row_from_entry(entry)? {
-            Some(v) => v,
-            None => continue,
-        };
-        out.push(row);
-        if out.len() > page_size {
-            break;
-        }
+    let fetch_limit = page_size.saturating_add(1);
+    let conn = open_db(&app_handle)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_name, size_bytes, created_ms, modified_ms, is_image
+             FROM patient_file_index
+             WHERE workspace_dir = ?1 AND patient_folder = ?2 AND treatment_folder = ?3
+             ORDER BY file_name COLLATE NOCASE
+             LIMIT ?4 OFFSET ?5",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(
+            params![
+                workspace_dir,
+                patient_folder,
+                treatment_folder,
+                fetch_limit as i64,
+                offset as i64
+            ],
+            |row| {
+                let file_name: String = row.get(0)?;
+                let size_bytes: i64 = row.get(1)?;
+                let created_ms: i64 = row.get(2)?;
+                let modified_ms: i64 = row.get(3)?;
+                let is_image: i64 = row.get(4)?;
+                Ok((file_name, size_bytes, created_ms, modified_ms, is_image))
+            },
+        )
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::with_capacity(fetch_limit);
+    for row in rows {
+        let (file_name, size_bytes, created_ms, modified_ms, is_image) =
+            row.map_err(|e| e.to_string())?;
+        let path = workspace
+            .join(patient_folder)
+            .join(treatment_folder)
+            .join(&file_name);
+        out.push(TreatmentFileRow {
+            path: path.to_string_lossy().to_string(),
+            name: file_name,
+            size: size_bytes.max(0) as u64,
+            created_ms: created_ms.max(0) as u64,
+            modified_ms: modified_ms.max(0) as u64,
+            is_image: is_image != 0,
+        });
     }
     let has_more = out.len() > page_size;
     if has_more {
@@ -3115,19 +3503,12 @@ fn list_patient_overview(
     workspace_dir: String,
     patient_folder: String,
 ) -> Result<PatientOverviewRow, String> {
-    let workspace = PathBuf::from(workspace_dir.trim());
-    if !workspace.exists() || !workspace.is_dir() {
-        return Err("workspace directory does not exist".to_string());
-    }
+    let workspace_dir = workspace_dir.trim().to_string();
+    let workspace = PathBuf::from(&workspace_dir);
 
     let patient_folder = patient_folder.trim();
     if patient_folder.is_empty() {
         return Err("patient folder is required".to_string());
-    }
-
-    let patient_path = workspace.join(patient_folder);
-    if !patient_path.exists() || !patient_path.is_dir() {
-        return Err("patient folder does not exist".to_string());
     }
 
     let conn = open_db(&app_handle)?;
@@ -3143,7 +3524,7 @@ fn list_patient_overview(
             .map_err(|e| e.to_string())?;
 
         let mapped = stmt
-            .query_map(params![workspace_dir, patient_folder], |row| {
+            .query_map(params![workspace_dir.as_str(), patient_folder], |row| {
                 Ok(PatientFolderOverviewRow {
                     folder_name: row.get::<_, String>(0)?,
                     folder_date: row.get::<_, String>(1)?,
@@ -3158,43 +3539,77 @@ fn list_patient_overview(
         }
     }
 
-    for folder in &mut folder_rows {
-        let folder_name = folder.folder_name.trim().to_string();
-        if folder_name.is_empty() {
-            continue;
-        }
-        let folder_path = patient_path.join(&folder_name);
-        if !folder_path.exists() || !folder_path.is_dir() {
-            continue;
-        }
-        let mut image_paths: Vec<String> = Vec::new();
-        for entry in fs::read_dir(&folder_path).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
-            let file_type = entry.file_type().map_err(|e| e.to_string())?;
-            if !file_type.is_file() {
+    {
+        let mut image_stmt = conn
+            .prepare(
+                "SELECT file_name
+                 FROM patient_file_index
+                 WHERE workspace_dir = ?1
+                   AND patient_folder = ?2
+                   AND treatment_folder = ?3
+                   AND is_image = 1
+                 ORDER BY file_name COLLATE NOCASE
+                 LIMIT 3",
+            )
+            .map_err(|e| e.to_string())?;
+        for folder in &mut folder_rows {
+            let folder_name = folder.folder_name.trim().to_string();
+            if folder_name.is_empty() {
                 continue;
             }
-            let path_buf = entry.path();
-            if !is_supported_preview_image(&path_buf) {
-                continue;
+            let rows = image_stmt
+                .query_map(params![workspace_dir.as_str(), patient_folder, folder_name], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|e| e.to_string())?;
+            let mut preview_paths = Vec::new();
+            for file_name in rows.flatten() {
+                let path = workspace
+                    .join(patient_folder)
+                    .join(&folder_name)
+                    .join(file_name);
+                preview_paths.push(path.to_string_lossy().to_string());
             }
-            image_paths.push(path_buf.to_string_lossy().to_string());
+            folder.preview_paths = preview_paths;
         }
-        image_paths.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-        folder.preview_paths = image_paths.into_iter().take(3).collect();
     }
 
+    let mut root_stmt = conn
+        .prepare(
+            "SELECT file_name, size_bytes, created_ms, modified_ms, is_image
+             FROM patient_file_index
+             WHERE workspace_dir = ?1 AND patient_folder = ?2 AND treatment_folder = ''
+             ORDER BY file_name COLLATE NOCASE",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = root_stmt
+        .query_map(params![workspace_dir.as_str(), patient_folder], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
     let mut root_files: Vec<TreatmentFileRow> = Vec::new();
-    for entry in fs::read_dir(&patient_path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        if let Some(row) = treatment_file_row_from_entry(entry)? {
-            if row.name == ".mpm-metadata.json" {
-                continue;
-            }
-            root_files.push(row);
+    for row in rows {
+        let (file_name, size_bytes, created_ms, modified_ms, is_image) =
+            row.map_err(|e| e.to_string())?;
+        if file_name == ".mpm-metadata.json" {
+            continue;
         }
+        let path = workspace.join(patient_folder).join(&file_name);
+        root_files.push(TreatmentFileRow {
+            path: path.to_string_lossy().to_string(),
+            name: file_name,
+            size: size_bytes.max(0) as u64,
+            created_ms: created_ms.max(0) as u64,
+            modified_ms: modified_ms.max(0) as u64,
+            is_image: is_image != 0,
+        });
     }
-    root_files.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
     Ok(PatientOverviewRow {
         treatment_folders: folder_rows,
@@ -3210,109 +3625,60 @@ fn list_patient_image_paths_page(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> Result<PatientImagePathsPageRow, String> {
-    let workspace = PathBuf::from(workspace_dir.trim());
-    if !workspace.exists() || !workspace.is_dir() {
-        return Err("workspace directory does not exist".to_string());
-    }
+    let workspace_dir = workspace_dir.trim().to_string();
+    let workspace = PathBuf::from(&workspace_dir);
 
     let patient_folder = patient_folder.trim();
     if patient_folder.is_empty() {
         return Err("patient folder is required".to_string());
     }
 
-    let patient_path = workspace.join(patient_folder);
-    if !patient_path.exists() || !patient_path.is_dir() {
-        return Err("patient folder does not exist".to_string());
-    }
-
     let offset = offset.unwrap_or(0);
     let limit = limit.unwrap_or(5000).clamp(1, 5000);
-    let target_count = offset.saturating_add(limit).saturating_add(1);
-
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut folder_names: Vec<String> = Vec::new();
-    let mut folder_seen: HashSet<String> = HashSet::new();
-
-    for entry in fs::read_dir(&patient_path).map_err(|e| e.to_string())? {
-        if out.len() >= target_count {
-            break;
-        }
-        let entry = entry.map_err(|e| e.to_string())?;
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        let path_buf = entry.path();
-        if file_type.is_file() {
-            if is_supported_preview_image(&path_buf) {
-                let value = path_buf.to_string_lossy().to_string();
-                if seen.insert(value.clone()) {
-                    out.push(value);
-                }
-            }
-            continue;
-        }
-        if file_type.is_dir() {
-            let folder_name = entry.file_name().to_string_lossy().trim().to_string();
-            if !folder_name.is_empty() && folder_seen.insert(folder_name.clone()) {
-                folder_names.push(folder_name);
-            }
-        }
+    let fetch_limit = limit.saturating_add(1);
+    let conn = open_db(&app_handle)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.treatment_folder, f.file_name
+             FROM patient_file_index f
+             LEFT JOIN patient_treatment_index t
+               ON t.workspace_dir = f.workspace_dir
+              AND t.patient_folder = f.patient_folder
+              AND t.folder_name = f.treatment_folder
+             WHERE f.workspace_dir = ?1
+               AND f.patient_folder = ?2
+               AND f.is_image = 1
+             ORDER BY
+               CASE WHEN f.treatment_folder = '' THEN 0 ELSE 1 END,
+               t.folder_date COLLATE NOCASE,
+               f.treatment_folder COLLATE NOCASE,
+               f.file_name COLLATE NOCASE
+             LIMIT ?3 OFFSET ?4",
+        )
+        .map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map(
+            params![workspace_dir, patient_folder, fetch_limit as i64, offset as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        let (treatment_folder, file_name) = row.map_err(|e| e.to_string())?;
+        let path = if treatment_folder.trim().is_empty() {
+            workspace.join(patient_folder).join(file_name)
+        } else {
+            workspace
+                .join(patient_folder)
+                .join(treatment_folder)
+                .join(file_name)
+        };
+        rows.push(path.to_string_lossy().to_string());
     }
-
-    if let Ok(conn) = open_db(&app_handle) {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT folder_name
-             FROM patient_treatment_index
-             WHERE workspace_dir = ?1 AND patient_folder = ?2
-             ORDER BY folder_date ASC, folder_name ASC",
-        ) {
-            if let Ok(mapped) = stmt.query_map(params![workspace_dir, patient_folder], |row| {
-                row.get::<_, String>(0)
-            }) {
-                for folder_name in mapped.flatten() {
-                    let normalized = folder_name.trim().to_string();
-                    if !normalized.is_empty() && folder_seen.insert(normalized.clone()) {
-                        folder_names.push(normalized);
-                    }
-                }
-            }
-        }
+    let has_more = rows.len() > limit;
+    if has_more {
+        rows.truncate(limit);
     }
-
-    folder_names.sort();
-    for folder_name in folder_names {
-        if out.len() >= target_count {
-            break;
-        }
-        let folder_path = patient_path.join(&folder_name);
-        if !folder_path.exists() || !folder_path.is_dir() {
-            continue;
-        }
-        for entry in fs::read_dir(&folder_path).map_err(|e| e.to_string())? {
-            if out.len() >= target_count {
-                break;
-            }
-            let entry = entry.map_err(|e| e.to_string())?;
-            let file_type = entry.file_type().map_err(|e| e.to_string())?;
-            if !file_type.is_file() {
-                continue;
-            }
-            let path_buf = entry.path();
-            if !is_supported_preview_image(&path_buf) {
-                continue;
-            }
-            let value = path_buf.to_string_lossy().to_string();
-            if seen.insert(value.clone()) {
-                out.push(value);
-            }
-        }
-    }
-
-    let has_more = out.len() > offset.saturating_add(limit);
-    let rows = if offset >= out.len() {
-        Vec::new()
-    } else {
-        out.into_iter().skip(offset).take(limit).collect()
-    };
 
     Ok(PatientImagePathsPageRow { rows, has_more })
 }
@@ -3728,52 +4094,6 @@ where
     let total = patient_dirs.len() as u64;
     on_progress(0, total);
 
-    let mut folders: Vec<(String, String, String, String, String)> = Vec::new();
-    let mut treatment_rows: Vec<(String, String, String, String)> = Vec::new();
-
-    for (index, (folder_name, patient_path)) in patient_dirs.into_iter().enumerate() {
-        let (last_name, first_name) = split_patient_name(&folder_name);
-        let metadata = read_patient_metadata(&patient_path);
-        let metadata_value = read_patient_metadata_value(&patient_path);
-        let mut patient_id = String::new();
-        let mut metadata_tokens = Vec::new();
-        if let Some(meta) = metadata {
-            patient_id = meta.id.trim().to_string();
-            if !patient_id.is_empty() {
-                metadata_tokens.push(patient_id.to_lowercase());
-            }
-            metadata_tokens.extend(meta.keywords.into_iter().map(|s| s.to_lowercase()));
-            metadata_tokens.extend(meta.searchterms.into_iter().map(|s| s.to_lowercase()));
-        }
-        if let Some(value) = metadata_value {
-            if patient_id.is_empty() {
-                patient_id = metadata_id_from_value(&value);
-            }
-            collect_metadata_tokens(&value, &mut metadata_tokens);
-        }
-        let metadata_text = metadata_tokens.join(" ");
-        folders.push((folder_name.clone(), last_name, first_name, patient_id, metadata_text));
-
-        for child in fs::read_dir(&patient_path).map_err(|e| e.to_string())? {
-            let child = child.map_err(|e| e.to_string())?;
-            let child_type = child.file_type().map_err(|e| e.to_string())?;
-            if !child_type.is_dir() {
-                continue;
-            }
-            let child_name = child.file_name().to_string_lossy().into_owned();
-            if let Some((folder_date, treatment_name)) = parse_treatment_folder_components(&child_name) {
-                treatment_rows.push((folder_name.clone(), child_name, folder_date, treatment_name));
-            }
-        }
-
-        let completed = (index + 1) as u64;
-        on_progress(completed, total);
-    }
-
-    folders.sort_by_key(|(_, last_name, first_name, _, _)| {
-        (last_name.to_lowercase(), first_name.to_lowercase())
-    });
-
     let workspace_dir = workspace.to_string_lossy().to_string();
     let mut conn = open_db(app_handle)?;
     let tx = conn.transaction().map_err(|e| e.to_string())?;
@@ -3787,41 +4107,27 @@ where
         params![workspace_dir.clone()],
     )
     .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_file_index WHERE workspace_dir = ?1",
+        params![workspace_dir.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_scan_state WHERE workspace_dir = ?1",
+        params![workspace_dir.clone()],
+    )
+    .map_err(|e| e.to_string())?;
 
-    for (folder_name, last_name, first_name, patient_id, metadata_text) in &folders {
-        let search_text = build_search_text(last_name, first_name, metadata_text);
-        tx.execute(
-            "INSERT INTO patient_index (workspace_dir, folder_name, last_name, first_name, patient_id, search_text)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                workspace_dir.clone(),
-                folder_name,
-                last_name,
-                first_name,
-                patient_id,
-                search_text
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+    let mut indexed_count = 0usize;
+    for (index, (folder_name, patient_path)) in patient_dirs.into_iter().enumerate() {
+        reindex_single_patient_in_tx(&tx, &workspace_dir, &folder_name, &patient_path)?;
+        indexed_count = indexed_count.saturating_add(1);
+        on_progress((index + 1) as u64, total);
     }
-
-    for (patient_folder, folder_name, folder_date, treatment_name) in &treatment_rows {
-        tx.execute(
-            "INSERT INTO patient_treatment_index (workspace_dir, patient_folder, folder_name, folder_date, treatment_name)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                workspace_dir.clone(),
-                patient_folder,
-                folder_name,
-                folder_date,
-                treatment_name
-            ],
-        )
-        .map_err(|e| e.to_string())?;
-    }
+    refresh_invalid_workspace_items_in_tx(&tx, &workspace_dir, workspace)?;
 
     tx.commit().map_err(|e| e.to_string())?;
-    Ok(folders.len())
+    Ok(indexed_count)
 }
 
 #[tauri::command]
@@ -3936,6 +4242,148 @@ async fn start_workspace_reindex(
     Ok(true)
 }
 
+fn crawl_workspace_changes_batch_internal(
+    app_handle: &tauri::AppHandle,
+    workspace: &Path,
+    max_patients: usize,
+) -> Result<u64, String> {
+    if !workspace.exists() || !workspace.is_dir() {
+        return Ok(0);
+    }
+
+    let workspace_dir = workspace.to_string_lossy().to_string();
+    let mut patient_dirs: Vec<(String, PathBuf)> = Vec::new();
+    let mut patient_set: HashSet<String> = HashSet::new();
+    for entry in fs::read_dir(workspace).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let file_type = entry.file_type().map_err(|e| e.to_string())?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let folder_name = entry.file_name().to_string_lossy().to_string();
+        if folder_name.starts_with('.') || !is_valid_patient_folder_name(&folder_name) {
+            continue;
+        }
+        patient_set.insert(folder_name.clone());
+        patient_dirs.push((folder_name, entry.path()));
+    }
+    patient_dirs.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+
+    let mut conn = open_db(app_handle)?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    let mut existing_patients: Vec<String> = Vec::new();
+    {
+        let mut stmt = tx
+            .prepare("SELECT folder_name FROM patient_index WHERE workspace_dir = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![workspace_dir.clone()], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            existing_patients.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+    for patient_folder in existing_patients {
+        if patient_set.contains(&patient_folder) {
+            continue;
+        }
+        tx.execute(
+            "DELETE FROM patient_index WHERE workspace_dir = ?1 AND folder_name = ?2",
+            params![workspace_dir.clone(), patient_folder.clone()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM patient_treatment_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+            params![workspace_dir.clone(), patient_folder.clone()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM patient_file_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+            params![workspace_dir.clone(), patient_folder.clone()],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "DELETE FROM patient_scan_state WHERE workspace_dir = ?1 AND patient_folder = ?2",
+            params![workspace_dir.clone(), patient_folder],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    let mut known_signatures: HashMap<String, String> = HashMap::new();
+    {
+        let mut stmt = tx
+            .prepare(
+                "SELECT patient_folder, signature
+                 FROM patient_scan_state
+                 WHERE workspace_dir = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![workspace_dir.clone()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            let (patient_folder, signature) = row.map_err(|e| e.to_string())?;
+            known_signatures.insert(patient_folder, signature);
+        }
+    }
+
+    let mut refreshed = 0_u64;
+    let batch_size = max_patients.max(1);
+    for (patient_folder, patient_path) in patient_dirs {
+        if refreshed >= batch_size as u64 {
+            break;
+        }
+        let next_signature = compute_patient_scan_signature(&patient_path).to_string();
+        let current_signature = known_signatures.get(&patient_folder).cloned().unwrap_or_default();
+        if next_signature == current_signature {
+            continue;
+        }
+        reindex_single_patient_in_tx(&tx, &workspace_dir, &patient_folder, &patient_path)?;
+        refreshed = refreshed.saturating_add(1);
+    }
+    refresh_invalid_workspace_items_in_tx(&tx, &workspace_dir, workspace)?;
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(refreshed)
+}
+
+#[tauri::command]
+async fn start_workspace_change_crawl(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    max_patients: Option<usize>,
+) -> Result<bool, String> {
+    let workspace_dir = workspace_dir.trim().to_string();
+    if workspace_dir.is_empty() {
+        return Err("workspace directory is required".to_string());
+    }
+    let workspace = PathBuf::from(&workspace_dir);
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+    if WORKSPACE_REINDEX_RUNNING.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+    if WORKSPACE_CHANGE_CRAWL_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    let app_handle_clone = app_handle.clone();
+    let max_patients = max_patients.unwrap_or(12).clamp(1, 80);
+    tauri::async_runtime::spawn_blocking(move || {
+        let _ = crawl_workspace_changes_batch_internal(&app_handle_clone, &workspace, max_patients);
+        WORKSPACE_CHANGE_CRAWL_RUNNING.store(false, Ordering::Relaxed);
+    });
+
+    Ok(true)
+}
+
 #[tauri::command]
 fn search_patients(
     app_handle: tauri::AppHandle,
@@ -4017,18 +4465,24 @@ fn search_patients_page(
 }
 
 #[tauri::command]
-fn get_invalid_patient_folders(workspace_dir: String) -> Result<InvalidPatientFoldersRow, String> {
-    get_invalid_patient_folders_page(workspace_dir, 0, 250)
+fn get_invalid_patient_folders(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<InvalidPatientFoldersRow, String> {
+    get_invalid_patient_folders_page(app_handle, workspace_dir, 0, 250)
 }
 
 #[tauri::command]
 fn get_invalid_patient_folders_page(
+    app_handle: tauri::AppHandle,
     workspace_dir: String,
     offset: usize,
     limit: usize,
 ) -> Result<InvalidPatientFoldersRow, String> {
-    let workspace = PathBuf::from(workspace_dir.trim());
-    if !workspace.exists() || !workspace.is_dir() {
+    let page_size = limit.clamp(1, 500);
+    let conn = open_db(&app_handle)?;
+    let workspace_dir = workspace_dir.trim().to_string();
+    if workspace_dir.is_empty() {
         return Ok(InvalidPatientFoldersRow {
             invalid_count: 0,
             invalid_folders: Vec::new(),
@@ -4037,45 +4491,42 @@ fn get_invalid_patient_folders_page(
         });
     }
 
-    let page_size = limit.clamp(1, 500);
-    let mut seen_count = 0usize;
-    let mut rows: Vec<(bool, String)> = Vec::with_capacity(page_size.saturating_add(1));
-    for entry in fs::read_dir(&workspace).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let file_type = entry.file_type().map_err(|e| e.to_string())?;
-        let folder_name = entry.file_name().to_string_lossy().into_owned();
-        if folder_name.starts_with('.') {
-            continue;
-        }
-        if file_type.is_dir() {
-            if is_valid_patient_folder_name(&folder_name) {
-                continue;
-            }
-            seen_count = seen_count.saturating_add(1);
-            if seen_count <= offset {
-                continue;
-            }
-            rows.push((true, folder_name));
-        } else if file_type.is_file() {
-            seen_count = seen_count.saturating_add(1);
-            if seen_count <= offset {
-                continue;
-            }
-            rows.push((false, folder_name));
-        }
-        if rows.len() > page_size {
-            break;
-        }
+    let invalid_count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM workspace_invalid_item_index
+             WHERE workspace_dir = ?1",
+            params![workspace_dir.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|v| v.max(0) as u64)
+        .unwrap_or(0);
+
+    let fetch_limit = page_size.saturating_add(1);
+    let mut stmt = conn
+        .prepare(
+            "SELECT is_folder, item_name
+             FROM workspace_invalid_item_index
+             WHERE workspace_dir = ?1
+             ORDER BY is_folder DESC, item_name COLLATE NOCASE
+             LIMIT ?2 OFFSET ?3",
+        )
+        .map_err(|e| e.to_string())?;
+    let mapped = stmt
+        .query_map(
+            params![workspace_dir.as_str(), fetch_limit as i64, offset as i64],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| e.to_string())?;
+    let mut rows: Vec<(bool, String)> = Vec::with_capacity(fetch_limit);
+    for row in mapped {
+        rows.push(row.map_err(|e| e.to_string())?);
     }
     let has_more = rows.len() > page_size;
     if has_more {
         rows.truncate(page_size);
     }
-    let invalid_count = if has_more {
-        offset.saturating_add(rows.len()).saturating_add(1) as u64
-    } else {
-        offset.saturating_add(rows.len()) as u64
-    };
+
     let mut shown_folders = Vec::new();
     let mut shown_files = Vec::new();
     for (is_folder, name) in rows {
@@ -4255,8 +4706,7 @@ async fn get_import_wizard_cached_previews(
     let include_data_url = include_data_url.unwrap_or(true);
     let generate_if_missing = generate_if_missing.unwrap_or(true);
     let settings = read_settings(&app_handle).unwrap_or_default();
-    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
-    let max_cache_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
     let preview_perf_mode = normalize_preview_performance_mode(
         settings
             .preview_performance_mode
@@ -4273,6 +4723,8 @@ async fn get_import_wizard_cached_previews(
             &cache_dir,
             max_cache_bytes,
             &preview_perf_mode,
+            None,
+            None,
         )
     })
     .await
@@ -4286,6 +4738,7 @@ async fn get_existing_cached_preview_paths(
 ) -> Result<Vec<CachedPreviewPathRow>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let cache_dir = get_active_preview_cache_dir(&app_handle);
+        let (source_meta_map, workspace_root) = build_source_meta_map_for_paths(&app_handle, &paths);
         let mut out = Vec::with_capacity(paths.len());
 
         for raw_path in paths {
@@ -4303,24 +4756,34 @@ async fn get_existing_cached_preview_paths(
                 continue;
             }
 
-            let file_meta = match fs::metadata(&path_buf) {
-                Ok(meta) => meta,
-                Err(_) => {
+            let source_meta = source_meta_map
+                .get(&path)
+                .copied()
+                .or_else(|| {
+                    let should_avoid_workspace_fs = workspace_root
+                        .as_ref()
+                        .map(|workspace| path_buf.starts_with(workspace))
+                        .unwrap_or(false);
+                    if should_avoid_workspace_fs {
+                        return None;
+                    }
+                    fs::metadata(&path_buf).ok().map(|meta| {
+                        let modified_ms = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        (meta.len(), modified_ms)
+                    })
+                });
+            let Some((file_size, modified_ms)) = source_meta else {
                     out.push(CachedPreviewPathRow {
                         path,
                         preview_path: None,
                     });
                     continue;
-                }
             };
-
-            let file_size = file_meta.len();
-            let modified_ms = file_meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0);
             let cache_file_path =
                 resolve_existing_cache_file_path(&cache_dir, &path_buf, file_size, modified_ms);
 
@@ -4597,6 +5060,27 @@ fn start_import_files(
             let _ = preview_tx.send(batch);
         }
         drop(preview_tx);
+        let workspace_path = PathBuf::from(&workspace_dir_for_preview_sync);
+        let patient_path = workspace_path.join(&patient_folder);
+        if patient_path.exists() && patient_path.is_dir() {
+            let mut conn = match open_db(&app_handle_clone) {
+                Ok(v) => v,
+                Err(_) => {
+                    emit_progress(100.0, true, None);
+                    return;
+                }
+            };
+            let tx_result = conn.transaction();
+            if let Ok(tx) = tx_result {
+                let _ = reindex_single_patient_in_tx(
+                    &tx,
+                    &workspace_dir_for_preview_sync,
+                    &patient_folder,
+                    &patient_path,
+                );
+                let _ = tx.commit();
+            }
+        }
         emit_progress(100.0, true, None);
     });
 
@@ -4614,14 +5098,11 @@ fn load_settings(app_handle: tauri::AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 fn set_cache_size_gb(app_handle: tauri::AppHandle, cache_size_gb: u8) -> Result<u8, String> {
-    if !(1..=10).contains(&cache_size_gb) {
-        return Err("cache_size_gb must be between 1 and 10".to_string());
-    }
-
+    let _ = cache_size_gb;
     let mut settings = read_settings(&app_handle)?;
-    settings.cache_size_gb = Some(cache_size_gb);
+    settings.cache_size_gb = Some(10);
     write_settings(&app_handle, &settings)?;
-    Ok(cache_size_gb)
+    Ok(10)
 }
 
 #[tauri::command]
@@ -4634,6 +5115,17 @@ fn set_preview_performance_mode(
     settings.preview_performance_mode = Some(normalized.clone());
     write_settings(&app_handle, &settings)?;
     Ok(normalized)
+}
+
+#[tauri::command]
+fn set_background_preview_creation(
+    app_handle: tauri::AppHandle,
+    enabled: bool,
+) -> Result<bool, String> {
+    let mut settings = read_settings(&app_handle)?;
+    settings.background_preview_creation = Some(enabled);
+    write_settings(&app_handle, &settings)?;
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -4838,9 +5330,7 @@ fn delete_local_cache_copy_files(
 
 #[tauri::command]
 fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
-    let settings = read_settings(&app_handle).unwrap_or_default();
-    let cache_size_gb = settings.cache_size_gb.unwrap_or(5).clamp(1, 10);
-    let max_bytes = (cache_size_gb as u64) * 1024 * 1024 * 1024;
+    let max_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
     let cache_dir = get_active_preview_cache_dir(&app_handle);
     let used_bytes = if let Ok(_guard) = preview_cache_lock().try_lock() {
         let mut index = load_preview_cache_index(&cache_dir);
@@ -4956,96 +5446,57 @@ fn compute_preview_debug_counts(
 ) -> Result<PreviewDebugCountsRow, String> {
     let workspace = PathBuf::from(workspace_dir.trim());
     let mut db_image_count = 0_u64;
-
-    if workspace.exists() && workspace.is_dir() {
-        let conn = open_db(app_handle)?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT patient_folder, folder_name
-                 FROM patient_treatment_index
-                 WHERE workspace_dir = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let rows = stmt
-            .query_map(params![workspace_dir], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-
-        for row in rows {
-            let (patient_folder, treatment_folder) = row.map_err(|e| e.to_string())?;
-            let treatment_path = workspace.join(patient_folder).join(treatment_folder);
-            if !treatment_path.exists() || !treatment_path.is_dir() {
-                continue;
-            }
-            let entries = match fs::read_dir(&treatment_path) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() || !is_supported_preview_image(&path) {
-                    continue;
-                }
-                db_image_count = db_image_count.saturating_add(1);
-            }
-        }
+    let conn = open_db(app_handle)?;
+    if let Ok(count) = conn.query_row(
+        "SELECT COUNT(*) FROM patient_file_index WHERE workspace_dir = ?1 AND is_image = 1",
+        params![workspace_dir],
+        |row| row.get::<_, i64>(0),
+    ) {
+        db_image_count = count.max(0) as u64;
     }
 
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let cache_image_count = if workspace.exists() && workspace.is_dir() {
-        let conn = open_db(app_handle)?;
-        let mut mapped_count = 0_u64;
-        let mut stmt = conn
-            .prepare(
-                "SELECT patient_folder, folder_name
-                 FROM patient_treatment_index
-                 WHERE workspace_dir = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(params![workspace_dir], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-        for row in rows {
-            let (patient_folder, treatment_folder) = row.map_err(|e| e.to_string())?;
-            let treatment_path = workspace.join(patient_folder).join(treatment_folder);
-            if !treatment_path.exists() || !treatment_path.is_dir() {
-                continue;
-            }
-            let entries = match fs::read_dir(&treatment_path) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() || !is_supported_preview_image(&path) {
-                    continue;
-                }
-                let meta = match fs::metadata(&path) {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let file_size = meta.len();
-                let modified_ms = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                let cache_file_path =
-                    resolve_existing_cache_file_path(&cache_dir, &path, file_size, modified_ms);
-                if cache_file_path.exists() {
-                    mapped_count = mapped_count.saturating_add(1);
-                }
-            }
+    let mut mapped_count = 0_u64;
+    let mut stmt = conn
+        .prepare(
+            "SELECT patient_folder, treatment_folder, file_name, size_bytes, modified_ms
+             FROM patient_file_index
+             WHERE workspace_dir = ?1",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![workspace_dir], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (patient_folder, treatment_folder, file_name, size_bytes, modified_ms) =
+            row.map_err(|e| e.to_string())?;
+        let path = if treatment_folder.trim().is_empty() {
+            workspace.join(patient_folder).join(file_name)
+        } else {
+            workspace.join(patient_folder).join(treatment_folder).join(file_name)
+        };
+        if !is_supported_preview_image(&path) {
+            continue;
         }
-        mapped_count
-    } else {
-        compute_preview_cache_image_count(&cache_dir)
-    };
+        let cache_file_path = resolve_existing_cache_file_path(
+            &cache_dir,
+            &path,
+            size_bytes.max(0) as u64,
+            modified_ms.max(0) as u64,
+        );
+        if cache_file_path.exists() {
+            mapped_count = mapped_count.saturating_add(1);
+        }
+    }
+    let cache_image_count = mapped_count;
 
     Ok(PreviewDebugCountsRow {
         db_image_count,
@@ -5353,6 +5804,7 @@ pub fn run() {
             is_patient_id_taken,
             reindex_patient_folders,
             start_workspace_reindex,
+            start_workspace_change_crawl,
             get_workspace_reindex_status,
             search_patients,
             search_patients_page,
@@ -5368,6 +5820,7 @@ pub fn run() {
             start_import_files,
             set_cache_size_gb,
             set_preview_performance_mode,
+            set_background_preview_creation,
             set_keep_local_cache_copy,
             get_local_cache_copy_status,
             sync_local_cache_copy,

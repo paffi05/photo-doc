@@ -520,13 +520,6 @@ export function createTreatmentFilesPanel({
       const priorityPaths = Array.from(new Set([...stackPreviewPaths, ...rootImagePaths]));
 
       let previewSrcByPath = new Map();
-      try {
-        previewSrcByPath = await loadExistingCachedPreviewDataSrcMap(priorityPaths);
-      } catch {
-        previewSrcByPath = new Map();
-      }
-      if (requestId !== activeRequestId) return;
-
       foldersOverviewWrapEl.hidden = folders.length < 1;
       const renderOverviewCards = () => {
         foldersOverviewGridEl.innerHTML = "";
@@ -535,6 +528,16 @@ export function createTreatmentFilesPanel({
           foldersOverviewGridEl.appendChild(card);
         }
       };
+      // Render immediately so overview cards are visible even if preview lookup is slow.
+      renderOverviewCards();
+
+      try {
+        previewSrcByPath = await loadExistingCachedPreviewDataSrcMap(priorityPaths);
+      } catch {
+        previewSrcByPath = new Map();
+      }
+      if (requestId !== activeRequestId) return;
+
       renderOverviewCards();
 
       for (const path of rootImagePaths) {

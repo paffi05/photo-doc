@@ -13,6 +13,7 @@ import { initMainContent } from "./main-content";
 const onboardingView = document.getElementById("onboardingView");
 const appView = document.getElementById("appView");
 const startupView = document.getElementById("startupView");
+const startupProcessText = document.getElementById("startupProcessText");
 
 const pickBtn = document.getElementById("pickWorkspaceBtn");
 const pickIcon = document.getElementById("pickWorkspaceIcon");
@@ -78,6 +79,7 @@ const cacheSizeSlider = document.getElementById("cacheSizeSlider");
 const cacheSizeValue = document.getElementById("cacheSizeValue");
 const previewSpeedSlider = document.getElementById("previewSpeedSlider");
 const previewSpeedValue = document.getElementById("previewSpeedValue");
+const backgroundPreviewCreationToggle = document.getElementById("backgroundPreviewCreationToggle");
 const cacheUsageBar = document.getElementById("cacheUsageBar");
 const cacheUsageText = document.getElementById("cacheUsageText");
 const indexingCategoryTitle = document.getElementById("indexingCategoryTitle");
@@ -90,6 +92,12 @@ const cacheReloadBtn = document.getElementById("cacheReloadBtn");
 function setDebugState(state) {
   if (!debugBadge) return;
   debugBadge.textContent = `debug: (${state})`;
+}
+
+function setStartupProcessStatus(message = "") {
+  if (!startupProcessText) return;
+  const text = String(message ?? "").trim();
+  startupProcessText.textContent = text || "Starting application...";
 }
 
 function setInvalidPanelExpanded(expanded) {
@@ -170,7 +178,7 @@ function renderInvalidPatientFoldersPanel() {
   for (const fileName of invalidPatientFileNames) {
     const item = document.createElement("li");
     item.className = "invalid-patient-folder-item";
-    const ext = extractExt(fileName) || "FILE";
+    const ext = fileExtBadgeLabel(fileName);
     item.innerHTML = `
       <span class="invalid-patient-file-ext">${ext}</span>
       <span class="invalid-patient-folder-name">${fileName}</span>
@@ -290,6 +298,11 @@ function extractExt(name = "") {
   return raw.slice(dot + 1).toUpperCase();
 }
 
+function fileExtBadgeLabel(name = "", maxLen = 4) {
+  const ext = extractExt(name) || "FILE";
+  return ext.length > maxLen ? "?" : ext;
+}
+
 function normalizeDialogPathSelection(selected) {
   const raw = Array.isArray(selected) ? selected[0] : selected;
   let path = String(raw ?? "").trim();
@@ -366,8 +379,10 @@ let previewFillPausedForActiveView = false;
 let activeViewPrioritySyncInFlight = false;
 let manualCacheHoldMode = "";
 let keepLocalCacheCopyEnabled = false;
+let backgroundPreviewCreationEnabled = false;
 let localCacheSyncInFlight = false;
 let localCacheStatusPollIntervalId = null;
+let workspaceChangeCrawlPollIntervalId = null;
 let localCacheStatusState = "up_to_date";
 let localCacheStatusRunning = false;
 let localCacheStatusCompleted = 0;
@@ -383,7 +398,7 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "0.9.4";
+let systemAppVersion = "0.9.5";
 let systemUpdateBusy = false;
 let systemUpdateCheckedAtMs = null;
 let importWizardDir = null;
@@ -410,6 +425,7 @@ let patientSearchHasMore = false;
 let patientSearchInFlight = false;
 let activePatientSearchQuery = "";
 let slowWorkspaceMode = false;
+let initialMainReadyInProgress = false;
 
 const DEBUG_PREF_KEY = "showFrontendDebug";
 const TIMELINE_NAMES_PREF_KEY = "alwaysShowTimelineNames";
@@ -418,6 +434,7 @@ const DEFAULT_PREVIEW_PERFORMANCE_MODE = "auto";
 const INDEXING_STATUS_POLL_MS = 2500;
 const INDEXING_STATUS_POLL_SLOW_MS = 5000;
 const LOCAL_CACHE_STATUS_POLL_MS = 3000;
+const WORKSPACE_CHANGE_CRAWL_POLL_MS = 12000;
 const MIN_MANUAL_CACHE_STATUS_MS = 1500;
 const PANEL_ANIM_MS = 230;
 const PATIENT_LIST_RENDER_BATCH_SIZE = 160;
@@ -425,9 +442,9 @@ const PATIENT_LIST_PAGE_SIZE = 250;
 const INVALID_ITEMS_PAGE_SIZE = 200;
 const WORKSPACE_REINDEX_START_TIMEOUT_MS = 6000;
 const WORKSPACE_REINDEX_STATUS_TIMEOUT_MS = 3500;
-const WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS = 45000;
-const WORKSPACE_LOAD_OVERALL_TIMEOUT_MS = 90000;
-const SEARCH_PATIENTS_TIMEOUT_MS = 20000;
+const WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS = 180000;
+const WORKSPACE_LOAD_OVERALL_TIMEOUT_MS = 600000;
+const SEARCH_PATIENTS_TIMEOUT_MS = 120000;
 const PREVIEW_FILL_IDLE_DELAY_MS = 2600;
 const PREVIEW_FILL_ATTEMPT_COOLDOWN_MS = 12000;
 const CACHE_RELOAD_ICON_UPDATE = `
@@ -822,6 +839,32 @@ function stopLocalCacheStatusPolling() {
   localCacheStatusPollIntervalId = null;
 }
 
+async function triggerWorkspaceChangeCrawl() {
+  if (!currentWorkspaceDir || isDbUpdating || initialMainReadyInProgress) return;
+  if (selectedPatient) return;
+  try {
+    await invoke("start_workspace_change_crawl", {
+      workspaceDir: currentWorkspaceDir,
+      maxPatients: slowWorkspaceMode ? 8 : 16,
+    });
+  } catch (err) {
+    console.error("start_workspace_change_crawl failed:", err);
+  }
+}
+
+function startWorkspaceChangeCrawlPolling() {
+  if (workspaceChangeCrawlPollIntervalId !== null) return;
+  workspaceChangeCrawlPollIntervalId = setInterval(() => {
+    void triggerWorkspaceChangeCrawl();
+  }, WORKSPACE_CHANGE_CRAWL_POLL_MS);
+}
+
+function stopWorkspaceChangeCrawlPolling() {
+  if (workspaceChangeCrawlPollIntervalId === null) return;
+  clearInterval(workspaceChangeCrawlPollIntervalId);
+  workspaceChangeCrawlPollIntervalId = null;
+}
+
 async function syncLocalCacheCopy({ manual = false } = {}) {
   if (!currentWorkspaceDir || !keepLocalCacheCopyEnabled || localCacheSyncInFlight) return;
   cacheMarkedNotSynchronized = false;
@@ -945,6 +988,7 @@ function clearPreviewFillIdleStartTimer() {
 function scheduleBackgroundPreviewFillWhenIdle() {
   if (previewFillIdleTimerId !== null) return;
   if (!currentWorkspaceDir) return;
+  if (!backgroundPreviewCreationEnabled) return;
   if (previewFillPausedByUser || cacheMarkedNotSynchronized) return;
 
   previewFillIdleTimerId = setTimeout(() => {
@@ -1153,6 +1197,7 @@ function setPreviewFillRunning(running) {
 }
 
 async function ensureBackgroundPreviewFill(cacheStats = null) {
+  if (!backgroundPreviewCreationEnabled) return;
   if (!currentWorkspaceDir || isPreviewFillRunning || previewFillPausedByUser) return;
   if (!isIdleForBackgroundPreviewFill()) {
     scheduleBackgroundPreviewFillWhenIdle();
@@ -1211,7 +1256,13 @@ async function refreshCacheUsageUi() {
       maxBytes: stats?.max_bytes ?? stats?.maxBytes ?? 0,
       percent: stats?.used_percent ?? stats?.usedPercent ?? 0,
     });
-    if (keepLocalCacheCopyEnabled && !isPreviewFillRunning && !isCacheMaintenanceRunning && !hasActiveImportJobs()) {
+    if (
+      keepLocalCacheCopyEnabled &&
+      !initialMainReadyInProgress &&
+      !isPreviewFillRunning &&
+      !isCacheMaintenanceRunning &&
+      !hasActiveImportJobs()
+    ) {
       void syncLocalCacheCopy();
     }
     return stats;
@@ -2138,6 +2189,9 @@ async function loadPatients(workspaceDir, options = {}) {
   const onReindexProgress = typeof options?.onReindexProgress === "function"
     ? options.onReindexProgress
     : null;
+  const onStartupStage = typeof options?.onStartupStage === "function"
+    ? options.onStartupStage
+    : null;
   currentWorkspaceDir = workspaceDir;
   slowWorkspaceMode = isLikelySlowWorkspacePath(workspaceDir);
   invalidPatientOffset = 0;
@@ -2149,6 +2203,7 @@ async function loadPatients(workspaceDir, options = {}) {
   let reindexFailed = false;
 
   try {
+    if (onStartupStage) onStartupStage("Building workspace index...");
     let startAccepted = await withTimeout(
       invoke("start_workspace_reindex", { workspaceDir }),
       WORKSPACE_REINDEX_START_TIMEOUT_MS,
@@ -2226,7 +2281,7 @@ async function loadPatients(workspaceDir, options = {}) {
   if (reindexFailed) {
     isDbUpdating = false;
     if (dbStatusText) dbStatusText.textContent = "Up to date";
-    if (dbStatusTime) dbStatusTime.textContent = "update failed";
+    if (dbStatusTime) dbStatusTime.textContent = "using cached index";
     if (dbStatusSpinner) dbStatusSpinner.hidden = true;
     if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
   } else {
@@ -2235,7 +2290,9 @@ async function loadPatients(workspaceDir, options = {}) {
   }
 
   try {
+    if (onStartupStage) onStartupStage("Loading patient list...");
     await searchPatients(query);
+    if (onStartupStage) onStartupStage("Scanning invalid files...");
     await withTimeout(
       refreshInvalidPatientFolderWarning(workspaceDir),
       12000,
@@ -2244,6 +2301,7 @@ async function loadPatients(workspaceDir, options = {}) {
       console.error("refreshInvalidPatientFolderWarning failed:", err);
       return 0;
     });
+    if (onStartupStage) onStartupStage("Preparing timeline...");
     await withTimeout(
       mainContent.refreshTimelineForSelection(),
       20000,
@@ -2251,6 +2309,7 @@ async function loadPatients(workspaceDir, options = {}) {
     ).catch((err) => {
       console.error("refreshTimelineForSelection failed:", err);
     });
+    if (onStartupStage) onStartupStage("Counting indexed images...");
     await withTimeout(
       refreshIndexingDebugCounts(),
       12000,
@@ -2306,6 +2365,7 @@ function clearPatients() {
     state: "up_to_date",
   });
   stopIndexingStatusPolling();
+  stopWorkspaceChangeCrawlPolling();
   setPreviewFillRunning(false);
   setIndexingProgressUi({ running: false, message: "Up to date" });
   setIndexingDebugCountsUi(0, 0, { show: false });
@@ -2313,32 +2373,47 @@ function clearPatients() {
 }
 
 function showMainScreen(workspaceDir) {
-  showMainScreenWithOptions(workspaceDir);
+  void showMainScreenWithOptions(workspaceDir);
 }
 
-function showMainScreenWithOptions(workspaceDir, options = {}) {
+async function showMainScreenWithOptions(workspaceDir, options = {}) {
   const skipLoadPatients = options?.skipLoadPatients ?? false;
+  const deferShowUntilReady = options?.deferShowUntilReady ?? false;
   console.log(`[transition ${ts()}] showing main screen`);
-  if (startupView) startupView.hidden = true;
+  if (!deferShowUntilReady && startupView) startupView.hidden = true;
   onboardingView.hidden = true;
-  appView.hidden = false;
+  appView.hidden = deferShowUntilReady;
   void setImportWizardCompactMode(false);
   currentWorkspaceDir = workspaceDir;
+  setWorkspacePathDisplay(workspaceDir);
+  initialMainReadyInProgress = true;
+  setStartupProcessStatus("Loading cache state...");
+  if (!skipLoadPatients) {
+    await loadPatients(workspaceDir, {
+      onStartupStage: (message) => setStartupProcessStatus(message),
+    });
+  }
+  setStartupProcessStatus("Finalizing startup...");
+  appView.hidden = false;
+  if (startupView) startupView.hidden = true;
   updateCacheReloadButtonState();
   updateLocalCacheDeleteButtonState();
   startIndexingStatusPolling();
   startLocalCacheStatusPolling();
+  startWorkspaceChangeCrawlPolling();
+  void triggerWorkspaceChangeCrawl();
   sidebarLayout.applyPatientSidebarMode();
   sidebarLayout.setPatientSidebarHidden(false);
-  setWorkspacePathDisplay(workspaceDir);
-  void (async () => {
-    const stats = await refreshCacheUsageUi();
-    await ensureBackgroundPreviewFill(stats);
-    await refreshIndexingDebugCounts();
-  })();
-  if (!skipLoadPatients) {
-    loadPatients(workspaceDir);
-  }
+  initialMainReadyInProgress = false;
+  const postStartupDelayMs = skipLoadPatients ? 1200 : 450;
+  setTimeout(() => {
+    if (String(currentWorkspaceDir ?? "").trim() !== String(workspaceDir ?? "").trim()) return;
+    void (async () => {
+      const stats = await refreshCacheUsageUi();
+      await ensureBackgroundPreviewFill(stats);
+      await refreshIndexingDebugCounts();
+    })();
+  }, postStartupDelayMs);
   requestAnimationFrame(sidebarLayout.updateTopButtonSpacing);
   console.log(
     `[transition ${ts()}] view flags onboarding.hidden=${onboardingView.hidden} app.hidden=${appView.hidden}`
@@ -2578,6 +2653,7 @@ async function pickImportWizardFolderAndSave() {
 // ---------- Boot ----------
 async function boot() {
   setDebugState("booting");
+  setStartupProcessStatus("Loading settings...");
   if (startupView) startupView.hidden = false;
   onboardingView.hidden = true;
   appView.hidden = true;
@@ -2618,8 +2694,17 @@ async function boot() {
       settings?.previewPerformanceMode ??
       DEFAULT_PREVIEW_PERFORMANCE_MODE
     );
+    const backgroundPreviewCreation = Boolean(
+      settings?.background_preview_creation ??
+      settings?.backgroundPreviewCreation ??
+      false
+    );
     keepLocalCacheCopyEnabled = keepLocalCopy;
+    backgroundPreviewCreationEnabled = backgroundPreviewCreation;
     if (keepLocalCacheCopyToggle) keepLocalCacheCopyToggle.checked = keepLocalCopy;
+    if (backgroundPreviewCreationToggle) {
+      backgroundPreviewCreationToggle.checked = backgroundPreviewCreation;
+    }
     setCacheSizeUi(cacheSizeGb);
     setPreviewPerformanceUi(previewPerformanceMode);
     importWizardDir = typeof importWizardDirFromSettings === "string"
@@ -2637,9 +2722,6 @@ async function boot() {
         : null;
     setImportWizardPathDisplay(importWizardDir);
     updateImportWizardButtonState();
-    await refreshCacheUsageUi();
-    await refreshIndexingDebugCounts();
-    await refreshLocalCacheCopyStatus();
     console.log("workspaceDir:", workspaceDir);
 
     if (!workspaceDir) {
@@ -2652,13 +2734,17 @@ async function boot() {
       return;
     }
 
-    showMainScreen(workspaceDir);
+    setStartupProcessStatus("Preparing workspace...");
+    await refreshLocalCacheCopyStatus();
+    await showMainScreenWithOptions(workspaceDir, { deferShowUntilReady: true });
     setDebugState("ready");
 
   } catch (err) {
     console.error("load_settings failed:", err);
     setCacheSizeUi(DEFAULT_CACHE_SIZE_GB);
     setPreviewPerformanceUi(DEFAULT_PREVIEW_PERFORMANCE_MODE);
+    backgroundPreviewCreationEnabled = false;
+    if (backgroundPreviewCreationToggle) backgroundPreviewCreationToggle.checked = false;
     setSystemUpdateUi({ busy: false });
     await refreshCacheUsageUi();
     if (startupView) startupView.hidden = true;
@@ -2840,6 +2926,28 @@ keepLocalCacheCopyToggle?.addEventListener("change", async (e) => {
     localCacheSyncInFlight = false;
     updateLocalCacheDeleteButtonState();
     void refreshLocalCacheCopyStatus();
+  }
+});
+backgroundPreviewCreationToggle?.addEventListener("change", async (e) => {
+  const enabled = Boolean(e.target?.checked);
+  backgroundPreviewCreationEnabled = enabled;
+  try {
+    await invoke("set_background_preview_creation", { enabled });
+    if (!enabled) {
+      previewFillPausedByUser = false;
+      try {
+        await invoke("stop_background_preview_fill");
+      } catch (err) {
+        console.error("stop_background_preview_fill for background toggle failed:", err);
+      }
+    } else {
+      void ensureBackgroundPreviewFill();
+    }
+    void refreshIndexingStatus();
+  } catch (err) {
+    console.error("set_background_preview_creation failed:", err);
+    backgroundPreviewCreationEnabled = !enabled;
+    if (backgroundPreviewCreationToggle) backgroundPreviewCreationToggle.checked = !enabled;
   }
 });
 cacheSizeSlider?.addEventListener("input", (e) => {

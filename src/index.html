@@ -10,15 +10,13 @@
 
   <body>
     <div id="startupView" class="startup-root">
-      <div class="startup-card">
-        <div class="startup-spinner-wrap" aria-hidden="true">
-          <svg class="startup-spinner-svg" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
-            <circle class="startup-spinner-ring" cx="120" cy="120" r="96"/>
-          </svg>
-        </div>
-        <h1 class="startup-title">Photo-Doc</h1>
-        <p class="startup-subtitle">Getting Ready...</p>
+      <div class="startup-spinner-wrap" aria-hidden="true">
+        <svg class="startup-spinner-svg" viewBox="0 0 240 240" xmlns="http://www.w3.org/2000/svg">
+          <circle class="startup-spinner-ring" cx="120" cy="120" r="96"/>
+        </svg>
       </div>
+      <p class="startup-subtitle">Getting Ready...</p>
+      <p class="startup-process" id="startupProcessText">Starting application...</p>
     </div>
 
     <!-- DEBUG -->
@@ -228,21 +226,6 @@
                   &gt;
                 </button>
               </div>
-              <div class="settings-row">
-                <div class="settings-value">Cache Size</div>
-                <div class="cache-size-control">
-                  <input
-                    type="range"
-                    id="cacheSizeSlider"
-                    min="1"
-                    max="10"
-                    step="1"
-                    value="5"
-                    aria-label="Cache size in gigabytes"
-                  />
-                  <div class="cache-size-value" id="cacheSizeValue">5 GB</div>
-                </div>
-              </div>
               <div class="settings-row processing-speed-row">
                 <div class="settings-value">Processing Speed</div>
                 <div class="processing-speed-control">
@@ -267,6 +250,13 @@
                     <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
                   </svg>
                 </button>
+              </div>
+              <div class="settings-row background-preview-row">
+                <div class="settings-value">Background Preview Creation</div>
+                <label class="toggle-switch" for="backgroundPreviewCreationToggle">
+                  <input type="checkbox" id="backgroundPreviewCreationToggle" />
+                  <span class="toggle-slider" aria-hidden="true"></span>
+                </label>
               </div>
               <div class="settings-row local-cache-copy-row">
                 <div class="settings-value">Keep local Cache Copy</div>
