@@ -1969,38 +1969,6 @@ fn build_preview_cache_key_workspace_relative(
     build_preview_cache_key_canonical(path, file_size, modified_ms)
 }
 
-fn build_preview_cache_key_candidates(
-    path: &Path,
-    workspace_root: Option<&Path>,
-    file_size: u64,
-    modified_ms: u64,
-    include_canonical_fallback: bool,
-) -> Vec<String> {
-    let mut out = vec![build_preview_cache_key_workspace_relative(
-        path,
-        workspace_root,
-        file_size,
-        modified_ms,
-    )];
-    if include_canonical_fallback {
-        out.push(build_preview_cache_key_canonical(path, file_size, modified_ms));
-    }
-    out.push(build_preview_cache_key_legacy(path, file_size, modified_ms));
-    out.retain(|k| !k.is_empty());
-    out.dedup();
-    out
-}
-
-fn build_preview_cache_key_legacy(path: &Path, file_size: u64, modified_ms: u64) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.to_string_lossy().hash(&mut hasher);
-    file_size.hash(&mut hasher);
-    modified_ms.hash(&mut hasher);
-    PREVIEW_CACHE_DIM.hash(&mut hasher);
-    PREVIEW_CACHE_QUALITY.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
 fn generate_preview_cache_bytes(path: &Path) -> Result<Vec<u8>, String> {
     let reader = image::ImageReader::open(path).map_err(|e| e.to_string())?;
     let img = reader.decode().map_err(|e| e.to_string())?;
@@ -2148,23 +2116,8 @@ fn resolve_existing_cache_file_path(
     file_size: u64,
     modified_ms: u64,
 ) -> PathBuf {
-    let keys = build_preview_cache_key_candidates(
-        path_buf,
-        workspace_root,
-        file_size,
-        modified_ms,
-        true,
-    );
-    for key in &keys {
-        let cache_file_path = cache_dir.join(format!("{key}.jpg"));
-        if cache_file_path.exists() {
-            return cache_file_path;
-        }
-    }
-    let primary_key = keys.first().cloned().unwrap_or_else(|| {
-        build_preview_cache_key_workspace_relative(path_buf, workspace_root, file_size, modified_ms)
-    });
-    cache_dir.join(format!("{primary_key}.jpg"))
+    let key = build_preview_cache_key_workspace_relative(path_buf, workspace_root, file_size, modified_ms);
+    cache_dir.join(format!("{key}.jpg"))
 }
 
 fn is_valid_cached_preview_bytes(bytes: &[u8]) -> bool {
@@ -2379,16 +2332,9 @@ fn collect_workspace_expected_preview_files(workspace: &Path) -> HashSet<String>
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let keys = build_preview_cache_key_candidates(
-                &path,
-                Some(workspace),
-                file_size,
-                modified_ms,
-                false,
-            );
-            for key in keys {
-                expected.insert(format!("{key}.jpg"));
-            }
+            let key =
+                build_preview_cache_key_workspace_relative(&path, Some(workspace), file_size, modified_ms);
+            expected.insert(format!("{key}.jpg"));
         }
     }
 
@@ -2452,16 +2398,9 @@ fn collect_workspace_expected_preview_files_from_db(
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let keys = build_preview_cache_key_candidates(
-                &path,
-                Some(workspace),
-                file_size,
-                modified_ms,
-                false,
-            );
-            for key in keys {
-                expected.insert(format!("{key}.jpg"));
-            }
+            let key =
+                build_preview_cache_key_workspace_relative(&path, Some(workspace), file_size, modified_ms);
+            expected.insert(format!("{key}.jpg"));
         }
     }
 
@@ -2493,7 +2432,6 @@ fn cleanup_preview_cache_for_workspace_dir(
     cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
     let expected = collect_workspace_expected_preview_files_from_db(app_handle, workspace)
         .unwrap_or_else(|_| collect_workspace_expected_preview_files(workspace));
-    let preserve_unknown_cache_files_for_transition = true;
 
     if let Ok(entries) = fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
@@ -2514,9 +2452,6 @@ fn cleanup_preview_cache_for_workspace_dir(
                 continue;
             };
             if !expected.contains(file_name) {
-                if preserve_unknown_cache_files_for_transition {
-                    continue;
-                }
                 let _ = fs::remove_file(&path);
             }
         }
@@ -2833,12 +2768,6 @@ fn resolve_cached_previews_in_cache_dir(
         let source_meta = source_meta_map
             .and_then(|map| map.get(&path).copied())
             .or_else(|| {
-                let should_avoid_workspace_fs = workspace_root
-                    .map(|workspace| path_buf.starts_with(workspace))
-                    .unwrap_or(false);
-                if should_avoid_workspace_fs {
-                    return None;
-                }
                 fs::metadata(&path_buf).ok().map(|meta| {
                     let modified_ms = meta
                         .modified()
@@ -2860,31 +2789,10 @@ fn resolve_cached_previews_in_cache_dir(
                 continue;
         };
         let row_index = rows.len();
-        let candidate_keys = build_preview_cache_key_candidates(
-            &path_buf,
-            workspace_root,
-            file_size,
-            modified_ms,
-            true,
-        );
-        let primary_cache_key = candidate_keys
-            .first()
-            .cloned()
-            .unwrap_or_else(|| build_preview_cache_key_workspace_relative(&path_buf, workspace_root, file_size, modified_ms));
-        let mut cache_key = primary_cache_key.clone();
-        let mut file_name = format!("{cache_key}.jpg");
-        let mut cache_file_path = cache_dir.join(&file_name);
-        if !cache_file_path.exists() {
-            for fallback_key in candidate_keys.iter().skip(1) {
-                let fallback_cache_file_path = cache_dir.join(format!("{fallback_key}.jpg"));
-                if fallback_cache_file_path.exists() {
-                    cache_key = fallback_key.clone();
-                    file_name = format!("{cache_key}.jpg");
-                    cache_file_path = fallback_cache_file_path;
-                    break;
-                }
-            }
-        }
+        let cache_key =
+            build_preview_cache_key_workspace_relative(&path_buf, workspace_root, file_size, modified_ms);
+        let file_name = format!("{cache_key}.jpg");
+        let cache_file_path = cache_dir.join(&file_name);
         if cache_file_path.exists() && !is_valid_cached_preview_file(&cache_file_path) {
             let _ = fs::remove_file(&cache_file_path);
         }
@@ -4599,7 +4507,6 @@ fn remove_import_wizard_cached_preview(
         .unwrap_or(0);
 
     let cache_key = build_preview_cache_key_workspace_relative(&source_path, None, file_size, modified_ms);
-    let legacy_key = build_preview_cache_key_legacy(&source_path, file_size, modified_ms);
     let cache_dir = folder.join(".preview-cache");
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
 
@@ -4607,20 +4514,11 @@ fn remove_import_wizard_cached_preview(
     let mut index = load_preview_cache_index(&cache_dir);
 
     let mut changed = false;
-    let mut candidate_keys =
-        build_preview_cache_key_candidates(&source_path, None, file_size, modified_ms, true);
-    candidate_keys.push(cache_key.clone());
-    candidate_keys.push(legacy_key.clone());
-    candidate_keys.sort();
-    candidate_keys.dedup();
-
-    for key in candidate_keys {
-        if let Some(entry) = index.entries.remove(&key) {
-            let _ = fs::remove_file(cache_dir.join(entry.file_name));
-            changed = true;
-        } else {
-            let _ = fs::remove_file(cache_dir.join(format!("{key}.jpg")));
-        }
+    if let Some(entry) = index.entries.remove(&cache_key) {
+        let _ = fs::remove_file(cache_dir.join(entry.file_name));
+        changed = true;
+    } else {
+        let _ = fs::remove_file(cache_dir.join(format!("{cache_key}.jpg")));
     }
 
     if changed {
@@ -5541,13 +5439,6 @@ async fn get_existing_cached_preview_paths(
                 .get(&path)
                 .copied()
                 .or_else(|| {
-                    let should_avoid_workspace_fs = workspace_root
-                        .as_ref()
-                        .map(|workspace| path_buf.starts_with(workspace))
-                        .unwrap_or(false);
-                    if should_avoid_workspace_fs {
-                        return None;
-                    }
                     fs::metadata(&path_buf).ok().map(|meta| {
                         let modified_ms = meta
                             .modified()
