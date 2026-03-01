@@ -583,11 +583,11 @@ body{
 
 .patient-last{
   font-weight: 700;
-  min-width: 0;
+  min-width: auto;
   flex: 0 0 auto;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
   white-space: nowrap;
 }
 
@@ -602,16 +602,24 @@ body{
 .patient-id{
   margin-left: auto;
   padding-left: 8px;
-  flex: 0 2 72px;
-  min-width: 0;
-  max-width: 72px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 0 auto;
+  min-width: auto;
+  max-width: none;
+  overflow: visible;
+  text-overflow: clip;
   text-align: right;
   font-size: 10px;
   font-weight: 400;
   color: rgba(0,0,0,0.65);
   white-space: nowrap;
+}
+
+.patient-item.truncate-last .patient-last{
+  min-width: 0;
+  flex: 1 1 auto;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .patient-item.selected .patient-id{
@@ -1296,6 +1304,15 @@ body{
   border: 1.5px solid rgba(225,29,138,0.26);
   border-top-color: #e11d8a;
   animation: treatmentPreviewSpin 0.75s linear infinite;
+}
+
+.treatment-previews-progress.checking-cache{
+  color: rgba(190,24,93,0.9);
+}
+
+.treatment-previews-progress.checking-cache .treatment-previews-spinner{
+  border-color: rgba(236,72,153,0.34);
+  border-top-color: #ec4899;
 }
 
 @keyframes treatmentPreviewSpin {
@@ -2561,6 +2578,16 @@ body{
 .app.platform-windows .settings-header,
 .app.platform-windows .settings.is-scrolled .settings-header{
   background: rgba(255,255,255,0.96);
+}
+
+.app.platform-windows .main-timeline-date{
+  line-height: 1.3;
+  padding-bottom: 1px;
+}
+
+.app.platform-windows .main-timeline-treatment{
+  line-height: 1.3;
+  padding-bottom: 1px;
 }
 
 /* Settings layout */

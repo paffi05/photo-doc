@@ -342,6 +342,7 @@ export function createTreatmentFilesPanel({
     const safeTotal = Math.max(0, Number(total) || 0);
     const safeCompleted = Math.min(safeTotal, Math.max(0, Number(completed) || 0));
     if (!previewsProgressEl || !previewsProgressTextEl) return;
+    previewsProgressEl.classList.remove("checking-cache");
     if (safeTotal < 1) {
       previewsProgressEl.hidden = true;
       previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
@@ -351,13 +352,24 @@ export function createTreatmentFilesPanel({
       }
       return;
     }
-    previewsProgressTextEl.textContent = `Loading Previews... (${safeCompleted}/${safeTotal})`;
+    previewsProgressTextEl.textContent = `Loading Preview... (${safeCompleted}/${safeTotal})`;
     previewsProgressEl.hidden = safeCompleted >= safeTotal;
     previewLoadingStatus = {
       running: safeCompleted < safeTotal,
       completed: safeCompleted,
       total: safeTotal,
     };
+    if (typeof onPreviewLoadingStatusChange === "function") {
+      onPreviewLoadingStatusChange(previewLoadingStatus);
+    }
+  }
+
+  function setPreviewCacheCheckStatus() {
+    if (!previewsProgressEl || !previewsProgressTextEl) return;
+    previewsProgressEl.classList.add("checking-cache");
+    previewsProgressEl.hidden = false;
+    previewsProgressTextEl.textContent = "Checking Cache...";
+    previewLoadingStatus = { running: true, completed: 0, total: 0 };
     if (typeof onPreviewLoadingStatusChange === "function") {
       onPreviewLoadingStatusChange(previewLoadingStatus);
     }
@@ -1403,6 +1415,9 @@ export function createTreatmentFilesPanel({
 
     const allImagePaths = imageFiles.map((f) => normalizePath(f?.path ?? "")).filter((p) => p.length > 0);
     let existingCacheByPath = new Map();
+    if (allImagePaths.length > 0) {
+      setPreviewCacheCheckStatus();
+    }
     try {
       existingCacheByPath = await loadExistingCachedPreviewSrcMap(allImagePaths);
     } catch {

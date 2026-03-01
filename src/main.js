@@ -419,7 +419,7 @@ let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
 let patientFormMode = "create";
 let invalidFolderEditingName = "";
-let systemAppVersion = "1.0.10";
+let systemAppVersion = "1.0.11";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -450,6 +450,7 @@ let patientSearchHasMore = false;
 let patientSearchInFlight = false;
 let activePatientSearchQuery = "";
 let shouldEnsureSelectedPatientVisible = false;
+let patientNameTruncationRafId = null;
 let slowWorkspaceMode = false;
 let initialMainReadyInProgress = false;
 
@@ -460,12 +461,13 @@ const DEFAULT_PREVIEW_PERFORMANCE_MODE = "auto";
 const INDEXING_STATUS_POLL_MS = 2500;
 const INDEXING_STATUS_POLL_SLOW_MS = 5000;
 const LOCAL_CACHE_STATUS_POLL_MS = 3000;
-const WORKSPACE_CHANGE_CRAWL_POLL_MS = 12000;
+const BACKGROUND_MAINTENANCE_POLL_MS = 10 * 60 * 1000;
 const MIN_MANUAL_CACHE_STATUS_MS = 1500;
 const PANEL_ANIM_MS = 230;
 const PATIENT_LIST_RENDER_BATCH_SIZE = 160;
 const PATIENT_LIST_PAGE_SIZE = 250;
 const INVALID_ITEMS_PAGE_SIZE = 200;
+const PATIENT_FIRSTNAME_EFFECTIVE_MIN_WIDTH_PX = 14;
 const WORKSPACE_REINDEX_START_TIMEOUT_MS = 6000;
 const WORKSPACE_REINDEX_STATUS_TIMEOUT_MS = 3500;
 const WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS = 180000;
@@ -910,9 +912,9 @@ function stopLocalCacheStatusPolling() {
   localCacheStatusPollIntervalId = null;
 }
 
-async function triggerWorkspaceChangeCrawl() {
+async function triggerWorkspaceChangeCrawl({ requireIdle = true } = {}) {
   if (!currentWorkspaceDir || isDbUpdating || initialMainReadyInProgress) return;
-  if (selectedPatient) return;
+  if (requireIdle && !isIdleForBackgroundMaintenance()) return;
   try {
     await invoke("start_workspace_change_crawl", {
       workspaceDir: currentWorkspaceDir,
@@ -926,8 +928,8 @@ async function triggerWorkspaceChangeCrawl() {
 function startWorkspaceChangeCrawlPolling() {
   if (workspaceChangeCrawlPollIntervalId !== null) return;
   workspaceChangeCrawlPollIntervalId = setInterval(() => {
-    void triggerWorkspaceChangeCrawl();
-  }, WORKSPACE_CHANGE_CRAWL_POLL_MS);
+    void runBackgroundMaintenanceTick();
+  }, BACKGROUND_MAINTENANCE_POLL_MS);
 }
 
 function stopWorkspaceChangeCrawlPolling() {
@@ -936,8 +938,9 @@ function stopWorkspaceChangeCrawlPolling() {
   workspaceChangeCrawlPollIntervalId = null;
 }
 
-async function syncLocalCacheCopy({ manual = false } = {}) {
+async function syncLocalCacheCopy({ manual = false, requireIdle = false } = {}) {
   if (!currentWorkspaceDir || !keepLocalCacheCopyEnabled || localCacheSyncInFlight) return;
+  if (requireIdle && !isIdleForBackgroundMaintenance()) return;
   cacheMarkedNotSynchronized = false;
   localCacheSyncInFlight = true;
   updateLocalCacheDeleteButtonState();
@@ -956,6 +959,13 @@ async function syncLocalCacheCopy({ manual = false } = {}) {
     updateLocalCacheDeleteButtonState();
     void refreshLocalCacheCopyStatus();
   }
+}
+
+async function runBackgroundMaintenanceTick() {
+  if (!isIdleForBackgroundMaintenance()) return;
+  await triggerWorkspaceChangeCrawl({ requireIdle: false });
+  if (!isIdleForBackgroundMaintenance()) return;
+  await syncLocalCacheCopy({ manual: false, requireIdle: true });
 }
 
 function renderIndexingProgressText() {
@@ -998,23 +1008,6 @@ function setIndexingCustomSuffixUi(suffix = "") {
 
 function setIndexingCategoryTitle(dbImageCount = null, { loading = false } = {}) {
   if (!indexingCategoryTitle) return;
-  if (!currentWorkspaceDir) {
-    indexingCategoryTitle.textContent = "INDEXING";
-    return;
-  }
-  if (loading) {
-    indexingCategoryTitle.textContent = "INDEXING (...)";
-    return;
-  }
-  const count = Number(dbImageCount);
-  if (Number.isFinite(count) && count >= 0) {
-    indexingCategoryTitle.textContent = `INDEXING (${Math.floor(count)})`;
-    return;
-  }
-  if (!Number.isFinite(count) || count < 0) {
-    indexingCategoryTitle.textContent = "INDEXING";
-    return;
-  }
   indexingCategoryTitle.textContent = "INDEXING";
 }
 
@@ -1052,16 +1045,22 @@ function hasActiveImportJobs() {
   return importingPatientJobCounts.size > 0;
 }
 
-function isIdleForBackgroundPreviewFill() {
+function isIdleForBackgroundMaintenance() {
   if (!currentWorkspaceDir) return false;
-  if (slowWorkspaceMode) return false;
-  if (isWorkspaceSetupInProgress) return false;
+  if (isWorkspaceSetupInProgress || initialMainReadyInProgress) return false;
   if (isDbUpdating || isPatientListLoading || patientSearchInFlight) return false;
   if (importWizardIsImporting || hasActiveImportJobs()) return false;
   if (activeViewPreviewLoading.running) return false;
-  if (isPreviewFillRunning || isPreviewFillStopInFlight || previewFillPausedByUser) return false;
+  if (isPreviewFillRunning || isPreviewFillStopInFlight) return false;
   if (isStoppingCacheProcesses || isCacheMaintenanceRunning) return false;
   if (localCacheSyncInFlight || localCacheStatusRunning) return false;
+  return true;
+}
+
+function isIdleForBackgroundPreviewFill() {
+  if (!isIdleForBackgroundMaintenance()) return false;
+  if (slowWorkspaceMode) return false;
+  if (previewFillPausedByUser) return false;
   return true;
 }
 
@@ -1345,15 +1344,6 @@ async function refreshCacheUsageUi() {
       maxBytes: stats?.max_bytes ?? stats?.maxBytes ?? 0,
       percent: stats?.used_percent ?? stats?.usedPercent ?? 0,
     });
-    if (
-      keepLocalCacheCopyEnabled &&
-      !initialMainReadyInProgress &&
-      !isPreviewFillRunning &&
-      !isCacheMaintenanceRunning &&
-      !hasActiveImportJobs()
-    ) {
-      void syncLocalCacheCopy();
-    }
     return stats;
   } catch (err) {
     console.error("get_preview_cache_stats failed:", err);
@@ -1446,7 +1436,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.10").trim() || "1.0.10";
+  const safeVersion = String(version || "1.0.11").trim() || "1.0.11";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -2322,6 +2312,36 @@ function updatePatientSelectionInList() {
   }
 }
 
+function updatePatientNameTruncationForItem(item) {
+  if (!item || !item.classList.contains("patient-item")) return;
+  const first = item.querySelector(".patient-first");
+  if (!first) {
+    item.classList.remove("truncate-last");
+    return;
+  }
+  const firstVisibleWidth = first.getBoundingClientRect().width;
+  const firstContentWidth = first.scrollWidth;
+  const firstMissing = firstVisibleWidth <= PATIENT_FIRSTNAME_EFFECTIVE_MIN_WIDTH_PX
+    || (firstContentWidth > 0 && (firstVisibleWidth / firstContentWidth) < 0.18);
+  item.classList.toggle("truncate-last", firstMissing);
+}
+
+function refreshPatientNameTruncation() {
+  if (!patientList) return;
+  const items = patientList.querySelectorAll(".patient-item");
+  for (const item of items) {
+    updatePatientNameTruncationForItem(item);
+  }
+}
+
+function schedulePatientNameTruncationRefresh() {
+  if (patientNameTruncationRafId !== null) return;
+  patientNameTruncationRafId = requestAnimationFrame(() => {
+    patientNameTruncationRafId = null;
+    refreshPatientNameTruncation();
+  });
+}
+
 function buildPatientListItem(entry) {
   const {
     folderName,
@@ -2502,6 +2522,7 @@ function appendPatientListRows(rows) {
     if (item) fragment.appendChild(item);
   }
   patientList.appendChild(fragment);
+  schedulePatientNameTruncationRefresh();
   ensureSelectedPatientVisibleInList();
 }
 
@@ -2547,6 +2568,7 @@ function renderPatientList(entries, filterText = "") {
       if (item) fragment.appendChild(item);
     }
     patientList.appendChild(fragment);
+    schedulePatientNameTruncationRefresh();
     ensureSelectedPatientVisibleInList();
     if (index < entries.length) {
       requestAnimationFrame(appendBatch);
@@ -2900,7 +2922,6 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   startIndexingStatusPolling();
   startLocalCacheStatusPolling();
   startWorkspaceChangeCrawlPolling();
-  void triggerWorkspaceChangeCrawl();
   sidebarLayout.applyPatientSidebarMode();
   sidebarLayout.setPatientSidebarHidden(false);
   initialMainReadyInProgress = false;
@@ -3637,7 +3658,10 @@ confirmAddPatientBtn?.addEventListener("click", async () => {
     selectedPatientId = patientId;
     updateImportWizardButtonState();
     mainContent.setSelectedPatientHeader({ lastName, firstName, patientId });
-    await loadPatients(currentWorkspaceDir);
+    await searchPatients("");
+    await mainContent.refreshTimelineForSelection();
+    void refreshInvalidPatientFolderWarning(currentWorkspaceDir);
+    void refreshIndexingStatus();
   } catch (err) {
     console.error("create_patient_with_metadata failed:", err);
     setDebugState("error: create patient");
@@ -3741,6 +3765,7 @@ window.addEventListener("resize", () => {
     sidebarLayout.setPatientSidebarHidden(true);
   }
   sidebarLayout.updateTopButtonSpacing();
+  schedulePatientNameTruncationRefresh();
 });
 patientSearchInput?.addEventListener("input", (e) => {
   const query = e.target?.value ?? "";

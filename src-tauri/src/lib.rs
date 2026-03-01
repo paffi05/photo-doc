@@ -540,6 +540,7 @@ static PREVIEW_DEBUG_COUNTS_CACHE: OnceLock<Mutex<HashMap<String, PreviewDebugCo
     OnceLock::new();
 static HEAVY_IO_TASK_RUNNING: AtomicBool = AtomicBool::new(false);
 static WORKSPACE_CHANGE_CRAWL_RUNNING: AtomicBool = AtomicBool::new(false);
+static LAST_AUTO_LOCAL_CACHE_SYNC_MS: AtomicU64 = AtomicU64::new(0);
 
 const PREVIEW_CACHE_DIM: u32 = 200;
 const PREVIEW_CACHE_QUALITY: u8 = 52;
@@ -557,6 +558,7 @@ const PREVIEW_PERF_GENTLE: &str = "gentle";
 const PREVIEW_PERF_AUTO: &str = "auto";
 const PREVIEW_PERF_FAST: &str = "fast";
 const PREVIEW_CACHE_MAX_BYTES_FIXED: u64 = 10 * 1024 * 1024 * 1024;
+const AUTO_LOCAL_CACHE_SYNC_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 fn normalize_preview_performance_mode(raw: &str) -> String {
     let mode = raw.trim().to_ascii_lowercase();
@@ -1867,6 +1869,14 @@ fn sync_local_cache_copy_if_enabled(app_handle: &tauri::AppHandle, workspace_dir
     if !settings.keep_local_cache_copy.unwrap_or(false) {
         return;
     }
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed)
+        > 0
+        || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed)
+        || WORKSPACE_REINDEX_RUNNING.load(Ordering::Relaxed)
+        || WORKSPACE_CHANGE_CRAWL_RUNNING.load(Ordering::Relaxed)
+    {
+        return;
+    }
     let workspace = PathBuf::from(workspace_dir.trim());
     if !workspace.exists() || !workspace.is_dir() {
         return;
@@ -1886,9 +1896,21 @@ fn schedule_local_cache_copy_sync_if_enabled(app_handle: &tauri::AppHandle) {
     if !settings.keep_local_cache_copy.unwrap_or(false) {
         return;
     }
-    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed)
+        > 0
+        || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed)
+        || WORKSPACE_REINDEX_RUNNING.load(Ordering::Relaxed)
+        || WORKSPACE_CHANGE_CRAWL_RUNNING.load(Ordering::Relaxed)
+        || LOCAL_CACHE_COPY_RUNNING.load(Ordering::Relaxed)
+    {
         return;
     }
+    let now = now_ms();
+    let last = LAST_AUTO_LOCAL_CACHE_SYNC_MS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < AUTO_LOCAL_CACHE_SYNC_INTERVAL_MS {
+        return;
+    }
+    LAST_AUTO_LOCAL_CACHE_SYNC_MS.store(now, Ordering::Relaxed);
     let Some(workspace_dir) = settings.workspace_dir else {
         return;
     };
@@ -1932,11 +1954,15 @@ fn normalize_cache_key_path_text(path_text: &str) -> String {
     out
 }
 
+fn normalize_modified_ms_for_cache_key(modified_ms: u64) -> u64 {
+    modified_ms / 1000
+}
+
 fn build_preview_cache_key_for_material(material: &str, file_size: u64, modified_ms: u64) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     material.hash(&mut hasher);
     file_size.hash(&mut hasher);
-    modified_ms.hash(&mut hasher);
+    normalize_modified_ms_for_cache_key(modified_ms).hash(&mut hasher);
     PREVIEW_CACHE_DIM.hash(&mut hasher);
     PREVIEW_CACHE_QUALITY.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
