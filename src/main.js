@@ -420,7 +420,7 @@ let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
 let patientFormMode = "create";
 let invalidFolderEditingName = "";
-let systemAppVersion = "1.0.7-1";
+let systemAppVersion = "1.0.8";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -1467,7 +1467,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.7-1").trim() || "1.0.7-1";
+  const safeVersion = String(version || "1.0.8").trim() || "1.0.8";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -3090,7 +3090,8 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   if (!skipLoadPatients) {
     await loadPatients(workspaceDir, {
       onStartupStage: (message) => setStartupProcessStatus(message),
-      fastStartup: deferShowUntilReady,
+      // Keep heavy DB/index updates on the startup screen to avoid runtime UI slowdowns.
+      fastStartup: false,
     });
   }
   setStartupProcessStatus("Finalizing startup...");
