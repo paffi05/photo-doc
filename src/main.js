@@ -410,6 +410,7 @@ let localCacheFileCount = 0;
 let isDeleteLocalCacheInFlight = false;
 let isDeleteMainCacheInFlight = false;
 let previewFillIdleTimerId = null;
+let localCacheSyncIdleTimerId = null;
 let previewFillLastAttemptMs = 0;
 let selectedPatient = null;
 let selectedPatientId = "";
@@ -419,7 +420,7 @@ let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
 let patientFormMode = "create";
 let invalidFolderEditingName = "";
-let systemAppVersion = "1.0.6";
+let systemAppVersion = "1.0.7-a";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -851,6 +852,7 @@ function updateLocalCacheDeleteButtonState() {
 function applyLocalCacheCopyStatus(status = {}) {
   const enabled = Boolean(status?.enabled);
   keepLocalCacheCopyEnabled = enabled;
+  if (!enabled) clearLocalCacheSyncIdleStartTimer();
   if (keepLocalCacheCopyToggle) keepLocalCacheCopyToggle.checked = enabled;
 
   const stateRaw = String(status?.state ?? "").trim().toLowerCase();
@@ -1049,10 +1051,28 @@ function isIdleForBackgroundPreviewFill() {
   return true;
 }
 
+function isIdleForLocalCacheCopySync() {
+  if (!currentWorkspaceDir) return false;
+  if (isWorkspaceSetupInProgress || initialMainReadyInProgress) return false;
+  if (isDbUpdating || isPatientListLoading || patientSearchInFlight) return false;
+  if (importWizardIsImporting || hasActiveImportJobs()) return false;
+  if (selectedPatient) return false;
+  if (activeViewPreviewLoading.running) return false;
+  if (isPreviewFillRunning || isPreviewFillStopInFlight || isCacheMaintenanceRunning) return false;
+  if (isStoppingCacheProcesses || localCacheSyncInFlight || localCacheStatusRunning) return false;
+  return true;
+}
+
 function clearPreviewFillIdleStartTimer() {
   if (previewFillIdleTimerId === null) return;
   clearTimeout(previewFillIdleTimerId);
   previewFillIdleTimerId = null;
+}
+
+function clearLocalCacheSyncIdleStartTimer() {
+  if (localCacheSyncIdleTimerId === null) return;
+  clearTimeout(localCacheSyncIdleTimerId);
+  localCacheSyncIdleTimerId = null;
 }
 
 function scheduleBackgroundPreviewFillWhenIdle() {
@@ -1064,6 +1084,22 @@ function scheduleBackgroundPreviewFillWhenIdle() {
   previewFillIdleTimerId = setTimeout(() => {
     previewFillIdleTimerId = null;
     void ensureBackgroundPreviewFill();
+  }, PREVIEW_FILL_IDLE_DELAY_MS);
+}
+
+function scheduleLocalCacheSyncWhenIdle() {
+  if (localCacheSyncIdleTimerId !== null) return;
+  if (!currentWorkspaceDir || !keepLocalCacheCopyEnabled) return;
+  if (localCacheSyncInFlight || localCacheStatusRunning) return;
+
+  localCacheSyncIdleTimerId = setTimeout(() => {
+    localCacheSyncIdleTimerId = null;
+    if (!currentWorkspaceDir || !keepLocalCacheCopyEnabled) return;
+    if (!isIdleForLocalCacheCopySync()) {
+      scheduleLocalCacheSyncWhenIdle();
+      return;
+    }
+    void syncLocalCacheCopy();
   }, PREVIEW_FILL_IDLE_DELAY_MS);
 }
 
@@ -1337,7 +1373,7 @@ async function refreshCacheUsageUi() {
       !isCacheMaintenanceRunning &&
       !hasActiveImportJobs()
     ) {
-      void syncLocalCacheCopy();
+      scheduleLocalCacheSyncWhenIdle();
     }
     return stats;
   } catch (err) {
@@ -1431,7 +1467,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.6").trim() || "1.0.6";
+  const safeVersion = String(version || "1.0.7-a").trim() || "1.0.7-a";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -3015,6 +3051,7 @@ function clearPatients() {
   renderPatientList([], "");
   stopLocalCacheStatusPolling();
   clearPreviewFillIdleStartTimer();
+  clearLocalCacheSyncIdleStartTimer();
   previewFillLastAttemptMs = 0;
   previewFillPausedForActiveView = false;
   activeViewPrioritySyncInFlight = false;
@@ -3763,6 +3800,7 @@ confirmAddPatientBtn?.addEventListener("click", async () => {
       }
       await refreshInvalidPatientFolderWarning(currentWorkspaceDir);
       await searchPatients("");
+      await mainContent.refreshTimelineForSelection();
       void refreshIndexingStatus();
     } catch (err) {
       console.error("rename_invalid_patient_folder failed:", err);

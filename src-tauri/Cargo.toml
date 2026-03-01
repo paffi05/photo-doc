@@ -1,6 +1,6 @@
 [package]
 name = "medical-photo-manager"
-version = "1.0.7"
+version = "1.0.7-a"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"

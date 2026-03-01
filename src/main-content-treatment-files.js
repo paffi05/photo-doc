@@ -12,8 +12,6 @@ const FALLBACK_RECOVERY_BATCH_SIZE = 20;
 const THUMB_RECOVERY_RETRY_DELAYS_MS = [350, 900, 1800];
 const FILE_LIST_PAGE_SIZE = 220;
 const ACTIVE_PREVIEW_BATCH_SIZE = 2;
-const EXISTING_PREVIEW_CHUNK_SIZE = 20;
-const EXISTING_PREVIEW_PARALLEL_CALLS = 5;
 
 function normalizePath(pathLike = "") {
   if (typeof pathLike === "string") return pathLike;
@@ -1055,65 +1053,23 @@ export function createTreatmentFilesPanel({
     return true;
   }
 
-  async function loadExistingCachedPreviewSrcMap(
-    paths = [],
-    {
-      chunkSize = EXISTING_PREVIEW_CHUNK_SIZE,
-      maxParallel = EXISTING_PREVIEW_PARALLEL_CALLS,
-      onChunkLoaded = null,
-    } = {}
-  ) {
+  async function loadExistingCachedPreviewSrcMap(paths = []) {
     const normalized = Array.isArray(paths)
       ? paths.map((p) => normalizePath(p)).filter((p) => p.length > 0)
       : [];
     if (normalized.length < 1) return new Map();
-
-    const safeChunkSize = Math.max(1, Number(chunkSize) || EXISTING_PREVIEW_CHUNK_SIZE);
-    const safeMaxParallel = Math.max(1, Number(maxParallel) || EXISTING_PREVIEW_PARALLEL_CALLS);
-    const batches = [];
-    for (let i = 0; i < normalized.length; i += safeChunkSize) {
-      batches.push(normalized.slice(i, i + safeChunkSize));
-    }
-
+    const rows = await invoke("get_existing_cached_preview_paths", { paths: normalized });
     const out = new Map();
-    let cursor = 0;
-    const workerCount = Math.min(safeMaxParallel, batches.length);
-    const workers = Array.from({ length: workerCount }, async () => {
-      while (cursor < batches.length) {
-        const idx = cursor;
-        cursor += 1;
-        const batch = batches[idx];
-        if (!Array.isArray(batch) || batch.length < 1) continue;
-
-        let rows = [];
-        try {
-          rows = await invoke("get_existing_cached_preview_paths", { paths: batch });
-        } catch {
-          rows = [];
-        }
-
-        const chunkMap = new Map();
-        for (const row of Array.isArray(rows) ? rows : []) {
-          const path = normalizePath(row?.path ?? "");
-          const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
-          if (!path || !previewPath) continue;
-          try {
-            chunkMap.set(path, convertFileSrc(previewPath));
-          } catch {
-            // ignore conversion failures
-          }
-        }
-
-        for (const [path, src] of chunkMap.entries()) {
-          out.set(path, src);
-        }
-
-        if (typeof onChunkLoaded === "function") {
-          await onChunkLoaded(chunkMap);
-        }
+    for (const row of Array.isArray(rows) ? rows : []) {
+      const path = normalizePath(row?.path ?? "");
+      const previewPath = normalizePath(row?.preview_path ?? row?.previewPath ?? "");
+      if (!path || !previewPath) continue;
+      try {
+        out.set(path, convertFileSrc(previewPath));
+      } catch {
+        // ignore conversion failures
       }
-    });
-    await Promise.all(workers);
+    }
     return out;
   }
 
@@ -1448,25 +1404,19 @@ export function createTreatmentFilesPanel({
     const allImagePaths = imageFiles.map((f) => normalizePath(f?.path ?? "")).filter((p) => p.length > 0);
     let existingCacheByPath = new Map();
     try {
-      existingCacheByPath = await loadExistingCachedPreviewSrcMap(allImagePaths, {
-        chunkSize: EXISTING_PREVIEW_CHUNK_SIZE,
-        maxParallel: EXISTING_PREVIEW_PARALLEL_CALLS,
-        onChunkLoaded: async (chunkMap) => {
-          if (requestId !== activeRequestId) return;
-          for (const [path, src] of chunkMap.entries()) {
-            setThumbImage(path, cardsByPath, src, {
-              requestId,
-              allowPathFallback: true,
-              previewQuality: "full",
-            });
-          }
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        },
-      });
+      existingCacheByPath = await loadExistingCachedPreviewSrcMap(allImagePaths);
     } catch {
       existingCacheByPath = new Map();
     }
     if (requestId !== activeRequestId) return;
+
+    for (const [path, src] of existingCacheByPath.entries()) {
+      setThumbImage(path, cardsByPath, src, {
+        requestId,
+        allowPathFallback: true,
+        previewQuality: "full",
+      });
+    }
 
     const firstPhase = [...visibleFirst, ...initial].filter((f) => {
       const path = normalizePath(f?.path ?? "");
