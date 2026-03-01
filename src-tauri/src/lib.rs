@@ -2517,6 +2517,11 @@ fn schedule_local_preview_mirror_to_workspace_main(
     tauri::async_runtime::spawn_blocking(move || {
         let _ = fs::create_dir_all(&workspace_main_cache_dir);
         hide_path_on_windows(&workspace_main_cache_dir);
+        let Ok(_guard) = preview_cache_lock().lock() else {
+            return;
+        };
+        let mut index = load_preview_cache_index(&workspace_main_cache_dir);
+        let current_ms = now_ms();
         let mut seen_file_names: HashSet<String> = HashSet::new();
         for src_preview_path in preview_paths {
             if src_preview_path.parent() != Some(local_cache_dir.as_path()) {
@@ -2528,28 +2533,48 @@ fn schedule_local_preview_mirror_to_workspace_main(
             if !seen_file_names.insert(file_name.to_string()) {
                 continue;
             }
-            let dst_preview_path = workspace_main_cache_dir.join(file_name);
-            if dst_preview_path.exists() {
+            if !is_cache_preview_jpeg(Path::new(file_name)) {
                 continue;
             }
-            let bytes = match fs::read(&src_preview_path) {
-                Ok(v) => v,
-                Err(_) => continue,
+            let Some(cache_key) = Path::new(file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.trim().to_string())
+            else {
+                continue;
             };
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&dst_preview_path)
-            {
-                Ok(mut dst_file) => {
-                    if dst_file.write_all(&bytes).is_err() {
-                        let _ = fs::remove_file(&dst_preview_path);
-                    }
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => {}
+            if cache_key.is_empty() {
+                continue;
             }
+            let Ok(src_meta) = fs::metadata(&src_preview_path) else {
+                continue;
+            };
+            if !src_meta.is_file() || src_meta.len() < 1 {
+                continue;
+            }
+            let dst_preview_path = workspace_main_cache_dir.join(file_name);
+            let _ = copy_if_newer(
+                &src_preview_path,
+                src_meta.len(),
+                file_modified_ms(&src_preview_path),
+                &dst_preview_path,
+            );
+            let cached_size = fs::metadata(&dst_preview_path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            if cached_size < 1 {
+                continue;
+            }
+            index.entries.insert(
+                cache_key,
+                PreviewCacheEntry {
+                    file_name: file_name.to_string(),
+                    size: cached_size,
+                    last_access_ms: current_ms,
+                },
+            );
         }
+        let _ = save_preview_cache_index(&workspace_main_cache_dir, &index);
     });
 }
 
