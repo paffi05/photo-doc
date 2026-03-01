@@ -3034,6 +3034,50 @@ fn upsert_patient_index_row(
     Ok(())
 }
 
+fn is_patient_id_taken_in_workspace(
+    conn: &Connection,
+    workspace_dir: &str,
+    patient_id: &str,
+    exclude_folder_name: Option<&str>,
+) -> Result<bool, String> {
+    let normalized_id = patient_id.trim();
+    if normalized_id.is_empty() {
+        return Ok(false);
+    }
+
+    let taken = if let Some(folder_name) = exclude_folder_name {
+        let folder_name = folder_name.trim();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM patient_index
+                WHERE workspace_dir = ?1
+                  AND patient_id = ?2
+                  AND folder_name != ?3
+             )",
+            params![workspace_dir, normalized_id, folder_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+            != 0
+    } else {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM patient_index
+                WHERE workspace_dir = ?1
+                  AND patient_id = ?2
+             )",
+            params![workspace_dir, normalized_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+            != 0
+    };
+
+    Ok(taken)
+}
+
 #[tauri::command]
 fn create_patient_with_metadata(
     app_handle: tauri::AppHandle,
@@ -3070,6 +3114,12 @@ fn create_patient_with_metadata(
         return Err("patient folder already exists for this name and ID".to_string());
     }
 
+    let conn = open_db(&app_handle)?;
+    let workspace_key = workspace.to_string_lossy().to_string();
+    if is_patient_id_taken_in_workspace(&conn, &workspace_key, patient_id, None)? {
+        return Err("patient id already exists".to_string());
+    }
+
     fs::create_dir(&patient_folder).map_err(|e| e.to_string())?;
 
     let metadata = PatientMetadata {
@@ -3080,8 +3130,6 @@ fn create_patient_with_metadata(
     let metadata_json = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
     fs::write(patient_metadata_path(&patient_folder), metadata_json).map_err(|e| e.to_string())?;
 
-    let conn = open_db(&app_handle)?;
-    let workspace_key = workspace.to_string_lossy().to_string();
     let metadata_text = metadata_to_search_text(&metadata);
     upsert_patient_index_row(
         &conn,
@@ -3094,6 +3142,131 @@ fn create_patient_with_metadata(
     )?;
 
     Ok(folder_name)
+}
+
+#[tauri::command]
+fn rename_invalid_patient_folder(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    old_folder_name: String,
+    last_name: String,
+    first_name: String,
+    patient_id: String,
+) -> Result<String, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let old_folder_name = old_folder_name.trim().to_string();
+    let last_name = last_name.trim_end().to_string();
+    let first_name = first_name.trim_end().to_string();
+    let patient_id = patient_id.trim().to_string();
+    if old_folder_name.is_empty() || last_name.trim().is_empty() || first_name.trim().is_empty() {
+        return Err("old folder name, last name and first name are required".to_string());
+    }
+    if last_name.contains('/') || last_name.contains('\\') || first_name.contains('/') || first_name.contains('\\') {
+        return Err("invalid characters in patient name".to_string());
+    }
+
+    let base_folder_name = format!("{}, {}", last_name.trim(), first_name.trim());
+    let base_folder_path = workspace.join(&base_folder_name);
+    let new_folder_name = if base_folder_name != old_folder_name && base_folder_path.exists() {
+        if patient_id.is_empty() {
+            return Err("patient id is required because the same name already exists".to_string());
+        }
+        format!("{base_folder_name} ({patient_id})")
+    } else {
+        base_folder_name
+    };
+
+    if new_folder_name.starts_with('.') {
+        return Err("folder name cannot start with a dot".to_string());
+    }
+    if new_folder_name.contains('/') || new_folder_name.contains('\\') {
+        return Err("invalid characters in folder name".to_string());
+    }
+    if !is_valid_patient_folder_name(&new_folder_name) {
+        return Err("new folder name is not a valid patient name".to_string());
+    }
+
+    let mut conn = open_db(&app_handle)?;
+    let workspace_key = workspace.to_string_lossy().to_string();
+    if !patient_id.is_empty()
+        && is_patient_id_taken_in_workspace(
+            &conn,
+            &workspace_key,
+            &patient_id,
+            Some(old_folder_name.as_str()),
+        )?
+    {
+        return Err("patient id already exists".to_string());
+    }
+
+    let old_path = workspace.join(&old_folder_name);
+    if !old_path.exists() || !old_path.is_dir() {
+        return Err("old invalid folder does not exist".to_string());
+    }
+    let new_path = workspace.join(&new_folder_name);
+    if new_folder_name != old_folder_name && new_path.exists() {
+        return Err("target folder already exists".to_string());
+    }
+
+    if new_folder_name != old_folder_name {
+        fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
+    }
+
+    // Ensure renamed folders always have metadata, and keep the ID aligned with the new name if provided.
+    let metadata_path = patient_metadata_path(&new_path);
+    let mut metadata_value = read_patient_metadata_value(&new_path).unwrap_or_else(|| json!({}));
+    if !metadata_value.is_object() {
+        metadata_value = json!({});
+    }
+    if let Some(metadata_obj) = metadata_value.as_object_mut() {
+        let existing_id = metadata_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let final_id = if patient_id.is_empty() { existing_id } else { patient_id.clone() };
+        metadata_obj.insert("id".to_string(), Value::String(final_id));
+        if !metadata_obj.contains_key("keywords") {
+            metadata_obj.insert("keywords".to_string(), json!([]));
+        }
+        if !metadata_obj.contains_key("searchterms") {
+            metadata_obj.insert("searchterms".to_string(), json!([]));
+        }
+    }
+    let metadata_json = serde_json::to_string_pretty(&metadata_value).map_err(|e| e.to_string())?;
+    fs::write(metadata_path, metadata_json).map_err(|e| e.to_string())?;
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_index WHERE workspace_dir = ?1 AND folder_name = ?2",
+        params![workspace_key.clone(), old_folder_name.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_treatment_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_key.clone(), old_folder_name.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_file_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_key.clone(), old_folder_name.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_scan_state WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_key.clone(), old_folder_name],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let _ = reindex_single_patient_in_tx(&tx, &workspace_key, &new_folder_name, &new_path)?;
+    refresh_invalid_workspace_items_in_tx(&tx, &workspace_key, &workspace)?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    Ok(new_folder_name)
 }
 
 #[tauri::command]
@@ -3174,6 +3347,12 @@ fn save_patient_id(
         return Err("id is required".to_string());
     }
 
+    let conn = open_db(&app_handle)?;
+    let workspace_key = workspace.to_string_lossy().to_string();
+    if is_patient_id_taken_in_workspace(&conn, &workspace_key, id, Some(folder_name))? {
+        return Err("patient id already exists".to_string());
+    }
+
     let folder_path = workspace.join(folder_name);
     if !folder_path.exists() || !folder_path.is_dir() {
         return Err("patient folder does not exist".to_string());
@@ -3201,10 +3380,9 @@ fn save_patient_id(
     let metadata_text = metadata_tokens.join(" ");
 
     let (last_name, first_name) = split_patient_name(folder_name);
-    let conn = open_db(&app_handle)?;
     upsert_patient_index_row(
         &conn,
-        &workspace.to_string_lossy(),
+        &workspace_key,
         folder_name,
         &last_name,
         &first_name,
@@ -3328,37 +3506,12 @@ fn is_patient_id_taken(
     }
 
     let conn = open_db(&app_handle)?;
-    let taken = if let Some(folder_name) = exclude_folder_name {
-        let folder_name = folder_name.trim().to_string();
-        conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM patient_index
-                WHERE workspace_dir = ?1
-                  AND patient_id = ?2
-                  AND folder_name != ?3
-             )",
-            params![workspace_dir, patient_id, folder_name],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|e| e.to_string())?
-            != 0
-    } else {
-        conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1
-                FROM patient_index
-                WHERE workspace_dir = ?1
-                  AND patient_id = ?2
-             )",
-            params![workspace_dir, patient_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|e| e.to_string())?
-            != 0
-    };
-
-    Ok(taken)
+    is_patient_id_taken_in_workspace(
+        &conn,
+        &workspace_dir,
+        &patient_id,
+        exclude_folder_name.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -4782,6 +4935,10 @@ fn search_patients_page(
     let mut rows_out: Vec<PatientSearchRow> = Vec::new();
     let page_size = limit.clamp(1, 500);
     let fetch_limit = page_size.saturating_add(1);
+    const UMLAUT_SORT_LAST_NAME_SQL: &str =
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(last_name, 'Ä', 'Ae'), 'Ö', 'Oe'), 'Ü', 'Ue'), 'ä', 'ae'), 'ö', 'oe'), 'ü', 'ue'), 'ß', 'ss'), 'ẞ', 'SS')";
+    const UMLAUT_SORT_FIRST_NAME_SQL: &str =
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(first_name, 'Ä', 'Ae'), 'Ö', 'Oe'), 'Ü', 'Ue'), 'ä', 'ae'), 'ö', 'oe'), 'ü', 'ue'), 'ß', 'ss'), 'ẞ', 'SS')";
 
     if q.is_empty() {
         let mut stmt = conn
@@ -4789,7 +4946,8 @@ fn search_patients_page(
                 "SELECT folder_name, patient_id
                  FROM patient_index
                  WHERE workspace_dir = ?1
-                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+                 ORDER BY REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(last_name, 'Ä', 'Ae'), 'Ö', 'Oe'), 'Ü', 'Ue'), 'ä', 'ae'), 'ö', 'oe'), 'ü', 'ue'), 'ß', 'ss'), 'ẞ', 'SS') COLLATE NOCASE,
+                          REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(first_name, 'Ä', 'Ae'), 'Ö', 'Oe'), 'Ü', 'Ue'), 'ä', 'ae'), 'ö', 'oe'), 'ü', 'ue'), 'ß', 'ss'), 'ẞ', 'SS') COLLATE NOCASE
                  LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| e.to_string())?;
@@ -4815,7 +4973,8 @@ fn search_patients_page(
                 "SELECT folder_name, patient_id
                  FROM patient_index
                  WHERE workspace_dir = ?1 AND search_text LIKE ?2
-                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+                 ORDER BY REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(last_name, 'Ä', 'Ae'), 'Ö', 'Oe'), 'Ü', 'Ue'), 'ä', 'ae'), 'ö', 'oe'), 'ü', 'ue'), 'ß', 'ss'), 'ẞ', 'SS') COLLATE NOCASE,
+                          REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(first_name, 'Ä', 'Ae'), 'Ö', 'Oe'), 'Ü', 'Ue'), 'ä', 'ae'), 'ö', 'oe'), 'ü', 'ue'), 'ß', 'ss'), 'ẞ', 'SS') COLLATE NOCASE
                  LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| e.to_string())?;
@@ -4850,8 +5009,10 @@ fn search_patients_page(
         let limit_idx = query_terms.len() + 2;
         let offset_idx = query_terms.len() + 3;
         sql.push_str(&format!(
-            " ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+            " ORDER BY {} COLLATE NOCASE, {} COLLATE NOCASE
               LIMIT ?{} OFFSET ?{}",
+            UMLAUT_SORT_LAST_NAME_SQL,
+            UMLAUT_SORT_FIRST_NAME_SQL,
             limit_idx, offset_idx
         ));
         bind_values.push(rusqlite::types::Value::Integer(fetch_limit as i64));
@@ -5972,59 +6133,15 @@ fn get_preview_debug_counts(
     if workspace_key.is_empty() {
         return Ok(PreviewDebugCountsRow::default());
     }
-
-    let now = now_ms();
-    let mut row = PreviewDebugCountsRow::default();
-    let mut should_start_refresh = false;
-    let mut loading = false;
-
-    if let Ok(count) = query_db_image_count(&app_handle, &workspace_key) {
-        row.db_image_count = count;
-        if let Ok(mut cache) = preview_debug_counts_store().lock() {
-            let entry = cache
-                .entry(workspace_key.clone())
-                .or_insert_with(PreviewDebugCountsCacheEntry::default);
-            entry.row.db_image_count = count;
-        }
-    }
-
+    let row = compute_preview_debug_counts(&app_handle, &workspace_key)?;
     if let Ok(mut cache) = preview_debug_counts_store().lock() {
         let entry = cache
-            .entry(workspace_key.clone())
+            .entry(workspace_key)
             .or_insert_with(PreviewDebugCountsCacheEntry::default);
-        row = entry.row.clone();
-        loading = entry.running;
-        let stale = now.saturating_sub(entry.updated_ms) > PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS;
-        if (entry.updated_ms == 0 || stale) && !entry.running {
-            entry.running = true;
-            should_start_refresh = true;
-            loading = true;
-        }
+        entry.row = row.clone();
+        entry.updated_ms = now_ms();
+        entry.running = false;
     }
-
-    if should_start_refresh {
-        let app_handle_clone = app_handle.clone();
-        let workspace_key_clone = workspace_key.clone();
-        tauri::async_runtime::spawn_blocking(move || {
-            let result = if let Some(_io_guard) = HeavyIoTaskGuard::acquire() {
-                compute_preview_debug_counts(&app_handle_clone, &workspace_key_clone)
-            } else {
-                Err("heavy io busy".to_string())
-            };
-            if let Ok(mut cache) = preview_debug_counts_store().lock() {
-                let entry = cache
-                    .entry(workspace_key_clone.clone())
-                    .or_insert_with(PreviewDebugCountsCacheEntry::default);
-                if let Ok(next_row) = result {
-                    entry.row = next_row;
-                    entry.updated_ms = now_ms();
-                }
-                entry.running = false;
-            }
-        });
-    }
-
-    row.loading = loading;
     Ok(row)
 }
 
@@ -6059,52 +6176,9 @@ fn compute_preview_debug_counts(
     app_handle: &tauri::AppHandle,
     workspace_dir: &str,
 ) -> Result<PreviewDebugCountsRow, String> {
-    let workspace = PathBuf::from(workspace_dir.trim());
     let db_image_count = query_db_image_count(app_handle, workspace_dir)?;
-    let conn = open_db(app_handle)?;
-
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let mut mapped_count = 0_u64;
-    let mut stmt = conn
-        .prepare(
-            "SELECT patient_folder, treatment_folder, file_name, size_bytes, modified_ms
-             FROM patient_file_index
-             WHERE workspace_dir = ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![workspace_dir], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    for row in rows {
-        let (patient_folder, treatment_folder, file_name, size_bytes, modified_ms) =
-            row.map_err(|e| e.to_string())?;
-        let path = if treatment_folder.trim().is_empty() {
-            workspace.join(patient_folder).join(file_name)
-        } else {
-            workspace.join(patient_folder).join(treatment_folder).join(file_name)
-        };
-        if !is_supported_preview_image(&path) {
-            continue;
-        }
-        let cache_file_path = resolve_existing_cache_file_path(
-            &cache_dir,
-            &path,
-            size_bytes.max(0) as u64,
-            modified_ms.max(0) as u64,
-        );
-        if cache_file_path.exists() {
-            mapped_count = mapped_count.saturating_add(1);
-        }
-    }
-    let cache_image_count = mapped_count;
+    let cache_image_count = compute_preview_cache_image_count(&cache_dir);
 
     Ok(PreviewDebugCountsRow {
         db_image_count,
@@ -6404,6 +6478,7 @@ pub fn run() {
             list_treatment_files,
             list_treatment_files_page,
             create_patient_with_metadata,
+            rename_invalid_patient_folder,
             save_patient_metadata,
             save_patient_id,
             load_patient_keywords,
