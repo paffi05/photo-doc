@@ -389,6 +389,8 @@ let indexingProgressRunning = false;
 let indexingProgressMessage = "Up to date";
 let indexingCountsSuffix = "";
 let indexingCustomSuffix = "";
+let previewImagesCreatedActiveCount = 0;
+let previewImagesCreatedDbCount = 0;
 let previewFillProgressMessage = "";
 let previewFillProgressCompleted = 0;
 let previewFillProgressTotal = 0;
@@ -419,7 +421,7 @@ let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
 let patientFormMode = "create";
 let invalidFolderEditingName = "";
-let systemAppVersion = "1.0.12";
+let systemAppVersion = "1.0.13";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -990,15 +992,36 @@ function setIndexingDebugCountsUi(dbImageCount = 0, cacheImageCount = 0, { show 
   renderIndexingProgressText();
 }
 
-function setPreviewImagesCreatedUi(activeFolderImageCount = 0, dbImageCount = 0, { loading = false } = {}) {
+function setPreviewImagesCreatedUi(
+  activeFolderImageCount = 0,
+  dbImageCount = 0,
+  { loading = false, updateDbTotal = false } = {}
+) {
   if (!previewImagesCreatedCount) return;
-  if (loading) {
-    previewImagesCreatedCount.textContent = "(.../...)";
-    return;
-  }
   const active = Math.max(0, Number(activeFolderImageCount) || 0);
   const db = Math.max(0, Number(dbImageCount) || 0);
-  previewImagesCreatedCount.textContent = `(${active}/${db})`;
+  if (!loading) {
+    previewImagesCreatedActiveCount = active;
+    if (updateDbTotal) {
+      previewImagesCreatedDbCount = db;
+    }
+  } else if (updateDbTotal) {
+    previewImagesCreatedDbCount = db;
+  }
+  previewImagesCreatedCount.textContent = `(${previewImagesCreatedActiveCount}/${previewImagesCreatedDbCount})`;
+}
+
+async function refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir = currentWorkspaceDir) {
+  if (!workspaceDir || startupView?.hidden) return;
+  try {
+    const dbImageCount = await invoke("get_db_image_count", { workspaceDir });
+    setPreviewImagesCreatedUi(previewImagesCreatedActiveCount, dbImageCount, {
+      loading: false,
+      updateDbTotal: true,
+    });
+  } catch (err) {
+    console.error("get_db_image_count failed:", err);
+  }
 }
 
 function setIndexingCustomSuffixUi(suffix = "") {
@@ -1112,10 +1135,11 @@ function updateCacheReloadButtonState() {
 }
 
 async function refreshIndexingDebugCounts() {
+  if (!sidebarLayout.isSettingsOpen()) return;
   if (!currentWorkspaceDir) {
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: false });
-    setPreviewImagesCreatedUi(0, 0, { loading: false });
+    setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
     return;
   }
   if (indexingDebugCountsInFlight) return;
@@ -1126,8 +1150,21 @@ async function refreshIndexingDebugCounts() {
     const dbImageCount = Number(stats?.db_image_count ?? stats?.dbImageCount ?? 0) || 0;
     const cacheImageCount = Number(stats?.cache_image_count ?? stats?.cacheImageCount ?? 0) || 0;
     setIndexingCategoryTitle(dbImageCount, { loading });
-    setPreviewImagesCreatedUi(cacheImageCount, dbImageCount, { loading });
+    setPreviewImagesCreatedUi(cacheImageCount, dbImageCount, { loading, updateDbTotal: false });
     setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: shouldShowIndexingDebugCounts() });
+    if (loading && indexingCountsWarmRetryTimerId === null) {
+      const workspaceKey = String(currentWorkspaceDir ?? "").trim();
+      if (workspaceKey) {
+        indexingCountsWarmRetryWorkspace = workspaceKey;
+        indexingCountsWarmRetryTimerId = setTimeout(() => {
+          indexingCountsWarmRetryTimerId = null;
+          if (String(currentWorkspaceDir ?? "").trim() !== workspaceKey) return;
+          if (!sidebarLayout.isSettingsOpen()) return;
+          void refreshIndexingDebugCounts();
+        }, 650);
+      }
+      return;
+    }
     if (dbImageCount === 0 && cacheImageCount === 0) {
       const workspaceKey = String(currentWorkspaceDir ?? "").trim();
       if (
@@ -1153,7 +1190,7 @@ async function refreshIndexingDebugCounts() {
     console.error("get_preview_debug_counts failed:", err);
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: shouldShowIndexingDebugCounts() });
-    setPreviewImagesCreatedUi(0, 0, { loading: false });
+    setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: false });
   } finally {
     indexingDebugCountsInFlight = false;
   }
@@ -1436,7 +1473,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.12").trim() || "1.0.12";
+  const safeVersion = String(version || "1.0.13").trim() || "1.0.13";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -2889,7 +2926,7 @@ function clearPatients() {
   setPreviewFillRunning(false);
   setIndexingProgressUi({ running: false, message: "Up to date" });
   setIndexingDebugCountsUi(0, 0, { show: false });
-  setPreviewImagesCreatedUi(0, 0, { loading: false });
+  setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
   setDbStatusIdle();
 }
 
@@ -2914,6 +2951,8 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
       onStartupStage: (message) => setStartupProcessStatus(message),
     });
   }
+  setStartupProcessStatus("Counting indexed images...");
+  await refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir);
   setStartupProcessStatus("Finalizing startup...");
   appView.hidden = false;
   if (startupView) startupView.hidden = true;
@@ -3742,6 +3781,10 @@ systemInstallBtn?.addEventListener("click", () => {
 settingsBody?.addEventListener("scroll", syncSettingsHeaderScrollState);
 openBtn?.addEventListener("click", () => {
   setTimeout(syncSettingsHeaderScrollState, 0);
+  requestAnimationFrame(() => {
+    if (!sidebarLayout.isSettingsOpen()) return;
+    void refreshIndexingDebugCounts();
+  });
 });
 closeBtn?.addEventListener("click", () => {
   panel?.classList.remove("is-scrolled");
@@ -3804,7 +3847,7 @@ sidebarLayout.applyPatientSidebarMode();
 sidebarLayout.updateTopButtonSpacing();
 updateAddPatientFormState();
 renderPatientList([], "");
-setPreviewImagesCreatedUi(0, 0, { loading: false });
+setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
 void listen("preview-fill-status", (event) => {
   const running = Boolean(event?.payload?.running);
   setPreviewFillRunning(running);

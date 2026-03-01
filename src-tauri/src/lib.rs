@@ -5655,12 +5655,18 @@ fn start_import_files(
         if e.is_empty() {
             return Err("existing folder is empty".to_string());
         }
+        if e.contains('/') || e.contains('\\') {
+            return Err("existing folder contains invalid path separators".to_string());
+        }
         e
     } else {
         let d = date.unwrap_or_default().trim().to_string();
         let t = treatment_name.unwrap_or_default().trim().to_string();
         if d.is_empty() || t.is_empty() {
             return Err("date and folder name are required for new folder".to_string());
+        }
+        if t.contains('/') || t.contains('\\') {
+            return Err("folder name cannot contain / or \\".to_string());
         }
         format!("{d} {t}")
     };
@@ -6303,51 +6309,13 @@ fn compute_preview_debug_counts(
 ) -> Result<PreviewDebugCountsRow, String> {
     let workspace = PathBuf::from(workspace_dir.trim());
     let db_image_count = query_db_image_count(app_handle, workspace_dir)?;
-    let conn = open_db(app_handle)?;
 
-    let cache_dir = get_active_preview_cache_dir(app_handle);
-    let mut mapped_count = 0_u64;
-    let mut stmt = conn
-        .prepare(
-            "SELECT patient_folder, treatment_folder, file_name, size_bytes, modified_ms
-             FROM patient_file_index
-             WHERE workspace_dir = ?1",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![workspace_dir], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-            ))
-        })
-        .map_err(|e| e.to_string())?;
-    for row in rows {
-        let (patient_folder, treatment_folder, file_name, size_bytes, modified_ms) =
-            row.map_err(|e| e.to_string())?;
-        let path = if treatment_folder.trim().is_empty() {
-            workspace.join(patient_folder).join(file_name)
-        } else {
-            workspace.join(patient_folder).join(treatment_folder).join(file_name)
-        };
-        if !is_supported_preview_image(&path) {
-            continue;
-        }
-        let cache_file_path = resolve_existing_cache_file_path(
-            &cache_dir,
-            &path,
-            Some(&workspace),
-            size_bytes.max(0) as u64,
-            modified_ms.max(0) as u64,
-        );
-        if cache_file_path.exists() {
-            mapped_count = mapped_count.saturating_add(1);
-        }
-    }
-    let cache_image_count = mapped_count;
+    // Always report "Previews created" against workspace main cache,
+    // independent from local-cache mode on this client.
+    let cache_dir = get_local_cache_copy_dir(&workspace);
+    fs::create_dir_all(&cache_dir).ok();
+    hide_path_on_windows(&cache_dir);
+    let cache_image_count = compute_preview_cache_image_count(&cache_dir);
 
     Ok(PreviewDebugCountsRow {
         db_image_count,

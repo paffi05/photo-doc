@@ -1307,12 +1307,12 @@ body{
 }
 
 .treatment-previews-progress.checking-cache{
-  color: rgba(190,24,93,0.9);
+  color: rgba(15,23,42,0.5);
 }
 
 .treatment-previews-progress.checking-cache .treatment-previews-spinner{
-  border-color: rgba(236,72,153,0.34);
-  border-top-color: #ec4899;
+  border-color: rgba(225,29,138,0.26);
+  border-top-color: #e11d8a;
 }
 
 @keyframes treatmentPreviewSpin {
@@ -2112,6 +2112,12 @@ body{
   border-color: rgba(229,231,235,0.55);
   color: rgba(229,231,235,0.88);
   cursor: not-allowed;
+}
+
+.main-import-input.invalid-input,
+.main-import-input.invalid-input:focus{
+  border-color: rgba(248,113,113,0.95);
+  box-shadow: 0 0 0 2px rgba(248,113,113,0.22);
 }
 
 .main-import-checkbox{

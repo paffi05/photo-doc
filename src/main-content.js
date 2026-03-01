@@ -972,6 +972,10 @@ export function initMainContent({
     return (folderName ?? "").replace(/^\d{4}-\d{2}-\d{2}\s*/, "").trim();
   }
 
+  function hasInvalidTreatmentFolderName(value = "") {
+    return /[\\/]/.test(String(value ?? "").trim());
+  }
+
   function buildTimelinePoint({ date = "", treatment = "", timelineKey = "", folderName = "" } = {}) {
     const point = document.createElement("div");
     point.className = "main-timeline-point";
@@ -1384,8 +1388,16 @@ export function initMainContent({
 
   function updateImportStartEnabled() {
     const hasExistingSelection = Boolean(getSelectedTimelineFolderName());
-    const hasNewFolderInput = Boolean(importDate?.value && importTreatmentName?.value.trim());
-    importStartBtn.disabled = !(hasExistingSelection || hasNewFolderInput);
+    const treatmentValue = String(importTreatmentName?.value ?? "").trim();
+    const invalidTreatmentName = hasInvalidTreatmentFolderName(treatmentValue);
+    const hasNewFolderInput = Boolean(importDate?.value && treatmentValue);
+    if (importTreatmentName) {
+      importTreatmentName.classList.toggle("invalid-input", invalidTreatmentName);
+      importTreatmentName.title = invalidTreatmentName
+        ? "Folder name cannot contain / or \\"
+        : "";
+    }
+    importStartBtn.disabled = !hasExistingSelection && (!hasNewFolderInput || invalidTreatmentName);
   }
 
   async function prepareImportPanel(droppedPaths = [], { append = true } = {}) {
@@ -1755,6 +1767,13 @@ export function initMainContent({
   importDeleteOrigin?.addEventListener("change", () => {
     importDeleteOriginPreference = Boolean(importDeleteOrigin.checked);
   });
+  importPanel?.addEventListener("keydown", (e) => {
+    if (e.key !== "Enter") return;
+    if (importPanel.hidden) return;
+    if (!importStartBtn || importStartBtn.disabled) return;
+    e.preventDefault();
+    importStartBtn.click();
+  });
   importTreatmentName?.addEventListener("input", () => {
     if (importTreatmentName.value.trim() && selectedTimelinePoint) {
       setSelectedTimelinePoint(null);
@@ -1843,6 +1862,7 @@ export function initMainContent({
       const treatmentName = importTreatmentName.value.trim();
       const date = importDate.value;
       if (isNew && (!date || !treatmentName)) return;
+      if (isNew && hasInvalidTreatmentFolderName(treatmentName)) return;
 
       try {
         if (typeof onImportDebugStateChange === "function") {
@@ -1875,6 +1895,12 @@ export function initMainContent({
         if (startedTargetFolder) {
           selectedTimelineKey = startedTargetFolder;
           await refreshTimeline();
+          requestAnimationFrame(() => {
+            const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
+            if (!selectedPoint) return;
+            ensureTimelinePointVisible(selectedPoint);
+            positionImportProgressCapsules();
+          });
         }
       } catch (err) {
         console.error("start_import_files failed:", err);
@@ -2008,7 +2034,15 @@ export function initMainContent({
         patientFolder: normalizedPatient,
       });
       selectedTimelineKey = normalizedTarget;
-      void refreshTimeline();
+      void (async () => {
+        await refreshTimeline();
+        requestAnimationFrame(() => {
+          const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
+          if (!selectedPoint) return;
+          ensureTimelinePointVisible(selectedPoint);
+          positionImportProgressCapsules();
+        });
+      })();
     },
   };
 }
