@@ -585,8 +585,11 @@ export function createTreatmentFilesPanel({
       // Render immediately so overview cards are visible even if preview lookup is slow.
       renderOverviewCards();
 
+      if (priorityPaths.length > 0) {
+        setPreviewCacheCheckStatus();
+      }
       try {
-        previewSrcByPath = await loadExistingCachedPreviewDataSrcMap(priorityPaths);
+        previewSrcByPath = await loadExistingCachedPreviewSrcMap(priorityPaths);
       } catch {
         previewSrcByPath = new Map();
       }
@@ -692,8 +695,11 @@ export function createTreatmentFilesPanel({
 
         stageTwoTotal += pageStageTwoPaths.length;
         let stageTwoCacheMap = new Map();
+        if (pageStageTwoPaths.length > 0) {
+          setPreviewCacheCheckStatus();
+        }
         try {
-          stageTwoCacheMap = await loadExistingCachedPreviewDataSrcMap(pageStageTwoPaths);
+          stageTwoCacheMap = await loadExistingCachedPreviewSrcMap(pageStageTwoPaths);
         } catch {
           stageTwoCacheMap = new Map();
         }
