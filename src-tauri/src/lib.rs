@@ -5354,8 +5354,18 @@ fn get_import_files_created_ms(paths: Vec<String>) -> Result<Vec<Option<u64>>, S
             out.push(None);
             continue;
         }
-        let (created_ms, _modified_ms) = file_time_ms_from_meta(&meta);
-        out.push(Some(created_ms));
+        let (created_ms, modified_ms) = file_time_ms_from_meta(&meta);
+        let picked_ms = match (created_ms > 0, modified_ms > 0) {
+            (true, true) => created_ms.min(modified_ms),
+            (true, false) => created_ms,
+            (false, true) => modified_ms,
+            (false, false) => 0,
+        };
+        if picked_ms > 0 {
+            out.push(Some(picked_ms));
+        } else {
+            out.push(None);
+        }
     }
     Ok(out)
 }

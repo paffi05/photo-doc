@@ -178,6 +178,7 @@ export function initMainContent({
   let isImportFilesListExpanded = false;
   let importImagePreviewByPath = new Map();
   let importPreviewRequestId = 0;
+  let importDeleteOriginPreference = false;
   const IMPORT_PREVIEW_MAX_ITEMS = 160;
   const IMPORT_PREVIEW_CONCURRENCY = 4;
   const importJobs = new Map();
@@ -453,7 +454,6 @@ export function initMainContent({
     importPanel.hidden = !visible;
     mainCanvas.classList.toggle("import-setup-open", visible);
     if (!visible) {
-      importDeleteOrigin.checked = false;
       lastDroppedPaths = [];
       importImagePreviewByPath = new Map();
       isImportFilesListExpanded = false;
@@ -463,6 +463,9 @@ export function initMainContent({
       contentScrollLayer.scrollTop = 0;
       mainCanvas.classList.remove("main-header-frost-visible");
       return;
+    }
+    if (importDeleteOrigin) {
+      importDeleteOrigin.checked = Boolean(importDeleteOriginPreference);
     }
     treatmentFilesPanel.clear();
     contentScrollLayer.scrollTop = 0;
@@ -1749,6 +1752,9 @@ export function initMainContent({
   });
 
   importDate?.addEventListener("input", updateImportStartEnabled);
+  importDeleteOrigin?.addEventListener("change", () => {
+    importDeleteOriginPreference = Boolean(importDeleteOrigin.checked);
+  });
   importTreatmentName?.addEventListener("input", () => {
     if (importTreatmentName.value.trim() && selectedTimelinePoint) {
       setSelectedTimelinePoint(null);
