@@ -325,19 +325,67 @@ body{
 .patient-add-confirm-btn:disabled{
   color: #000000;
   border-color: #000000;
-  background: #2563eb;
+  background: transparent;
   cursor: not-allowed;
 }
 
 .patient-add-confirm-btn:disabled:hover{
   color: #000000;
   border-color: #000000;
-  background: #2563eb;
+  background: transparent;
   transform: none;
 }
 
 .patient-add-confirm-btn:focus{
   box-shadow: none;
+}
+
+.patient-add-form.invalid-edit-mode{
+  background: #f59e0b;
+  border-color: transparent;
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-input{
+  border-color: #000000;
+  background: #f59e0b;
+  color: #000000;
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-input:focus{
+  border-color: #000000;
+  box-shadow: 0 0 0 2px rgba(0,0,0,0.12);
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-input.invalid-id,
+.patient-add-form.invalid-edit-mode .patient-add-input.invalid-id:focus,
+.patient-add-form.invalid-edit-mode .patient-add-input.duplicate-id,
+.patient-add-form.invalid-edit-mode .patient-add-input.duplicate-id:focus{
+  border-color: #ffffff;
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-input::placeholder{
+  color: rgba(0,0,0,0.62);
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-confirm-btn{
+  color: #000000;
+  background: #f59e0b;
+  border-color: #000000;
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-confirm-btn:not(:disabled),
+.patient-add-form.invalid-edit-mode .patient-add-confirm-btn:not(:disabled):hover,
+.patient-add-form.invalid-edit-mode .patient-add-confirm-btn:not(:disabled):focus,
+.patient-add-form.invalid-edit-mode .patient-add-confirm-btn:not(:disabled):active{
+  color: #000000;
+  border-color: #000000;
+  background: #f59e0b;
+}
+
+.patient-add-form.invalid-edit-mode .patient-add-confirm-btn:disabled{
+  color: #ffffff;
+  border-color: #ffffff;
+  background: transparent;
 }
 
 .app.compact-sidebar .patient-sidebar{
@@ -445,6 +493,68 @@ body{
 
 .patient-item:hover{
   color: #2563eb;
+}
+
+.patient-item.invalid-folder{
+  color: #5b6472;
+}
+
+.patient-item.invalid-folder.invalid-start{
+  margin-top: 7px;
+}
+
+.patient-item.invalid-folder:hover{
+  color: #5b6472;
+}
+
+.patient-invalid-flag{
+  width: 14px;
+  height: 14px;
+  margin-right: 8px;
+  color: #f59e0b;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.patient-invalid-flag .icon{
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.patient-invalid-edit-btn{
+  margin-left: auto;
+  margin-right: 4px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 0;
+  background: #f59e0b;
+  color: #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.patient-invalid-edit-icon{
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 12px;
+  height: 12px;
+  display: block;
+  color: #ffffff;
+  transform: translate(-50%, -50%) rotate(-48deg);
+}
+
+.patient-invalid-edit-btn:hover{
+  background: #f59e0b;
 }
 
 .patient-import-spinner{

@@ -167,7 +167,7 @@ function renderInvalidPatientFoldersPanel() {
 
   setInvalidPanelExpanded(expanded);
   invalidPatientFoldersPanel.setAttribute("aria-hidden", expanded ? "false" : "true");
-  invalidPatientFoldersBtn?.classList.toggle("active", expanded);
+  syncInvalidPatientFoldersButtonActiveState();
 
   invalidPatientFoldersList.innerHTML = "";
   if (!expanded) return;
@@ -216,6 +216,18 @@ function renderInvalidPatientFoldersPanel() {
       void refreshInvalidPatientFolderWarning(currentWorkspaceDir, { append: true });
     });
   }
+}
+
+function isInvalidRenameFormExpanded() {
+  return patientFormMode === "invalid_rename" &&
+    Boolean(addPatientForm?.classList.contains("expanded"));
+}
+
+function syncInvalidPatientFoldersButtonActiveState() {
+  if (!invalidPatientFoldersBtn) return;
+  const hasInvalidItems = Boolean(currentWorkspaceDir) && invalidPatientFolderCount > 0;
+  const active = hasInvalidItems && (invalidPatientFoldersPanelExpanded || isInvalidRenameFormExpanded());
+  invalidPatientFoldersBtn.classList.toggle("active", active);
 }
 
 function setInvalidPatientFolderWarningUi(count = 0, folderNames = [], fileNames = [], hasMore = false) {
@@ -405,7 +417,9 @@ let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
-let systemAppVersion = "1.0.6";
+let patientFormMode = "create";
+let invalidFolderEditingName = "";
+let systemAppVersion = "1.0.9";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -1432,7 +1446,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.6").trim() || "1.0.6";
+  const safeVersion = String(version || "1.0.9").trim() || "1.0.9";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
@@ -1572,7 +1586,13 @@ function splitPatientName(folderName) {
 
 function normalizePatientEntry(entry) {
   if (typeof entry === "string") {
-    return { folderName: entry, patientId: "", keywords: [], matchedKeywords: [] };
+    return {
+      folderName: entry,
+      patientId: "",
+      keywords: [],
+      matchedKeywords: [],
+      invalidFolder: false,
+    };
   }
 
   const folderName =
@@ -1598,8 +1618,72 @@ function normalizePatientEntry(entry) {
   };
   const keywords = normalizeKeywords(keywordsRaw);
   const matchedKeywords = normalizeKeywords(matchedKeywordsRaw);
+  const invalidFolder = Boolean(entry?.invalid_folder ?? entry?.invalidFolder ?? false);
+  const invalidStart = Boolean(entry?.invalid_start ?? entry?.invalidStart ?? false);
 
-  return { folderName, patientId, keywords, matchedKeywords };
+  return { folderName, patientId, keywords, matchedKeywords, invalidFolder, invalidStart };
+}
+
+function splitPatientSearchTerms(query = "") {
+  const q = String(query ?? "").trim().toLowerCase();
+  if (!q) return [];
+  if (q.includes(",")) {
+    return q
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean);
+  }
+  return q
+    .split(/\s+/u)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function normalizeSearchComparable(value = "") {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
+
+function folderNameMatchesSearchTerms(folderName = "", terms = []) {
+  const text = normalizeSearchComparable(String(folderName ?? "").trim());
+  if (!text || !Array.isArray(terms) || terms.length < 1) return false;
+  return terms.every((term) => text.includes(normalizeSearchComparable(term)));
+}
+
+async function loadInvalidFolderSearchMatches(workspaceDir, query = "") {
+  const workspace = String(workspaceDir ?? "").trim();
+  const terms = splitPatientSearchTerms(query);
+  if (!workspace || terms.length < 1) return [];
+  try {
+    const row = await withTimeout(
+      invoke("get_invalid_patient_folders_page", {
+        workspaceDir: workspace,
+        offset: 0,
+        limit: 500,
+      }),
+      12000,
+      "get_invalid_patient_folders_page search matches",
+    );
+    const invalidFolders = Array.isArray(row?.invalid_folders ?? row?.invalidFolders)
+      ? (row?.invalid_folders ?? row?.invalidFolders)
+      : [];
+    return invalidFolders
+      .filter((name) => folderNameMatchesSearchTerms(name, terms))
+      .map((folderName) => ({
+        folderName: String(folderName ?? "").trim(),
+        patientId: "",
+        keywords: [],
+        matchedKeywords: [],
+        invalidFolder: true,
+        invalidStart: false,
+      }))
+      .filter((rowEntry) => Boolean(rowEntry.folderName));
+  } catch (err) {
+    console.error("load invalid folder search matches failed:", err);
+    return [];
+  }
 }
 
 function cachePatientEntries(entries = []) {
@@ -2065,6 +2149,24 @@ function normalizePatientNameForCreate(value) {
   return String(value ?? "").replace(/\s+$/u, "");
 }
 
+function extractPatientIdFromFolderName(folderName = "") {
+  const text = String(folderName ?? "").trim();
+  const match = text.match(/\s\(([^()]+)\)\s*$/u);
+  return String(match?.[1] ?? "").trim();
+}
+
+function setPatientFormMode(mode = "create") {
+  patientFormMode = mode === "invalid_rename" ? "invalid_rename" : "create";
+  addPatientForm?.classList.toggle("invalid-edit-mode", patientFormMode === "invalid_rename");
+  if (confirmAddPatientBtn) {
+    confirmAddPatientBtn.setAttribute(
+      "aria-label",
+      patientFormMode === "invalid_rename" ? "Rename invalid folder" : "Create patient",
+    );
+  }
+  syncInvalidPatientFoldersButtonActiveState();
+}
+
 function isNumericPatientId(value) {
   return /^\d+$/.test(value);
 }
@@ -2090,6 +2192,24 @@ function isAddPatientFormValid() {
   const lastName = normalizePatientNameForCreate(newPatientLastName?.value);
   const firstName = normalizePatientNameForCreate(newPatientFirstName?.value);
   const patientId = normalizePatientFieldValue(newPatientId?.value);
+  if (patientFormMode === "invalid_rename") {
+    const hasInvalidChars =
+      [lastName, firstName, patientId].some((v) =>
+        String(v ?? "").includes(",") ||
+        String(v ?? "").includes("(") ||
+        String(v ?? "").includes(")") ||
+        String(v ?? "").includes("/") ||
+        String(v ?? "").includes("\\")
+      );
+    const hasInvalidId = Boolean(patientId) && !isNumericPatientId(patientId);
+    return Boolean(
+      lastName.trim() &&
+      firstName.trim() &&
+      patientId &&
+      !hasInvalidChars &&
+      !hasInvalidId,
+    );
+  }
   return Boolean(
     lastName.trim() &&
     firstName.trim() &&
@@ -2111,6 +2231,9 @@ function updateAddPatientFormState() {
 async function checkAddPatientIdUniqueness() {
   const token = ++addPatientIdCheckToken;
   const patientId = normalizePatientFieldValue(newPatientId?.value);
+  const excludeFolderName = patientFormMode === "invalid_rename"
+    ? String(invalidFolderEditingName ?? "").trim()
+    : null;
 
   addPatientIdTaken = false;
   addPatientIdChecking = false;
@@ -2121,7 +2244,7 @@ async function checkAddPatientIdUniqueness() {
 
   addPatientIdChecking = true;
   updateAddPatientFormState();
-  const taken = await isPatientIdTaken(patientId);
+  const taken = await isPatientIdTaken(patientId, { excludeFolderName });
   if (token !== addPatientIdCheckToken) return;
 
   addPatientIdTaken = Boolean(taken);
@@ -2144,12 +2267,42 @@ function setAddPatientFormVisible(visible) {
   if (!addPatientForm) return;
   setAddPatientPanelExpanded(visible);
   addPatientForm.setAttribute("aria-hidden", visible ? "false" : "true");
-  addPatientBtn?.classList.toggle("active", visible);
+  addPatientBtn?.classList.toggle("active", visible && patientFormMode === "create");
+  if (!visible) {
+    setPatientFormMode("create");
+    invalidFolderEditingName = "";
+  }
   if (visible) {
     updateAddPatientFormState();
     void checkAddPatientIdUniqueness();
+    requestAnimationFrame(() => {
+      syncInvalidPatientFoldersButtonActiveState();
+    });
+    if (patientFormMode === "invalid_rename") {
+      newPatientLastName?.focus();
+      return;
+    }
     newPatientLastName?.focus();
+    return;
   }
+  syncInvalidPatientFoldersButtonActiveState();
+}
+
+function openInvalidFolderRenameForm(folderName = "") {
+  const target = String(folderName ?? "").trim();
+  if (!target) return;
+  const { lastName, firstName } = splitPatientName(target);
+  const patientId = extractPatientIdFromFolderName(target);
+  invalidFolderEditingName = target;
+  setPatientFormMode("invalid_rename");
+  if (newPatientLastName) newPatientLastName.value = lastName;
+  if (newPatientFirstName) newPatientFirstName.value = firstName;
+  if (newPatientId) newPatientId.value = patientId;
+  addPatientIdTaken = false;
+  addPatientIdChecking = false;
+  newPatientId?.classList.remove("duplicate-id");
+  setAddPatientFormVisible(true);
+  updateAddPatientFormState();
 }
 
 function setPatientListLoading(loading) {
@@ -2170,18 +2323,41 @@ function updatePatientSelectionInList() {
 }
 
 function buildPatientListItem(entry) {
-  const { folderName, patientId, keywords, matchedKeywords } = normalizePatientEntry(entry);
+  const {
+    folderName,
+    patientId,
+    keywords,
+    matchedKeywords,
+    invalidFolder,
+    invalidStart,
+  } = normalizePatientEntry(entry);
   if (!folderName) return null;
   const { lastName, firstName } = splitPatientName(folderName);
   const item = document.createElement("li");
   item.className = "patient-item";
+  if (invalidFolder) item.classList.add("invalid-folder");
+  if (invalidFolder && invalidStart) item.classList.add("invalid-start");
   item.dataset.folderName = folderName;
   const wizardLockActive = Boolean(importWizardLinkedPatient && String(importWizardLinkedPatient).trim());
   const isWizardTargetPatient = wizardLockActive && folderName === importWizardLinkedPatient;
-  item.draggable = true;
+  item.draggable = !invalidFolder;
   let dragged = false;
   if (folderName === selectedPatient) {
     item.classList.add("selected");
+  }
+
+  if (invalidFolder) {
+    const invalidIcon = document.createElement("span");
+    invalidIcon.className = "patient-invalid-flag";
+    invalidIcon.setAttribute("aria-hidden", "true");
+    invalidIcon.innerHTML = `
+      <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M12 4L21 20H3L12 4Z" fill="currentColor"/>
+        <path d="M12 9.8V13.8" stroke="#000000" stroke-width="1.5" stroke-linecap="round"/>
+        <circle cx="12" cy="16.7" r="0.9" fill="#000000"/>
+      </svg>
+    `;
+    item.appendChild(invalidIcon);
   }
 
   if (isWizardTargetPatient) {
@@ -2217,6 +2393,27 @@ function buildPatientListItem(entry) {
     item.appendChild(id);
   }
 
+  if (invalidFolder) {
+    const editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.className = "patient-invalid-edit-btn";
+    editBtn.setAttribute("aria-label", "Rename invalid folder");
+    editBtn.setAttribute("title", "Rename invalid folder");
+    editBtn.innerHTML = `
+      <svg class="patient-invalid-edit-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M20 10H9L4 12L9 14H20L21.5 12L20 10Z"
+          fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M9 10L7 12L9 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    `;
+    editBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      openInvalidFolderRenameForm(folderName);
+    });
+    item.appendChild(editBtn);
+  }
+
   const shownKeywords = matchedKeywords.length > 0 ? matchedKeywords : [];
   if (shownKeywords.length > 0) {
     const meta = document.createElement("span");
@@ -2227,6 +2424,7 @@ function buildPatientListItem(entry) {
   }
 
   item.addEventListener("click", () => {
+    if (invalidFolder) return;
     if (dragged) {
       dragged = false;
       return;
@@ -2240,6 +2438,10 @@ function buildPatientListItem(entry) {
   });
 
   item.addEventListener("dragstart", (event) => {
+    if (invalidFolder) {
+      event?.preventDefault?.();
+      return;
+    }
     dragged = true;
     const dt = event?.dataTransfer;
     if (!dt) return;
@@ -2249,6 +2451,10 @@ function buildPatientListItem(entry) {
   });
 
   item.addEventListener("dragend", () => {
+    if (invalidFolder) {
+      dragged = false;
+      return;
+    }
     if (!currentWorkspaceDir || !folderName) {
       dragged = false;
       return;
@@ -2381,6 +2587,9 @@ async function searchPatients(query = "", { append = false } = {}) {
     const selectedFolder = String(selectedPatient ?? "").trim();
     const shouldLocateSelectedOnClear = !append && !normalizedQuery && Boolean(selectedFolder);
     shouldEnsureSelectedPatientVisible = shouldLocateSelectedOnClear;
+    const invalidSearchRows = (!append && normalizedQuery)
+      ? await loadInvalidFolderSearchMatches(currentWorkspaceDir, normalizedQuery)
+      : [];
 
     const page = await fetchPage(patientSearchOffset);
     const firstRows = Array.isArray(page?.rows) ? page.rows : [];
@@ -2405,7 +2614,16 @@ async function searchPatients(query = "", { append = false } = {}) {
       }
     }
 
-    const rows = append ? rawRows : prependSelectedPatientIfMissing(rawRows, normalizedQuery);
+    let rows = append ? rawRows : prependSelectedPatientIfMissing(rawRows, normalizedQuery);
+    if (!append && normalizedQuery && invalidSearchRows.length > 0) {
+      rows = [
+        ...rows,
+        ...invalidSearchRows.map((entry, idx) => ({
+          ...entry,
+          invalidStart: idx === 0,
+        })),
+      ];
+    }
     patientSearchHasMore = hasMore;
     patientSearchOffset = nextOffset;
     if (append) {
@@ -3304,16 +3522,38 @@ previewSpeedSlider?.addEventListener("change", async (e) => {
   }
 });
 addPatientBtn?.addEventListener("click", () => {
+  const wasInvalidRename = patientFormMode === "invalid_rename";
+  setPatientFormMode("create");
+  invalidFolderEditingName = "";
+  resetAddPatientForm();
   if (sidebarLayout.isCompactPatientSidebarMode() && sidebarLayout.isPatientSidebarHidden()) {
     sidebarLayout.setPatientSidebarHidden(false);
     return;
   }
   const isExpanded = addPatientForm?.classList.contains("expanded") ?? false;
+  if (isExpanded && wasInvalidRename) {
+    setAddPatientFormVisible(true);
+    return;
+  }
   setAddPatientFormVisible(!isExpanded);
 });
 invalidPatientFoldersBtn?.addEventListener("click", () => {
-  if (invalidPatientFolderCount <= 0) return;
-  invalidPatientFoldersPanelExpanded = !invalidPatientFoldersPanelExpanded;
+  const hasInvalidItems = invalidPatientFolderCount > 0;
+  const invalidRenameExpanded = isInvalidRenameFormExpanded();
+  if (!hasInvalidItems && !invalidRenameExpanded) return;
+
+  const isActive = hasInvalidItems && (invalidPatientFoldersPanelExpanded || invalidRenameExpanded);
+  if (isActive) {
+    invalidPatientFoldersPanelExpanded = false;
+    renderInvalidPatientFoldersPanel();
+    if (invalidRenameExpanded) {
+      setAddPatientFormVisible(false);
+      resetAddPatientForm();
+    }
+    return;
+  }
+
+  invalidPatientFoldersPanelExpanded = true;
   renderInvalidPatientFoldersPanel();
 });
 invalidPatientFoldersList?.addEventListener("scroll", () => {
@@ -3328,6 +3568,45 @@ invalidPatientFoldersList?.addEventListener("scroll", () => {
 });
 confirmAddPatientBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || !isAddPatientFormValid() || confirmAddPatientBtn.disabled) return;
+  if (patientFormMode === "invalid_rename") {
+    const lastName = normalizePatientNameForCreate(newPatientLastName?.value);
+    const firstName = normalizePatientNameForCreate(newPatientFirstName?.value);
+    const patientId = normalizePatientFieldValue(newPatientId?.value);
+    const sourceFolderName = String(invalidFolderEditingName ?? "").trim();
+    if (!sourceFolderName || !lastName.trim() || !firstName.trim()) return;
+    confirmAddPatientBtn.disabled = true;
+    try {
+      const renamedFolderName = await invoke("rename_invalid_patient_folder", {
+        workspaceDir: currentWorkspaceDir,
+        oldFolderName: sourceFolderName,
+        lastName,
+        firstName,
+        patientId,
+      });
+      setAddPatientFormVisible(false);
+      resetAddPatientForm();
+      const finalFolderName = String(renamedFolderName ?? "").trim() || sourceFolderName;
+      selectedPatient = finalFolderName;
+      selectedPatientId = patientId;
+      const renamedNameParts = splitPatientName(finalFolderName);
+      mainContent.setSelectedPatientHeader({
+        lastName: renamedNameParts.lastName,
+        firstName: renamedNameParts.firstName,
+        patientId,
+      });
+      if (patientSearchInput) {
+        patientSearchInput.value = "";
+      }
+      await refreshInvalidPatientFolderWarning(currentWorkspaceDir);
+      await searchPatients("");
+      await mainContent.refreshTimelineForSelection();
+      void refreshIndexingStatus();
+    } catch (err) {
+      console.error("rename_invalid_patient_folder failed:", err);
+      confirmAddPatientBtn.disabled = false;
+    }
+    return;
+  }
   const lastName = normalizePatientNameForCreate(newPatientLastName?.value);
   const firstName = normalizePatientNameForCreate(newPatientFirstName?.value);
   const patientId = normalizePatientFieldValue(newPatientId?.value);

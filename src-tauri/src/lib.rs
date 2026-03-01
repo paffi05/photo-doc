@@ -1924,15 +1924,65 @@ fn save_preview_cache_index(cache_dir: &Path, index: &PreviewCacheIndex) -> Resu
     fs::write(path, json).map_err(|e| e.to_string())
 }
 
-fn build_preview_cache_key(path: &Path, file_size: u64, modified_ms: u64) -> String {
+fn normalize_cache_key_path_text(path_text: &str) -> String {
+    let mut out = path_text.replace('\\', "/");
+    if cfg!(windows) {
+        out = out.to_ascii_lowercase();
+    }
+    out
+}
+
+fn build_preview_cache_key_for_material(material: &str, file_size: u64, modified_ms: u64) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    normalized_path.to_string_lossy().hash(&mut hasher);
+    material.hash(&mut hasher);
     file_size.hash(&mut hasher);
     modified_ms.hash(&mut hasher);
     PREVIEW_CACHE_DIM.hash(&mut hasher);
     PREVIEW_CACHE_QUALITY.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn build_preview_cache_key_canonical(path: &Path, file_size: u64, modified_ms: u64) -> String {
+    let normalized_path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let material = format!(
+        "canon:{}",
+        normalize_cache_key_path_text(&normalized_path.to_string_lossy())
+    );
+    build_preview_cache_key_for_material(&material, file_size, modified_ms)
+}
+
+fn build_preview_cache_key_workspace_relative(
+    path: &Path,
+    workspace_root: Option<&Path>,
+    file_size: u64,
+    modified_ms: u64,
+) -> String {
+    if let Some(root) = workspace_root {
+        if let Ok(relative) = path.strip_prefix(root) {
+            let material = format!(
+                "ws:{}",
+                normalize_cache_key_path_text(&relative.to_string_lossy())
+            );
+            return build_preview_cache_key_for_material(&material, file_size, modified_ms);
+        }
+    }
+    build_preview_cache_key_canonical(path, file_size, modified_ms)
+}
+
+fn build_preview_cache_key_candidates(
+    path: &Path,
+    workspace_root: Option<&Path>,
+    file_size: u64,
+    modified_ms: u64,
+) -> Vec<String> {
+    let mut out = vec![
+        build_preview_cache_key_workspace_relative(path, workspace_root, file_size, modified_ms),
+        build_preview_cache_key_canonical(path, file_size, modified_ms),
+        build_preview_cache_key_legacy(path, file_size, modified_ms),
+    ];
+    out.retain(|k| !k.is_empty());
+    out.dedup();
+    out
 }
 
 fn build_preview_cache_key_legacy(path: &Path, file_size: u64, modified_ms: u64) -> String {
@@ -2085,20 +2135,24 @@ fn compute_preview_cache_image_count(cache_dir: &Path) -> u64 {
     count
 }
 
-fn resolve_existing_cache_file_path(cache_dir: &Path, path_buf: &Path, file_size: u64, modified_ms: u64) -> PathBuf {
-    let key = build_preview_cache_key(path_buf, file_size, modified_ms);
-    let cache_file_path = cache_dir.join(format!("{key}.jpg"));
-    if cache_file_path.exists() {
-        return cache_file_path;
+fn resolve_existing_cache_file_path(
+    cache_dir: &Path,
+    path_buf: &Path,
+    workspace_root: Option<&Path>,
+    file_size: u64,
+    modified_ms: u64,
+) -> PathBuf {
+    let keys = build_preview_cache_key_candidates(path_buf, workspace_root, file_size, modified_ms);
+    for key in &keys {
+        let cache_file_path = cache_dir.join(format!("{key}.jpg"));
+        if cache_file_path.exists() {
+            return cache_file_path;
+        }
     }
-
-    let legacy_key = build_preview_cache_key_legacy(path_buf, file_size, modified_ms);
-    let legacy_cache_file_path = cache_dir.join(format!("{legacy_key}.jpg"));
-    if legacy_cache_file_path.exists() {
-        return legacy_cache_file_path;
-    }
-
-    cache_file_path
+    let primary_key = keys.first().cloned().unwrap_or_else(|| {
+        build_preview_cache_key_workspace_relative(path_buf, workspace_root, file_size, modified_ms)
+    });
+    cache_dir.join(format!("{primary_key}.jpg"))
 }
 
 fn is_valid_cached_preview_bytes(bytes: &[u8]) -> bool {
@@ -2131,6 +2185,11 @@ fn seed_active_preview_cache_from_import_wizard_cache(
     if !is_supported_preview_image(source_path) || !is_supported_preview_image(target_path) {
         return Ok(());
     }
+    let workspace_root_for_target = read_settings(app_handle)
+        .ok()
+        .and_then(|settings| settings.workspace_dir)
+        .map(|raw| PathBuf::from(raw.trim()))
+        .filter(|root| !root.as_os_str().is_empty() && target_path.starts_with(root));
 
     let src_meta = fs::metadata(source_path).map_err(|e| e.to_string())?;
     let src_size = src_meta.len();
@@ -2143,6 +2202,7 @@ fn seed_active_preview_cache_from_import_wizard_cache(
     let src_preview_path = resolve_existing_cache_file_path(
         import_wizard_cache_dir,
         source_path,
+        None,
         src_size,
         src_modified_ms,
     );
@@ -2158,7 +2218,12 @@ fn seed_active_preview_cache_from_import_wizard_cache(
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let dst_key = build_preview_cache_key(target_path, dst_size, dst_modified_ms);
+    let dst_key = build_preview_cache_key_workspace_relative(
+        target_path,
+        workspace_root_for_target.as_deref(),
+        dst_size,
+        dst_modified_ms,
+    );
     let file_name = format!("{dst_key}.jpg");
     let active_cache_dir = get_active_preview_cache_dir(app_handle);
     fs::create_dir_all(&active_cache_dir).map_err(|e| e.to_string())?;
@@ -2302,8 +2367,10 @@ fn collect_workspace_expected_preview_files(workspace: &Path) -> HashSet<String>
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let key = build_preview_cache_key(&path, file_size, modified_ms);
-            expected.insert(format!("{key}.jpg"));
+            let keys = build_preview_cache_key_candidates(&path, Some(workspace), file_size, modified_ms);
+            for key in keys {
+                expected.insert(format!("{key}.jpg"));
+            }
         }
     }
 
@@ -2367,8 +2434,10 @@ fn collect_workspace_expected_preview_files_from_db(
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            let key = build_preview_cache_key(&path, file_size, modified_ms);
-            expected.insert(format!("{key}.jpg"));
+            let keys = build_preview_cache_key_candidates(&path, Some(workspace), file_size, modified_ms);
+            for key in keys {
+                expected.insert(format!("{key}.jpg"));
+            }
         }
     }
 
@@ -2400,6 +2469,7 @@ fn cleanup_preview_cache_for_workspace_dir(
     cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
     let expected = collect_workspace_expected_preview_files_from_db(app_handle, workspace)
         .unwrap_or_else(|_| collect_workspace_expected_preview_files(workspace));
+    let preserve_unknown_cache_files_for_transition = true;
 
     if let Ok(entries) = fs::read_dir(&cache_dir) {
         for entry in entries.flatten() {
@@ -2420,6 +2490,9 @@ fn cleanup_preview_cache_for_workspace_dir(
                 continue;
             };
             if !expected.contains(file_name) {
+                if preserve_unknown_cache_files_for_transition {
+                    continue;
+                }
                 let _ = fs::remove_file(&path);
             }
         }
@@ -2763,14 +2836,28 @@ fn resolve_cached_previews_in_cache_dir(
                 continue;
         };
         let row_index = rows.len();
-        let cache_key = build_preview_cache_key(&path_buf, file_size, modified_ms);
+        let candidate_keys =
+            build_preview_cache_key_candidates(&path_buf, workspace_root, file_size, modified_ms);
+        let cache_key = candidate_keys
+            .first()
+            .cloned()
+            .unwrap_or_else(|| build_preview_cache_key_workspace_relative(&path_buf, workspace_root, file_size, modified_ms));
         let file_name = format!("{cache_key}.jpg");
         let cache_file_path = cache_dir.join(&file_name);
-        let legacy_cache_key = build_preview_cache_key_legacy(&path_buf, file_size, modified_ms);
-        let legacy_cache_file_path = cache_dir.join(format!("{legacy_cache_key}.jpg"));
 
-        if !cache_file_path.exists() && legacy_cache_file_path.exists() {
-            let _ = fs::rename(&legacy_cache_file_path, &cache_file_path);
+        if !cache_file_path.exists() {
+            for fallback_key in candidate_keys.iter().skip(1) {
+                let fallback_cache_file_path = cache_dir.join(format!("{fallback_key}.jpg"));
+                if !fallback_cache_file_path.exists() {
+                    continue;
+                }
+                if fs::rename(&fallback_cache_file_path, &cache_file_path).is_err() {
+                    let _ = fs::copy(&fallback_cache_file_path, &cache_file_path);
+                }
+                if cache_file_path.exists() {
+                    break;
+                }
+            }
         }
         if cache_file_path.exists() && !is_valid_cached_preview_file(&cache_file_path) {
             let _ = fs::remove_file(&cache_file_path);
@@ -3034,6 +3121,50 @@ fn upsert_patient_index_row(
     Ok(())
 }
 
+fn is_patient_id_taken_in_workspace(
+    conn: &Connection,
+    workspace_dir: &str,
+    patient_id: &str,
+    exclude_folder_name: Option<&str>,
+) -> Result<bool, String> {
+    let normalized_id = patient_id.trim();
+    if normalized_id.is_empty() {
+        return Ok(false);
+    }
+
+    let taken = if let Some(folder_name) = exclude_folder_name {
+        let folder_name = folder_name.trim();
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM patient_index
+                WHERE workspace_dir = ?1
+                  AND patient_id = ?2
+                  AND folder_name != ?3
+             )",
+            params![workspace_dir, normalized_id, folder_name],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+            != 0
+    } else {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM patient_index
+                WHERE workspace_dir = ?1
+                  AND patient_id = ?2
+             )",
+            params![workspace_dir, normalized_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?
+            != 0
+    };
+
+    Ok(taken)
+}
+
 #[tauri::command]
 fn create_patient_with_metadata(
     app_handle: tauri::AppHandle,
@@ -3094,6 +3225,130 @@ fn create_patient_with_metadata(
     )?;
 
     Ok(folder_name)
+}
+
+#[tauri::command]
+fn rename_invalid_patient_folder(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    old_folder_name: String,
+    last_name: String,
+    first_name: String,
+    patient_id: String,
+) -> Result<String, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+
+    let old_folder_name = old_folder_name.trim().to_string();
+    let last_name = last_name.trim_end().to_string();
+    let first_name = first_name.trim_end().to_string();
+    let patient_id = patient_id.trim().to_string();
+    if old_folder_name.is_empty() || last_name.trim().is_empty() || first_name.trim().is_empty() {
+        return Err("old folder name, last name and first name are required".to_string());
+    }
+    if last_name.contains('/') || last_name.contains('\\') || first_name.contains('/') || first_name.contains('\\') {
+        return Err("invalid characters in patient name".to_string());
+    }
+
+    let base_folder_name = format!("{}, {}", last_name.trim(), first_name.trim());
+    let base_folder_path = workspace.join(&base_folder_name);
+    let new_folder_name = if base_folder_name != old_folder_name && base_folder_path.exists() {
+        if patient_id.is_empty() {
+            return Err("patient id is required because the same name already exists".to_string());
+        }
+        format!("{base_folder_name} ({patient_id})")
+    } else {
+        base_folder_name
+    };
+
+    if new_folder_name.starts_with('.') {
+        return Err("folder name cannot start with a dot".to_string());
+    }
+    if new_folder_name.contains('/') || new_folder_name.contains('\\') {
+        return Err("invalid characters in folder name".to_string());
+    }
+    if !is_valid_patient_folder_name(&new_folder_name) {
+        return Err("new folder name is not a valid patient name".to_string());
+    }
+
+    let mut conn = open_db(&app_handle)?;
+    let workspace_key = workspace.to_string_lossy().to_string();
+    if !patient_id.is_empty()
+        && is_patient_id_taken_in_workspace(
+            &conn,
+            &workspace_key,
+            &patient_id,
+            Some(old_folder_name.as_str()),
+        )?
+    {
+        return Err("patient id already exists".to_string());
+    }
+
+    let old_path = workspace.join(&old_folder_name);
+    if !old_path.exists() || !old_path.is_dir() {
+        return Err("old invalid folder does not exist".to_string());
+    }
+    let new_path = workspace.join(&new_folder_name);
+    if new_folder_name != old_folder_name && new_path.exists() {
+        return Err("target folder already exists".to_string());
+    }
+
+    if new_folder_name != old_folder_name {
+        fs::rename(&old_path, &new_path).map_err(|e| e.to_string())?;
+    }
+
+    let metadata_path = patient_metadata_path(&new_path);
+    let mut metadata_value = read_patient_metadata_value(&new_path).unwrap_or_else(|| json!({}));
+    if !metadata_value.is_object() {
+        metadata_value = json!({});
+    }
+    if let Some(metadata_obj) = metadata_value.as_object_mut() {
+        let existing_id = metadata_obj
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let final_id = if patient_id.is_empty() { existing_id } else { patient_id.clone() };
+        metadata_obj.insert("id".to_string(), Value::String(final_id));
+        if !metadata_obj.contains_key("keywords") {
+            metadata_obj.insert("keywords".to_string(), json!([]));
+        }
+        if !metadata_obj.contains_key("searchterms") {
+            metadata_obj.insert("searchterms".to_string(), json!([]));
+        }
+    }
+    let metadata_json = serde_json::to_string_pretty(&metadata_value).map_err(|e| e.to_string())?;
+    fs::write(metadata_path, metadata_json).map_err(|e| e.to_string())?;
+
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_index WHERE workspace_dir = ?1 AND folder_name = ?2",
+        params![workspace_key.clone(), old_folder_name.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_treatment_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_key.clone(), old_folder_name.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_file_index WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_key.clone(), old_folder_name.clone()],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM patient_scan_state WHERE workspace_dir = ?1 AND patient_folder = ?2",
+        params![workspace_key.clone(), old_folder_name],
+    )
+    .map_err(|e| e.to_string())?;
+
+    let _ = reindex_single_patient_in_tx(&tx, &workspace_key, &new_folder_name, &new_path)?;
+    refresh_invalid_workspace_items_in_tx(&tx, &workspace_key, &workspace)?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    Ok(new_folder_name)
 }
 
 #[tauri::command]
@@ -4317,7 +4572,7 @@ fn remove_import_wizard_cached_preview(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let cache_key = build_preview_cache_key(&source_path, file_size, modified_ms);
+    let cache_key = build_preview_cache_key_workspace_relative(&source_path, None, file_size, modified_ms);
     let legacy_key = build_preview_cache_key_legacy(&source_path, file_size, modified_ms);
     let cache_dir = folder.join(".preview-cache");
     fs::create_dir_all(&cache_dir).map_err(|e| e.to_string())?;
@@ -4326,7 +4581,9 @@ fn remove_import_wizard_cached_preview(
     let mut index = load_preview_cache_index(&cache_dir);
 
     let mut changed = false;
-    let mut candidate_keys = vec![cache_key.clone(), legacy_key.clone()];
+    let mut candidate_keys = build_preview_cache_key_candidates(&source_path, None, file_size, modified_ms);
+    candidate_keys.push(cache_key.clone());
+    candidate_keys.push(legacy_key.clone());
     candidate_keys.sort();
     candidate_keys.dedup();
 
@@ -5284,7 +5541,13 @@ async fn get_existing_cached_preview_paths(
             let mut preview_match: Option<PathBuf> = None;
             for cache_dir in &candidate_cache_dirs {
                 let cache_file_path =
-                    resolve_existing_cache_file_path(cache_dir, &path_buf, file_size, modified_ms);
+                    resolve_existing_cache_file_path(
+                        cache_dir,
+                        &path_buf,
+                        workspace_root.as_deref(),
+                        file_size,
+                        modified_ms,
+                    );
                 let valid_quick = fs::metadata(&cache_file_path)
                     .map(|m| m.is_file() && m.len() > 0)
                     .unwrap_or(false);
@@ -6097,6 +6360,7 @@ fn compute_preview_debug_counts(
         let cache_file_path = resolve_existing_cache_file_path(
             &cache_dir,
             &path,
+            Some(&workspace),
             size_bytes.max(0) as u64,
             modified_ms.max(0) as u64,
         );
@@ -6244,6 +6508,7 @@ fn start_background_preview_fill(
                         let cache_file_path = resolve_existing_cache_file_path(
                             &cache_dir,
                             &source_path,
+                            Some(&workspace),
                             size_bytes.max(0) as u64,
                             modified_ms.max(0) as u64,
                         );
@@ -6404,6 +6669,7 @@ pub fn run() {
             list_treatment_files,
             list_treatment_files_page,
             create_patient_with_metadata,
+            rename_invalid_patient_folder,
             save_patient_metadata,
             save_patient_id,
             load_patient_keywords,
