@@ -420,7 +420,7 @@ let addPatientIdCheckToken = 0;
 let addPatientFormHideTimerId = null;
 let patientFormMode = "create";
 let invalidFolderEditingName = "";
-let systemAppVersion = "1.0.7-a";
+let systemAppVersion = "1.0.7-1";
 let systemUpdateBusy = false;
 let systemUpdateInstalling = false;
 let systemUpdateCheckedAtMs = null;
@@ -1467,7 +1467,7 @@ function setSystemUpdateUi({
     systemInstallBtn.disabled = isWorking;
     systemInstallBtn.setAttribute("title", installing ? "Installing update..." : "Install update");
   }
-  const safeVersion = String(version || "1.0.7-a").trim() || "1.0.7-a";
+  const safeVersion = String(version || "1.0.7-1").trim() || "1.0.7-1";
   if (systemVersionText) {
     systemVersionText.textContent = `Version ${safeVersion}`;
   }
