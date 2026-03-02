@@ -38,6 +38,11 @@ let closeConfirmVisible = false;
 const knownPaths = new Set();
 const pendingRows = [];
 const previewDataUrlByPath = new Map();
+const candidateRowsByPath = new Map();
+
+const FILE_STABLE_MIN_AGE_MS = 2200;
+const FILE_STABLE_POLLS_REQUIRED = 2;
+const BASELINE_RECENT_FILE_WINDOW_MS = 15000;
 
 function renderImportUi() {
   if (!importPanel || !importCountText || !importListWrap || !importList || !importToggle) return;
@@ -309,15 +314,26 @@ async function pollWatchFolder() {
   try {
     const rows = await invoke("list_import_wizard_files", { folderDir: importWizardDir });
     const list = Array.isArray(rows) ? rows : [];
+    const now = Date.now();
+    const seenCandidatePaths = new Set();
     const newImagePaths = [];
     for (const row of list) {
       const path = String(row?.path ?? "").trim();
       const isImage = Boolean(row?.is_image ?? row?.isImage ?? false);
       if (!path || !isImage || knownPaths.has(path)) continue;
+      if (pendingRows.some((entry) => String(entry?.path ?? "").trim() === path)) continue;
+      seenCandidatePaths.add(path);
+      if (!isStableImportRow(row, now)) continue;
+      candidateRowsByPath.delete(path);
       knownPaths.add(path);
       pendingRows.unshift(row);
       newImagePaths.push(path);
       void fetchPreviewForPath(path).then(renderImportUi);
+    }
+    for (const path of candidateRowsByPath.keys()) {
+      if (!seenCandidatePaths.has(path)) {
+        candidateRowsByPath.delete(path);
+      }
     }
 
     if (livePreviewToggle?.checked && newImagePaths.length > 0) {
@@ -332,6 +348,37 @@ async function pollWatchFolder() {
   } catch (err) {
     console.error("list_import_wizard_files failed:", err);
   }
+}
+
+function getRowModifiedMs(row) {
+  return Number(row?.modified_ms ?? row?.modifiedMs ?? 0) || 0;
+}
+
+function isStableImportRow(row, nowMs = Date.now()) {
+  const path = String(row?.path ?? "").trim();
+  if (!path) return false;
+  const size = Number(row?.size ?? 0);
+  const modifiedMs = getRowModifiedMs(row);
+  const ageMs = modifiedMs > 0 ? (nowMs - modifiedMs) : 0;
+  const prev = candidateRowsByPath.get(path);
+  if (!prev) {
+    candidateRowsByPath.set(path, {
+      size,
+      modifiedMs,
+      stablePolls: 0,
+    });
+    return false;
+  }
+  const unchanged = prev.size === size && prev.modifiedMs === modifiedMs;
+  const stablePolls = unchanged ? (Number(prev.stablePolls ?? 0) + 1) : 0;
+  candidateRowsByPath.set(path, { size, modifiedMs, stablePolls });
+  return size > 0 && ageMs >= FILE_STABLE_MIN_AGE_MS && stablePolls >= FILE_STABLE_POLLS_REQUIRED;
+}
+
+function shouldTreatAsBaselineFile(row, nowMs = Date.now()) {
+  const modifiedMs = getRowModifiedMs(row);
+  if (modifiedMs <= 0) return false;
+  return (nowMs - modifiedMs) >= BASELINE_RECENT_FILE_WINDOW_MS;
 }
 
 async function closeLivePreviewWindow() {
@@ -425,6 +472,7 @@ function cleanup() {
   if (blinkTimer) clearTimeout(blinkTimer);
   if (pupilInterval) clearInterval(pupilInterval);
   if (pollInterval) clearInterval(pollInterval);
+  candidateRowsByPath.clear();
   void closeLivePreviewWindow();
   importModeFilePaths = [];
   if (!importBusy) {
@@ -486,11 +534,21 @@ async function init() {
   }
 
   if (importWizardDir && workspaceDir && patientFolder) {
+    const now = Date.now();
     const baseline = await invoke("list_import_wizard_files", { folderDir: importWizardDir }).catch(() => []);
     for (const row of Array.isArray(baseline) ? baseline : []) {
       const path = String(row?.path ?? "").trim();
       const isImage = Boolean(row?.is_image ?? row?.isImage ?? false);
-      if (path && isImage) knownPaths.add(path);
+      if (!path || !isImage) continue;
+      if (shouldTreatAsBaselineFile(row, now)) {
+        knownPaths.add(path);
+        continue;
+      }
+      candidateRowsByPath.set(path, {
+        size: Number(row?.size ?? 0),
+        modifiedMs: getRowModifiedMs(row),
+        stablePolls: 0,
+      });
     }
     pollInterval = setInterval(() => {
       void pollWatchFolder();
