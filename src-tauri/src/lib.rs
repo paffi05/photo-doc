@@ -459,6 +459,15 @@ struct StartImportResponse {
 }
 
 #[derive(Serialize)]
+struct ImportWizardImageValidationRow {
+    ready: bool,
+    decodable: bool,
+    structurally_complete: bool,
+    size: u64,
+    fingerprint: String,
+}
+
+#[derive(Serialize)]
 struct SystemUpdateResult {
     updated: bool,
     version: Option<String>,
@@ -4466,30 +4475,101 @@ fn get_import_wizard_preview_data_url(path: String) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{b64}"))
 }
 
+fn import_wizard_image_structurally_complete(ext: &str, bytes: &[u8]) -> bool {
+    match ext {
+        "jpg" | "jpeg" => bytes.len() >= 2 && bytes.ends_with(&[0xFF, 0xD9]),
+        "png" => {
+            const PNG_IEND_TRAILER: [u8; 12] = [
+                0x00, 0x00, 0x00, 0x00, // IEND chunk length
+                0x49, 0x45, 0x4E, 0x44, // IEND
+                0xAE, 0x42, 0x60, 0x82, // CRC
+            ];
+            bytes.len() >= PNG_IEND_TRAILER.len() && bytes.ends_with(&PNG_IEND_TRAILER)
+        }
+        _ => false,
+    }
+}
+
 #[tauri::command]
-fn validate_import_wizard_image_complete(path: String) -> Result<bool, String> {
+fn validate_import_wizard_image_complete(path: String) -> Result<ImportWizardImageValidationRow, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("path is required".to_string());
     }
     let source = PathBuf::from(&path);
     if !source.exists() || !source.is_file() {
-        return Ok(false);
+        return Ok(ImportWizardImageValidationRow {
+            ready: false,
+            decodable: false,
+            structurally_complete: false,
+            size: 0,
+            fingerprint: String::new(),
+        });
     }
     if !is_supported_preview_image(&source) {
-        return Ok(false);
+        return Ok(ImportWizardImageValidationRow {
+            ready: false,
+            decodable: false,
+            structurally_complete: false,
+            size: 0,
+            fingerprint: String::new(),
+        });
     }
+
+    let ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let bytes = match fs::read(&source) {
+        Ok(b) => b,
+        Err(_) => {
+            return Ok(ImportWizardImageValidationRow {
+                ready: false,
+                decodable: false,
+                structurally_complete: false,
+                size: 0,
+                fingerprint: String::new(),
+            });
+        }
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    let fingerprint = format!("{:016x}", hasher.finish());
+    let structurally_complete = import_wizard_image_structurally_complete(ext.as_str(), &bytes);
 
     let reader = match image::ImageReader::open(&source) {
         Ok(r) => r,
-        Err(_) => return Ok(false),
+        Err(_) => {
+            return Ok(ImportWizardImageValidationRow {
+                ready: false,
+                decodable: false,
+                structurally_complete,
+                size: bytes.len() as u64,
+                fingerprint,
+            });
+        }
     };
     let reader = match reader.with_guessed_format() {
         Ok(r) => r,
-        Err(_) => return Ok(false),
+        Err(_) => {
+            return Ok(ImportWizardImageValidationRow {
+                ready: false,
+                decodable: false,
+                structurally_complete,
+                size: bytes.len() as u64,
+                fingerprint,
+            });
+        }
     };
-
-    Ok(reader.decode().is_ok())
+    let decodable = reader.decode().is_ok();
+    Ok(ImportWizardImageValidationRow {
+        ready: decodable && structurally_complete,
+        decodable,
+        structurally_complete,
+        size: bytes.len() as u64,
+        fingerprint,
+    })
 }
 
 #[tauri::command]

@@ -386,6 +386,8 @@ function trackImportRowCandidate(row, nowMs = Date.now()) {
       decodeReady: false,
       decodeCheckInFlight: false,
       lastDecodeAttemptAtMs: 0,
+      decodeFingerprint: "",
+      decodeStablePasses: 0,
     });
     return;
   }
@@ -397,6 +399,8 @@ function trackImportRowCandidate(row, nowMs = Date.now()) {
     decodeReady: sizeChanged ? false : Boolean(prev.decodeReady),
     decodeCheckInFlight: sizeChanged ? false : Boolean(prev.decodeCheckInFlight),
     lastDecodeAttemptAtMs: sizeChanged ? 0 : (Number(prev.lastDecodeAttemptAtMs ?? 0) || 0),
+    decodeFingerprint: sizeChanged ? "" : String(prev.decodeFingerprint ?? ""),
+    decodeStablePasses: sizeChanged ? 0 : (Number(prev.decodeStablePasses ?? 0) || 0),
   });
 }
 
@@ -417,17 +421,27 @@ async function isImportRowDecodable(row, nowMs = Date.now()) {
   });
 
   try {
-    const ready = Boolean(await invoke("validate_import_wizard_image_complete", { path }));
+    const result = await invoke("validate_import_wizard_image_complete", { path });
+    const readyNow = Boolean(result?.ready ?? result === true);
+    const fingerprint = String(result?.fingerprint ?? "").trim();
     const current = candidateRowsByPath.get(path);
     if (current) {
+      const prevFingerprint = String(current.decodeFingerprint ?? "");
+      const stablePasses = readyNow && fingerprint && fingerprint === prevFingerprint
+        ? ((Number(current.decodeStablePasses ?? 0) || 0) + 1)
+        : (readyNow ? 1 : 0);
+      const readyAccepted = readyNow && stablePasses >= 2;
       candidateRowsByPath.set(path, {
         ...current,
-        decodeReady: ready,
+        decodeReady: readyAccepted,
         decodeCheckInFlight: false,
         lastDecodeAttemptAtMs: nowMs,
+        decodeFingerprint: readyNow ? fingerprint : "",
+        decodeStablePasses: stablePasses,
       });
+      return readyAccepted;
     }
-    return ready;
+    return false;
   } catch {
     const current = candidateRowsByPath.get(path);
     if (current) {
@@ -436,6 +450,8 @@ async function isImportRowDecodable(row, nowMs = Date.now()) {
         decodeReady: false,
         decodeCheckInFlight: false,
         lastDecodeAttemptAtMs: nowMs,
+        decodeFingerprint: "",
+        decodeStablePasses: 0,
       });
     }
     return false;
@@ -617,6 +633,8 @@ async function init() {
         decodeReady: false,
         decodeCheckInFlight: false,
         lastDecodeAttemptAtMs: 0,
+        decodeFingerprint: "",
+        decodeStablePasses: 0,
       });
     }
     pollInterval = setInterval(() => {
