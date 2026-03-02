@@ -40,9 +40,8 @@ const pendingRows = [];
 const previewDataUrlByPath = new Map();
 const candidateRowsByPath = new Map();
 
-const FILE_STABLE_MIN_AGE_MS = 2200;
-const FILE_STABLE_POLLS_REQUIRED = 2;
-const BASELINE_RECENT_FILE_WINDOW_MS = 15000;
+const BASELINE_EXISTING_FILE_AGE_MS = 60000;
+const FILE_DECODE_RETRY_MIN_MS = 1000;
 
 function renderImportUi() {
   if (!importPanel || !importCountText || !importListWrap || !importList || !importToggle) return;
@@ -309,6 +308,18 @@ async function fetchPreviewForPath(path) {
   }
 }
 
+async function invalidateCachedPreview(path) {
+  if (!importWizardDir || !path) return;
+  try {
+    await invoke("remove_import_wizard_cached_preview", {
+      folderDir: importWizardDir,
+      path,
+    });
+  } catch {
+    // best effort only
+  }
+}
+
 async function pollWatchFolder() {
   if (!importWizardDir) return;
   try {
@@ -323,12 +334,13 @@ async function pollWatchFolder() {
       if (!path || !isImage || knownPaths.has(path)) continue;
       if (pendingRows.some((entry) => String(entry?.path ?? "").trim() === path)) continue;
       seenCandidatePaths.add(path);
-      if (!isStableImportRow(row, now)) continue;
+      trackImportRowCandidate(row, now);
+      if (!await isImportRowDecodable(row, now)) continue;
       candidateRowsByPath.delete(path);
       knownPaths.add(path);
       pendingRows.unshift(row);
       newImagePaths.push(path);
-      void fetchPreviewForPath(path).then(renderImportUi);
+      void invalidateCachedPreview(path).then(() => fetchPreviewForPath(path)).then(renderImportUi);
     }
     for (const path of candidateRowsByPath.keys()) {
       if (!seenCandidatePaths.has(path)) {
@@ -354,31 +366,86 @@ function getRowModifiedMs(row) {
   return Number(row?.modified_ms ?? row?.modifiedMs ?? 0) || 0;
 }
 
-function isStableImportRow(row, nowMs = Date.now()) {
+function getRowCreatedMs(row) {
+  return Number(row?.created_ms ?? row?.createdMs ?? 0) || 0;
+}
+
+function getRowActivityMs(row) {
+  return Math.max(getRowCreatedMs(row), getRowModifiedMs(row), 0);
+}
+
+function trackImportRowCandidate(row, nowMs = Date.now()) {
   const path = String(row?.path ?? "").trim();
-  if (!path) return false;
+  if (!path) return;
   const size = Number(row?.size ?? 0);
-  const modifiedMs = getRowModifiedMs(row);
-  const ageMs = modifiedMs > 0 ? (nowMs - modifiedMs) : 0;
   const prev = candidateRowsByPath.get(path);
   if (!prev) {
     candidateRowsByPath.set(path, {
       size,
-      modifiedMs,
-      stablePolls: 0,
+      firstSeenAtMs: nowMs,
+      decodeReady: false,
+      decodeCheckInFlight: false,
+      lastDecodeAttemptAtMs: 0,
     });
+    return;
+  }
+  const sizeChanged = prev.size !== size;
+  const firstSeenAtMs = Number(prev.firstSeenAtMs ?? nowMs) || nowMs;
+  candidateRowsByPath.set(path, {
+    size,
+    firstSeenAtMs,
+    decodeReady: sizeChanged ? false : Boolean(prev.decodeReady),
+    decodeCheckInFlight: sizeChanged ? false : Boolean(prev.decodeCheckInFlight),
+    lastDecodeAttemptAtMs: sizeChanged ? 0 : (Number(prev.lastDecodeAttemptAtMs ?? 0) || 0),
+  });
+}
+
+async function isImportRowDecodable(row, nowMs = Date.now()) {
+  const path = String(row?.path ?? "").trim();
+  if (!path) return false;
+  const prev = candidateRowsByPath.get(path);
+  if (!prev) return false;
+  if (Boolean(prev.decodeReady)) return true;
+  if (Boolean(prev.decodeCheckInFlight)) return false;
+  const lastAttemptAtMs = Number(prev.lastDecodeAttemptAtMs ?? 0) || 0;
+  if (lastAttemptAtMs > 0 && (nowMs - lastAttemptAtMs) < FILE_DECODE_RETRY_MIN_MS) return false;
+
+  candidateRowsByPath.set(path, {
+    ...prev,
+    decodeCheckInFlight: true,
+    lastDecodeAttemptAtMs: nowMs,
+  });
+
+  try {
+    const ready = Boolean(await invoke("validate_import_wizard_image_complete", { path }));
+    const current = candidateRowsByPath.get(path);
+    if (current) {
+      candidateRowsByPath.set(path, {
+        ...current,
+        decodeReady: ready,
+        decodeCheckInFlight: false,
+        lastDecodeAttemptAtMs: nowMs,
+      });
+    }
+    return ready;
+  } catch {
+    const current = candidateRowsByPath.get(path);
+    if (current) {
+      candidateRowsByPath.set(path, {
+        ...current,
+        decodeReady: false,
+        decodeCheckInFlight: false,
+        lastDecodeAttemptAtMs: nowMs,
+      });
+    }
     return false;
   }
-  const unchanged = prev.size === size && prev.modifiedMs === modifiedMs;
-  const stablePolls = unchanged ? (Number(prev.stablePolls ?? 0) + 1) : 0;
-  candidateRowsByPath.set(path, { size, modifiedMs, stablePolls });
-  return size > 0 && ageMs >= FILE_STABLE_MIN_AGE_MS && stablePolls >= FILE_STABLE_POLLS_REQUIRED;
 }
 
 function shouldTreatAsBaselineFile(row, nowMs = Date.now()) {
-  const modifiedMs = getRowModifiedMs(row);
-  if (modifiedMs <= 0) return false;
-  return (nowMs - modifiedMs) >= BASELINE_RECENT_FILE_WINDOW_MS;
+  const activityMs = getRowActivityMs(row);
+  if (activityMs <= 0) return true;
+  return (nowMs - activityMs) >= BASELINE_EXISTING_FILE_AGE_MS;
 }
 
 async function closeLivePreviewWindow() {
@@ -546,8 +613,10 @@ async function init() {
       }
       candidateRowsByPath.set(path, {
         size: Number(row?.size ?? 0),
-        modifiedMs: getRowModifiedMs(row),
-        stablePolls: 0,
+        firstSeenAtMs: now,
+        decodeReady: false,
+        decodeCheckInFlight: false,
+        lastDecodeAttemptAtMs: 0,
       });
     }
     pollInterval = setInterval(() => {

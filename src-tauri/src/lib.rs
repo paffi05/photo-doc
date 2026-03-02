@@ -4467,6 +4467,32 @@ fn get_import_wizard_preview_data_url(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn validate_import_wizard_image_complete(path: String) -> Result<bool, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Ok(false);
+    }
+    if !is_supported_preview_image(&source) {
+        return Ok(false);
+    }
+
+    let reader = match image::ImageReader::open(&source) {
+        Ok(r) => r,
+        Err(_) => return Ok(false),
+    };
+    let reader = match reader.with_guessed_format() {
+        Ok(r) => r,
+        Err(_) => return Ok(false),
+    };
+
+    Ok(reader.decode().is_ok())
+}
+
+#[tauri::command]
 fn close_import_wizard_preview_window(app_handle: tauri::AppHandle) -> Result<bool, String> {
     if let Ok(mut current) = import_wizard_preview_path_store().lock() {
         current.clear();
@@ -6604,6 +6630,7 @@ pub fn run() {
             clear_import_wizard_preview_cache,
             open_import_wizard_preview_window,
             get_import_wizard_preview_data_url,
+            validate_import_wizard_image_complete,
             get_current_import_wizard_preview_path,
             close_import_wizard_preview_window,
             close_import_wizard_helper_window,

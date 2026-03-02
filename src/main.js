@@ -2356,8 +2356,15 @@ function updatePatientNameTruncationForItem(item) {
     item.classList.remove("truncate-last");
     return;
   }
+  if (item.getClientRects().length < 1 || first.getClientRects().length < 1) {
+    // Avoid false truncation when the main view is hidden during startup.
+    return;
+  }
   const firstVisibleWidth = first.getBoundingClientRect().width;
   const firstContentWidth = first.scrollWidth;
+  if (firstVisibleWidth <= 0 || firstContentWidth <= 0) {
+    return;
+  }
   const firstMissing = firstVisibleWidth <= PATIENT_FIRSTNAME_EFFECTIVE_MIN_WIDTH_PX
     || (firstContentWidth > 0 && (firstVisibleWidth / firstContentWidth) < 0.18);
   item.classList.toggle("truncate-last", firstMissing);
@@ -2963,6 +2970,9 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   startWorkspaceChangeCrawlPolling();
   sidebarLayout.applyPatientSidebarMode();
   sidebarLayout.setPatientSidebarHidden(false);
+  requestAnimationFrame(() => {
+    schedulePatientNameTruncationRefresh();
+  });
   initialMainReadyInProgress = false;
   const postStartupDelayMs = skipLoadPatients ? 1200 : 450;
   setTimeout(() => {
