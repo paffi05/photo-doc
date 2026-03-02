@@ -66,6 +66,14 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Clean Tauri target (Windows)
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          if (Test-Path "src-tauri/target") {
+            Remove-Item -Recurse -Force "src-tauri/target"
+          }
+
       - name: Build and publish Tauri release
         uses: tauri-apps/tauri-action@v0
         env:
