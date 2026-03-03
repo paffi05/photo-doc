@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for app windows",
-  "windows": ["main", "import_wizard_helper", "import_wizard_preview"],
+  "windows": ["main", "import_wizard_helper", "import_wizard_preview", "image_preview"],
   "permissions": [
     "core:default",
     "core:window:allow-create",
