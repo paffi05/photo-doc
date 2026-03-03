@@ -42,7 +42,6 @@ let closeConfirmVisible = false;
 let livePreviewWindow = null;
 let livePreviewConfirmRefreshTimerId = null;
 let livePreviewBlockedByImport = false;
-let livePreviewKnownClosed = true;
 const knownPaths = new Set();
 const pendingRows = [];
 const previewDataUrlByPath = new Map();
@@ -598,22 +597,33 @@ async function isImportRowDecodable(row, nowMs = Date.now()) {
 }
 
 async function closeLivePreviewWindow() {
-  if (
-    livePreviewKnownClosed &&
-    !livePreviewWindow &&
-    !lastLivePreviewPath &&
-    !lastPreviewDispatchSignature
-  ) {
-    return;
-  }
   suppressNextPreviewClosedEvent = true;
   setTimeout(() => {
     suppressNextPreviewClosedEvent = false;
   }, 600);
   try {
     let closed = false;
+    if (livePreviewWindow) {
+      try {
+        await livePreviewWindow.close();
+        closed = true;
+      } catch (err) {
+        wizardTrace("preview", "close cached handle failed", { err: String(err ?? "") });
+      }
+    }
+    if (!closed) {
+      try {
+        const existing = await WebviewWindow.getByLabel("import_wizard_preview");
+        if (existing) {
+          await existing.close();
+          closed = true;
+        }
+      } catch (err) {
+        wizardTrace("preview", "close by label failed", { err: String(err ?? "") });
+      }
+    }
     try {
-      closed = Boolean(await invoke("close_import_wizard_preview_window"));
+      await invoke("close_import_wizard_preview_window");
     } catch (err) {
       wizardTrace("preview", "rust close command failed", { err: String(err ?? "") });
     }
@@ -627,7 +637,6 @@ async function closeLivePreviewWindow() {
     lastLivePreviewPath = "";
     livePreviewPinnedPath = "";
     lastPreviewDispatchSignature = "";
-    livePreviewKnownClosed = true;
   }
 }
 
@@ -700,7 +709,6 @@ async function sendLivePreviewPath(path, navigationPaths = null, options = {}) {
     if (force || userInitiated) {
       livePreviewManuallyClosed = false;
     }
-    livePreviewKnownClosed = false;
   } catch (err) {
     livePreviewWindow = null;
     wizardTrace("preview", "dispatch failed", { path, err: String(err ?? "") });
@@ -856,7 +864,6 @@ async function init() {
   });
   void listen("import-wizard-preview-window-closed", () => {
     livePreviewWindow = null;
-    livePreviewKnownClosed = true;
     if (suppressNextPreviewClosedEvent) {
       suppressNextPreviewClosedEvent = false;
       return;
