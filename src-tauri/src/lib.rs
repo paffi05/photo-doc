@@ -2178,12 +2178,12 @@ fn seed_active_preview_cache_from_import_wizard_cache(
     import_wizard_cache_dir: &Path,
     source_path: &Path,
     target_path: &Path,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     if !import_wizard_cache_dir.exists() || !import_wizard_cache_dir.is_dir() {
-        return Ok(());
+        return Ok(false);
     }
     if !is_supported_preview_image(source_path) || !is_supported_preview_image(target_path) {
-        return Ok(());
+        return Ok(false);
     }
     let workspace_root_for_target = read_settings(app_handle)
         .ok()
@@ -2206,8 +2206,8 @@ fn seed_active_preview_cache_from_import_wizard_cache(
         src_size,
         src_modified_ms,
     );
-    if !src_preview_path.exists() {
-        return Ok(());
+    if !src_preview_path.exists() || !is_valid_cached_preview_file(&src_preview_path) {
+        return Ok(false);
     }
 
     let dst_meta = fs::metadata(target_path).map_err(|e| e.to_string())?;
@@ -2228,7 +2228,7 @@ fn seed_active_preview_cache_from_import_wizard_cache(
     let active_cache_dir = get_active_preview_cache_dir(app_handle);
     fs::create_dir_all(&active_cache_dir).map_err(|e| e.to_string())?;
     let dst_preview_path = active_cache_dir.join(&file_name);
-    if !dst_preview_path.exists() {
+    if !dst_preview_path.exists() || !is_valid_cached_preview_file(&dst_preview_path) {
         fs::copy(&src_preview_path, &dst_preview_path).map_err(|e| e.to_string())?;
     }
 
@@ -2245,7 +2245,8 @@ fn seed_active_preview_cache_from_import_wizard_cache(
             last_access_ms: now_ms(),
         },
     );
-    save_preview_cache_index(&active_cache_dir, &index)
+    save_preview_cache_index(&active_cache_dir, &index)?;
+    Ok(true)
 }
 
 fn emit_preview_fill_progress(
@@ -2683,9 +2684,8 @@ fn build_source_meta_map_for_paths(
                 }
             }
         }
-        if is_workspace_path {
-            continue;
-        }
+        // During import/reindex windows, workspace files may exist before DB rows are updated.
+        // Fall back to filesystem metadata so pre-seeded cache previews can be resolved immediately.
         if let Ok(meta) = fs::metadata(&path_buf) {
             let modified_ms = meta
                 .modified()
@@ -4475,6 +4475,37 @@ fn get_import_wizard_preview_data_url(path: String) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{b64}"))
 }
 
+#[tauri::command]
+fn get_import_wizard_quick_preview_data_url(path: String) -> Result<String, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+    if !is_supported_preview_image(&source) {
+        return Err("unsupported preview source file".to_string());
+    }
+    generate_quick_preview_data_url(&source)
+        .ok_or_else(|| "failed to generate quick preview".to_string())
+}
+
+#[tauri::command]
+fn get_import_wizard_preview_src_path(app_handle: tauri::AppHandle, path: String) -> Result<String, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+    let mapped = ensure_webview_accessible_preview_path(&app_handle, &source);
+    Ok(mapped.to_string_lossy().to_string())
+}
+
 fn import_wizard_image_structurally_complete(ext: &str, bytes: &[u8]) -> bool {
     match ext {
         "jpg" | "jpeg" => bytes.len() >= 2 && bytes.ends_with(&[0xFF, 0xD9]),
@@ -5826,6 +5857,19 @@ fn start_import_files(
         }
         IMPORT_ACTIVE_COUNT.fetch_add(1, Ordering::Relaxed);
         let _import_active_guard = ImportActiveGuard;
+        // Import has highest priority: pause competing background cache tasks.
+        PREVIEW_FILL_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+        LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+        for _ in 0..80 {
+            if !PREVIEW_FILL_RUNNING.load(Ordering::Relaxed)
+                && !LOCAL_CACHE_COPY_RUNNING.load(Ordering::Relaxed)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+        LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 
         let total_bytes: u64 = import_files
             .iter()
@@ -5844,7 +5888,8 @@ fn start_import_files(
                 if batch.is_empty() {
                     continue;
                 }
-                if let Ok(rows) = resolve_cached_previews(&preview_handle, &batch, false, true) {
+                // Do not create new previews during import. Import should remain I/O-priority.
+                if let Ok(rows) = resolve_cached_previews(&preview_handle, &batch, false, false) {
                     emit_import_preview_ready_events(&preview_handle, &rows);
                 }
             }
@@ -5875,13 +5920,6 @@ fn start_import_files(
 
             match fs::copy(&src_path, &dst_path) {
                 Ok(written) => {
-                    if delete_origin {
-                        // Safety guard: never delete originals that are inside workspace.
-                        if !path_is_inside_dir(&src_path, &workspace_root_for_delete_guard) {
-                            let _ = fs::remove_file(&src_path);
-                        }
-                    }
-
                     if is_supported_preview_image(&dst_path) {
                         if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
                             let _ = seed_active_preview_cache_from_import_wizard_cache(
@@ -5895,6 +5933,13 @@ fn start_import_files(
                         if pending_preview_paths.len() >= IMPORT_PREVIEW_MICROBATCH_SIZE {
                             let batch = std::mem::take(&mut pending_preview_paths);
                             let _ = preview_tx.send(batch);
+                        }
+                    }
+
+                    if delete_origin {
+                        // Safety guard: never delete originals that are inside workspace.
+                        if !path_is_inside_dir(&src_path, &workspace_root_for_delete_guard) {
+                            let _ = fs::remove_file(&src_path);
                         }
                     }
 
@@ -6098,6 +6143,13 @@ async fn sync_local_cache_copy(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
 ) -> Result<LocalCacheCopyStatusRow, String> {
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+        let runtime = local_cache_copy_runtime()
+            .lock()
+            .map_err(|e| e.to_string())?;
+        return Ok(local_cache_copy_status_row(&app_handle, true, false, &runtime));
+    }
+
     let settings = read_settings(&app_handle).unwrap_or_default();
     let enabled = settings.keep_local_cache_copy.unwrap_or(false);
     if !enabled {
@@ -6497,6 +6549,9 @@ fn start_background_preview_fill(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
 ) -> Result<bool, String> {
+    if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+        return Ok(false);
+    }
     let settings = read_settings(&app_handle).unwrap_or_default();
     if !settings.background_preview_creation.unwrap_or(false) {
         return Ok(false);
@@ -6718,6 +6773,8 @@ pub fn run() {
             clear_import_wizard_preview_cache,
             open_import_wizard_preview_window,
             get_import_wizard_preview_data_url,
+            get_import_wizard_quick_preview_data_url,
+            get_import_wizard_preview_src_path,
             validate_import_wizard_image_complete,
             get_current_import_wizard_preview_path,
             close_import_wizard_preview_window,
