@@ -15,6 +15,7 @@ const appView = document.getElementById("appView");
 const startupView = document.getElementById("startupView");
 const startupProcessText = document.getElementById("startupProcessText");
 const startupUpdateNotice = document.getElementById("startupUpdateNotice");
+const startupSpinnerPercent = document.getElementById("startupSpinnerPercent");
 
 const pickBtn = document.getElementById("pickWorkspaceBtn");
 const pickIcon = document.getElementById("pickWorkspaceIcon");
@@ -104,6 +105,12 @@ function setStartupProcessStatus(message = "") {
   if (!startupProcessText) return;
   const text = String(message ?? "").trim();
   startupProcessText.textContent = text || "Starting application...";
+}
+
+function setStartupSpinnerPercent(percent = 0) {
+  if (!startupSpinnerPercent) return;
+  const safe = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  startupSpinnerPercent.textContent = `${safe}%`;
 }
 
 function setStartupUpdateNoticeVisible(visible) {
@@ -2754,7 +2761,7 @@ async function loadPatients(workspaceDir, options = {}) {
   };
 
   try {
-    setStartupStageIfChanged("Building workspace index...");
+    setStartupStageIfChanged("Updating Database...");
     let startAccepted = await withTimeout(
       invoke("start_workspace_reindex", { workspaceDir }),
       WORKSPACE_REINDEX_START_TIMEOUT_MS,
@@ -2805,7 +2812,7 @@ async function loadPatients(workspaceDir, options = {}) {
         if (importingKeywords) {
           setStartupStageIfChanged("Importing Keywords...");
         } else {
-          setStartupStageIfChanged("Building workspace index...");
+          setStartupStageIfChanged("Updating Database...");
         }
       }
       if (isDbUpdating && dbStatusText) {
@@ -2966,14 +2973,20 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   setWorkspacePathDisplay(workspaceDir);
   initialMainReadyInProgress = true;
   setStartupProcessStatus("Loading cache state...");
+  setStartupSpinnerPercent(0);
   if (!skipLoadPatients) {
     await loadPatients(workspaceDir, {
       onStartupStage: (message) => setStartupProcessStatus(message),
+      onReindexProgress: (percent) => setStartupSpinnerPercent(percent),
     });
+  } else {
+    setStartupSpinnerPercent(82);
   }
   setStartupProcessStatus("Counting indexed images...");
+  setStartupSpinnerPercent(92);
   await refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir);
   setStartupProcessStatus("Finalizing startup...");
+  setStartupSpinnerPercent(100);
   appView.hidden = false;
   if (startupView) startupView.hidden = true;
   updateCacheReloadButtonState();

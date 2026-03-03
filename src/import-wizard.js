@@ -30,6 +30,8 @@ let pupilInterval = null;
 let pollInterval = null;
 let importExpanded = false;
 let lastLivePreviewPath = "";
+let livePreviewManuallyClosed = false;
+let suppressNextPreviewClosedEvent = false;
 let importMode = false;
 let importBusy = false;
 let importModeFilePaths = [];
@@ -42,6 +44,18 @@ const candidateRowsByPath = new Map();
 
 const BASELINE_EXISTING_FILE_AGE_MS = 60000;
 const FILE_DECODE_RETRY_MIN_MS = 1000;
+
+function getPendingPreviewPaths() {
+  const seen = new Set();
+  const out = [];
+  for (const row of pendingRows) {
+    const path = String(row?.path ?? "").trim();
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    out.push(path);
+  }
+  return out;
+}
 
 function renderImportUi() {
   if (!importPanel || !importCountText || !importListWrap || !importList || !importToggle) return;
@@ -79,6 +93,13 @@ function renderImportUi() {
     title.textContent = name;
     title.title = name;
     li.appendChild(title);
+    li.addEventListener("click", () => {
+      if (!path) return;
+      void sendLivePreviewPath(path, getPendingPreviewPaths(), {
+        force: true,
+        userInitiated: true,
+      });
+    });
 
     const removeBtn = document.createElement("button");
     removeBtn.type = "button";
@@ -104,6 +125,7 @@ function renderImportUi() {
       if (idx >= 0) pendingRows.splice(idx, 1);
       renderImportUi();
       updateActionButtonState();
+      void syncLivePreviewNavigation();
     });
     li.appendChild(removeBtn);
 
@@ -353,10 +375,12 @@ async function pollWatchFolder() {
 
     renderImportUi();
     updateActionButtonState();
+    void syncLivePreviewNavigation();
     const countIncreased = pendingRows.length > previousPendingCount;
     if (livePreviewToggle?.checked && countIncreased && latestAddedPath && latestAddedPath !== lastLivePreviewPath) {
+      livePreviewManuallyClosed = false;
       requestAnimationFrame(() => {
-        void sendLivePreviewPath(latestAddedPath);
+        void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths());
       });
     }
   } catch (err) {
@@ -467,6 +491,10 @@ function shouldTreatAsBaselineFile(row, nowMs = Date.now()) {
 }
 
 async function closeLivePreviewWindow() {
+  suppressNextPreviewClosedEvent = true;
+  setTimeout(() => {
+    suppressNextPreviewClosedEvent = false;
+  }, 600);
   try {
     await invoke("close_import_wizard_preview_window");
   } catch {
@@ -476,14 +504,37 @@ async function closeLivePreviewWindow() {
   }
 }
 
-async function sendLivePreviewPath(path) {
-  if (!path || !livePreviewToggle?.checked) return;
+async function sendLivePreviewPath(path, navigationPaths = null, options = {}) {
+  const force = Boolean(options?.force);
+  const userInitiated = Boolean(options?.userInitiated);
+  if (!path) return;
+  if (!force && !livePreviewToggle?.checked) return;
+  const navPaths = Array.isArray(navigationPaths) ? navigationPaths : getPendingPreviewPaths();
   try {
-    await invoke("open_import_wizard_preview_window", { path });
+    await invoke("open_import_wizard_preview_window", {
+      path,
+      navigationPaths: navPaths,
+    });
     lastLivePreviewPath = path;
+    if (force || userInitiated) {
+      livePreviewManuallyClosed = false;
+    }
   } catch (err) {
     console.error("import wizard live preview update failed:", err);
   }
+}
+
+async function syncLivePreviewNavigation() {
+  if (!livePreviewToggle?.checked || importMode) return;
+  if (livePreviewManuallyClosed) return;
+  const navPaths = getPendingPreviewPaths();
+  if (navPaths.length < 1) {
+    await closeLivePreviewWindow();
+    return;
+  }
+  const activePath = navPaths.includes(lastLivePreviewPath) ? lastLivePreviewPath : navPaths[0];
+  if (!activePath) return;
+  await sendLivePreviewPath(activePath, navPaths);
 }
 
 function initDoctorAnimation() {
@@ -599,6 +650,15 @@ async function init() {
   void listen("import-wizard-request-close", () => {
     void requestCloseWithWarning();
   });
+  void listen("import-wizard-preview-window-closed", () => {
+    if (suppressNextPreviewClosedEvent) {
+      suppressNextPreviewClosedEvent = false;
+      return;
+    }
+    if (!livePreviewToggle?.checked || importMode) return;
+    livePreviewManuallyClosed = true;
+    lastLivePreviewPath = "";
+  });
   if (treatmentInput) {
     treatmentInput.addEventListener("input", updateActionButtonState);
     treatmentInput.addEventListener("keydown", (event) => {
@@ -613,8 +673,12 @@ async function init() {
       if (importMode) return;
       void saveLivePreviewToggleSetting(livePreviewToggle.checked);
       if (!livePreviewToggle.checked) {
+        livePreviewManuallyClosed = false;
         void closeLivePreviewWindow();
+        return;
       }
+      livePreviewManuallyClosed = false;
+      void syncLivePreviewNavigation();
     });
   }
 

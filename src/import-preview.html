@@ -9,7 +9,16 @@
   </head>
   <body>
     <main class="preview-root">
+      <button id="navPrevBtn" class="preview-nav preview-nav-left" type="button" aria-label="Previous image">
+        &#8249;
+      </button>
       <img id="previewImage" alt="Live preview" draggable="false" />
+      <div id="previewLoading" class="preview-loading" aria-hidden="true">
+        <div class="preview-spinner" aria-label="Loading image"></div>
+      </div>
+      <button id="navNextBtn" class="preview-nav preview-nav-right" type="button" aria-label="Next image">
+        &#8250;
+      </button>
     </main>
   </body>
 </html>

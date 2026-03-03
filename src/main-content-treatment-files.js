@@ -554,11 +554,14 @@ export function createTreatmentFilesPanel({
     renderOverviewKeywords(w, p, requestId);
 
     otherWrapEl.hidden = rootFiles.length < 1;
-    const rootImageCardsByPath = renderOtherFiles(rootFiles);
     const rootImagePaths = rootFiles
       .filter((file) => Boolean(file?.is_image ?? file?.isImage))
       .map((file) => normalizePath(file?.path ?? ""))
       .filter((path) => path.length > 0);
+    const rootImageCardsByPath = renderOtherFiles(rootFiles, {
+      scope: "patient_root",
+      navigationPaths: rootImagePaths,
+    });
 
     if (folders.length > 0 || rootImagePaths.length > 0) {
       const stackPreviewPaths = [];
@@ -839,11 +842,13 @@ export function createTreatmentFilesPanel({
     keywordsListEl.appendChild(addKeywordBtn);
   }
 
-  function renderOtherFiles(otherFiles = []) {
+  function renderOtherFiles(otherFiles = [], options = {}) {
     otherListEl.innerHTML = "";
     const imageCardsByPath = new Map();
+    const scope = String(options?.scope ?? "").trim();
+    const navigationPaths = Array.isArray(options?.navigationPaths) ? options.navigationPaths : [];
     for (const file of otherFiles) {
-      const row = createFileListRow(file);
+      const row = createFileListRow(file, { scope, navigationPaths });
       otherListEl.appendChild(row);
       if (Boolean(file?.is_image ?? file?.isImage)) {
         const path = normalizePath(file?.path ?? "");
@@ -853,7 +858,7 @@ export function createTreatmentFilesPanel({
     return imageCardsByPath;
   }
 
-  function createImageCard(file) {
+  function createImageCard(file, options = {}) {
     const card = document.createElement("button");
     card.type = "button";
     card.className = "treatment-image-card";
@@ -870,7 +875,15 @@ export function createTreatmentFilesPanel({
         return;
       }
       if (typeof onOpenPath === "function") {
-        void onOpenPath(file.path);
+        void onOpenPath({
+          path: file.path,
+          isImage: true,
+          scope: String(options?.scope ?? "").trim() || "treatment",
+          workspaceDir: activeContext?.workspaceDir ?? "",
+          patientFolder: activeContext?.patientFolder ?? "",
+          treatmentFolder: activeContext?.treatmentFolder ?? "",
+          navigationPaths: Array.isArray(options?.navigationPaths) ? options.navigationPaths : [],
+        });
       }
     });
     card.addEventListener("dragstart", (event) => {
@@ -891,7 +904,7 @@ export function createTreatmentFilesPanel({
     return card;
   }
 
-  function createFileListRow(file) {
+  function createFileListRow(file, options = {}) {
     const isImage = Boolean(file?.is_image ?? file?.isImage);
     const createdMs = Number(file?.created_ms ?? file?.createdMs ?? file?.modified_ms ?? file?.modifiedMs ?? 0) || 0;
     const dateText = formatDateOnly(createdMs);
@@ -914,7 +927,15 @@ export function createTreatmentFilesPanel({
     `;
     row.addEventListener("click", () => {
       if (typeof onOpenPath === "function") {
-        void onOpenPath(file.path);
+        void onOpenPath({
+          path: file.path,
+          isImage,
+          scope: String(options?.scope ?? "").trim() || (activeContext?.treatmentFolder ? "treatment" : "patient_root"),
+          workspaceDir: activeContext?.workspaceDir ?? "",
+          patientFolder: activeContext?.patientFolder ?? "",
+          treatmentFolder: activeContext?.treatmentFolder ?? "",
+          navigationPaths: Array.isArray(options?.navigationPaths) ? options.navigationPaths : [],
+        });
       }
     });
     row.addEventListener("dragstart", (event) => {
@@ -1384,7 +1405,7 @@ export function createTreatmentFilesPanel({
     const cardsByPath = new Map();
     if (useListView) {
       for (const file of files) {
-        const row = createFileListRow(file);
+        const row = createFileListRow(file, { scope: "treatment" });
         listEl.appendChild(row);
         if (Boolean(file?.is_image ?? file?.isImage)) {
           const path = normalizePath(file?.path ?? "");
@@ -1392,9 +1413,9 @@ export function createTreatmentFilesPanel({
         }
       }
     } else {
-      renderOtherFiles(otherFiles);
+      renderOtherFiles(otherFiles, { scope: "treatment" });
       for (const file of imageFiles) {
-        const card = createImageCard(file);
+        const card = createImageCard(file, { scope: "treatment" });
         const path = normalizePath(file?.path ?? "");
         if (path) cardsByPath.set(path, card);
         imagesGridEl.appendChild(card);

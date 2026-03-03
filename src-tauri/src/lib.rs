@@ -543,6 +543,9 @@ static LOCAL_CACHE_COPY_RUNTIME: OnceLock<Mutex<LocalCacheCopyRuntime>> = OnceLo
 static LOCAL_CACHE_COPY_RUNNING: AtomicBool = AtomicBool::new(false);
 static LOCAL_CACHE_COPY_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static IMPORT_WIZARD_PREVIEW_PATH: OnceLock<Mutex<String>> = OnceLock::new();
+static IMPORT_WIZARD_PREVIEW_NAV_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static IMAGE_PREVIEW_PATH: OnceLock<Mutex<String>> = OnceLock::new();
+static IMAGE_PREVIEW_NAV_PATHS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static WORKSPACE_REINDEX_RUNNING: AtomicBool = AtomicBool::new(false);
 static WORKSPACE_REINDEX_STATUS: OnceLock<Mutex<WorkspaceReindexStatus>> = OnceLock::new();
 static PREVIEW_DEBUG_COUNTS_CACHE: OnceLock<Mutex<HashMap<String, PreviewDebugCountsCacheEntry>>> =
@@ -1270,6 +1273,18 @@ fn preview_cache_lock() -> &'static Mutex<()> {
 
 fn import_wizard_preview_path_store() -> &'static Mutex<String> {
     IMPORT_WIZARD_PREVIEW_PATH.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn import_wizard_preview_nav_paths_store() -> &'static Mutex<Vec<String>> {
+    IMPORT_WIZARD_PREVIEW_NAV_PATHS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn image_preview_path_store() -> &'static Mutex<String> {
+    IMAGE_PREVIEW_PATH.get_or_init(|| Mutex::new(String::new()))
+}
+
+fn image_preview_nav_paths_store() -> &'static Mutex<Vec<String>> {
+    IMAGE_PREVIEW_NAV_PATHS.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 fn local_cache_copy_runtime() -> &'static Mutex<LocalCacheCopyRuntime> {
@@ -4282,6 +4297,96 @@ fn list_patient_image_paths_page(
 }
 
 #[tauri::command]
+fn list_treatment_image_paths(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+    treatment_folder: String,
+) -> Result<Vec<String>, String> {
+    let workspace_dir = workspace_dir.trim().to_string();
+    let workspace = PathBuf::from(&workspace_dir);
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+    let treatment_folder = treatment_folder.trim();
+    if treatment_folder.is_empty() {
+        return Err("treatment folder is required".to_string());
+    }
+
+    let conn = open_db(&app_handle)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_name
+             FROM patient_file_index
+             WHERE workspace_dir = ?1
+               AND patient_folder = ?2
+               AND treatment_folder = ?3
+               AND is_image = 1
+             ORDER BY file_name COLLATE NOCASE",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![workspace_dir, patient_folder, treatment_folder], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let file_name = row.map_err(|e| e.to_string())?;
+        let path = workspace
+            .join(patient_folder)
+            .join(treatment_folder)
+            .join(file_name);
+        out.push(path.to_string_lossy().to_string());
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn list_patient_root_image_paths(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+) -> Result<Vec<String>, String> {
+    let workspace_dir = workspace_dir.trim().to_string();
+    let workspace = PathBuf::from(&workspace_dir);
+
+    let patient_folder = patient_folder.trim();
+    if patient_folder.is_empty() {
+        return Err("patient folder is required".to_string());
+    }
+
+    let conn = open_db(&app_handle)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT file_name
+             FROM patient_file_index
+             WHERE workspace_dir = ?1
+               AND patient_folder = ?2
+               AND treatment_folder = ''
+               AND is_image = 1
+             ORDER BY file_name COLLATE NOCASE",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![workspace_dir, patient_folder], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let file_name = row.map_err(|e| e.to_string())?;
+        let path = workspace.join(patient_folder).join(file_name);
+        out.push(path.to_string_lossy().to_string());
+    }
+    Ok(out)
+}
+
+#[tauri::command]
 fn list_import_wizard_files(folder_dir: String) -> Result<Vec<ImportWizardFileRow>, String> {
     let folder_dir = folder_dir.trim();
     if folder_dir.is_empty() {
@@ -4394,8 +4499,30 @@ fn clear_import_wizard_preview_cache(app_handle: tauri::AppHandle, folder_dir: S
     Ok(true)
 }
 
+fn sanitize_navigation_paths(paths: Option<Vec<String>>, active_path: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    if let Some(raw_paths) = paths {
+        for raw in raw_paths {
+            let p = raw.trim().to_string();
+            if p.is_empty() || !seen.insert(p.clone()) {
+                continue;
+            }
+            out.push(p);
+        }
+    }
+    if !active_path.trim().is_empty() && !out.iter().any(|p| p == active_path) {
+        out.insert(0, active_path.to_string());
+    }
+    out
+}
+
 #[tauri::command]
-fn open_import_wizard_preview_window(app_handle: tauri::AppHandle, path: String) -> Result<bool, String> {
+fn open_import_wizard_preview_window(
+    app_handle: tauri::AppHandle,
+    path: String,
+    navigation_paths: Option<Vec<String>>,
+) -> Result<bool, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("path is required".to_string());
@@ -4407,10 +4534,18 @@ fn open_import_wizard_preview_window(app_handle: tauri::AppHandle, path: String)
     if let Ok(mut current) = import_wizard_preview_path_store().lock() {
         *current = path.clone();
     }
+    let sanitized_nav_paths = sanitize_navigation_paths(navigation_paths, &path);
+    if let Ok(mut nav_paths) = import_wizard_preview_nav_paths_store().lock() {
+        *nav_paths = if sanitized_nav_paths.is_empty() {
+            vec![path.clone()]
+        } else {
+            sanitized_nav_paths.clone()
+        };
+    }
 
     let label = "import_wizard_preview";
-    let window = if let Some(existing) = app_handle.get_webview_window(label) {
-        existing
+    let (window, created_now) = if let Some(existing) = app_handle.get_webview_window(label) {
+        (existing, false)
     } else {
         let settings = read_settings(&app_handle).unwrap_or_default();
         let state = settings.import_wizard_preview_window_state;
@@ -4423,7 +4558,7 @@ fn open_import_wizard_preview_window(app_handle: tauri::AppHandle, path: String)
             _ => (820, 620),
         };
 
-        tauri::WebviewWindowBuilder::new(
+        let created = tauri::WebviewWindowBuilder::new(
             &app_handle,
             label,
             tauri::WebviewUrl::App("import-preview.html".into()),
@@ -4434,12 +4569,84 @@ fn open_import_wizard_preview_window(app_handle: tauri::AppHandle, path: String)
         .resizable(true)
         .center()
         .build()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+        (created, true)
     };
 
-    window.show().map_err(|e| e.to_string())?;
+    let is_visible = window.is_visible().unwrap_or(false);
+    if created_now || !is_visible {
+        window.show().map_err(|e| e.to_string())?;
+    }
     window
-        .emit("import-wizard-preview-file", serde_json::json!({ "path": path }))
+        .emit(
+            "import-wizard-preview-file",
+            serde_json::json!({
+                "path": path,
+                "paths": sanitized_nav_paths,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
+fn open_image_preview_window(
+    app_handle: tauri::AppHandle,
+    path: String,
+    navigation_paths: Option<Vec<String>>,
+) -> Result<bool, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+    if let Ok(mut current) = image_preview_path_store().lock() {
+        *current = path.clone();
+    }
+
+    let sanitized_nav_paths = sanitize_navigation_paths(navigation_paths, &path);
+    if let Ok(mut nav_paths) = image_preview_nav_paths_store().lock() {
+        *nav_paths = if sanitized_nav_paths.is_empty() {
+            vec![path.clone()]
+        } else {
+            sanitized_nav_paths.clone()
+        };
+    }
+
+    let label = "image_preview";
+    let (window, created_now) = if let Some(existing) = app_handle.get_webview_window(label) {
+        (existing, false)
+    } else {
+        let created = tauri::WebviewWindowBuilder::new(
+            &app_handle,
+            label,
+            tauri::WebviewUrl::App("import-preview.html?mode=image".into()),
+        )
+        .title("Image Preview")
+        .inner_size(980.0, 740.0)
+        .min_inner_size(520.0, 420.0)
+        .resizable(true)
+        .center()
+        .build()
+        .map_err(|e| e.to_string())?;
+        (created, true)
+    };
+
+    let is_visible = window.is_visible().unwrap_or(false);
+    if created_now || !is_visible {
+        window.show().map_err(|e| e.to_string())?;
+    }
+    window
+        .emit(
+            "image-preview-file",
+            serde_json::json!({
+                "path": path,
+                "paths": sanitized_nav_paths,
+            }),
+        )
         .map_err(|e| e.to_string())?;
     Ok(true)
 }
@@ -4608,6 +4815,9 @@ fn close_import_wizard_preview_window(app_handle: tauri::AppHandle) -> Result<bo
     if let Ok(mut current) = import_wizard_preview_path_store().lock() {
         current.clear();
     }
+    if let Ok(mut nav_paths) = import_wizard_preview_nav_paths_store().lock() {
+        nav_paths.clear();
+    }
     let Some(window) = app_handle.get_webview_window("import_wizard_preview") else {
         return Ok(false);
     };
@@ -4630,6 +4840,45 @@ fn get_current_import_wizard_preview_path() -> Result<String, String> {
         .lock()
         .map_err(|e| e.to_string())?;
     Ok(current.clone())
+}
+
+#[tauri::command]
+fn get_current_import_wizard_preview_paths() -> Result<Vec<String>, String> {
+    let paths = import_wizard_preview_nav_paths_store()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(paths.clone())
+}
+
+#[tauri::command]
+fn get_current_image_preview_path() -> Result<String, String> {
+    let current = image_preview_path_store()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(current.clone())
+}
+
+#[tauri::command]
+fn get_current_image_preview_paths() -> Result<Vec<String>, String> {
+    let paths = image_preview_nav_paths_store()
+        .lock()
+        .map_err(|e| e.to_string())?;
+    Ok(paths.clone())
+}
+
+#[tauri::command]
+fn close_image_preview_window(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    if let Ok(mut current) = image_preview_path_store().lock() {
+        current.clear();
+    }
+    if let Ok(mut nav_paths) = image_preview_nav_paths_store().lock() {
+        nav_paths.clear();
+    }
+    let Some(window) = app_handle.get_webview_window("image_preview") else {
+        return Ok(false);
+    };
+    window.close().map_err(|e| e.to_string())?;
+    Ok(true)
 }
 
 #[tauri::command]
@@ -6749,6 +6998,11 @@ pub fn run() {
                         let _ = persist_main_window_state(&window.app_handle(), window);
                     } else if window.label() == "import_wizard_preview" {
                         let _ = persist_import_wizard_preview_window_state(&window.app_handle(), window);
+                        if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                            let _ = window
+                                .app_handle()
+                                .emit("import-wizard-preview-window-closed", serde_json::json!({}));
+                        }
                     }
                 }
                 _ => {}
@@ -6767,17 +7021,24 @@ pub fn run() {
             copy_treatment_folder_to_destination,
             copy_file_to_destination,
             copy_patient_folder_to_destination,
+            list_treatment_image_paths,
+            list_patient_root_image_paths,
             list_import_wizard_files,
             get_import_files_created_ms,
             ensure_import_wizard_preview_cache,
             clear_import_wizard_preview_cache,
             open_import_wizard_preview_window,
+            open_image_preview_window,
             get_import_wizard_preview_data_url,
             get_import_wizard_quick_preview_data_url,
             get_import_wizard_preview_src_path,
             validate_import_wizard_image_complete,
             get_current_import_wizard_preview_path,
+            get_current_import_wizard_preview_paths,
+            get_current_image_preview_path,
+            get_current_image_preview_paths,
             close_import_wizard_preview_window,
+            close_image_preview_window,
             close_import_wizard_helper_window,
             notify_import_wizard_completed,
             remove_import_wizard_cached_preview,

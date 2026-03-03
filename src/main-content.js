@@ -82,8 +82,66 @@ export function initMainContent({
   } = createImportPanel(contentScrollLayer);
   const treatmentFilesPanel = createTreatmentFilesPanel({
     container: contentScrollLayer,
-    onOpenPath: async (path) => {
-      await invoke("open_path_with_default", { path });
+    onOpenPath: async (openRequest) => {
+      const path = typeof openRequest === "string"
+        ? String(openRequest ?? "").trim()
+        : String(openRequest?.path ?? "").trim();
+      if (!path) return;
+
+      const isImage = typeof openRequest === "object"
+        ? Boolean(openRequest?.isImage ?? openRequest?.is_image ?? false)
+        : false;
+      if (!isImage) {
+        await invoke("open_path_with_default", { path });
+        return;
+      }
+
+      const workspaceDir = String(openRequest?.workspaceDir ?? "").trim();
+      const patientFolder = String(openRequest?.patientFolder ?? "").trim();
+      const treatmentFolder = String(openRequest?.treatmentFolder ?? "").trim();
+      const scope = String(openRequest?.scope ?? "").trim();
+      let navigationPaths = Array.isArray(openRequest?.navigationPaths)
+        ? openRequest.navigationPaths.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+        : [];
+
+      try {
+        if (scope === "treatment" && workspaceDir && patientFolder && treatmentFolder) {
+          const rows = await invoke("list_treatment_image_paths", {
+            workspaceDir,
+            patientFolder,
+            treatmentFolder,
+          });
+          const normalized = Array.isArray(rows)
+            ? rows.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+            : [];
+          if (normalized.length > 0) navigationPaths = normalized;
+        } else if (scope === "patient_root" && workspaceDir && patientFolder) {
+          const rows = await invoke("list_patient_root_image_paths", {
+            workspaceDir,
+            patientFolder,
+          });
+          const normalized = Array.isArray(rows)
+            ? rows.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+            : [];
+          if (normalized.length > 0) navigationPaths = normalized;
+        }
+      } catch (err) {
+        console.error("loading image preview navigation paths failed:", err);
+      }
+
+      if (!navigationPaths.includes(path)) {
+        navigationPaths.unshift(path);
+      }
+
+      try {
+        await invoke("open_image_preview_window", {
+          path,
+          navigationPaths,
+        });
+      } catch (err) {
+        console.error("open_image_preview_window failed, fallback to default opener:", err);
+        await invoke("open_path_with_default", { path });
+      }
     },
     onOpenTreatmentFolder: (folderName) => {
       const target = String(folderName ?? "").trim();
