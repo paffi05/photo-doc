@@ -8,13 +8,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Cursor;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Default)]
 struct WindowState {
@@ -4517,9 +4517,27 @@ fn sanitize_navigation_paths(paths: Option<Vec<String>>, active_path: &str) -> V
     out
 }
 
+fn preview_trace(scope: &str, message: &str) {
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!("[preview-trace][rust][{scope}][{ts_ms}] {message}");
+}
+
 #[tauri::command]
-fn open_import_wizard_preview_window(
-    app_handle: tauri::AppHandle,
+fn preview_trace_client(scope: String, message: String) -> Result<bool, String> {
+    let safe_scope = scope.trim();
+    let safe_message = message.trim();
+    if safe_scope.is_empty() || safe_message.is_empty() {
+        return Ok(false);
+    }
+    preview_trace(safe_scope, safe_message);
+    Ok(true)
+}
+
+#[tauri::command]
+fn set_import_wizard_preview_state(
     path: String,
     navigation_paths: Option<Vec<String>>,
 ) -> Result<bool, String> {
@@ -4539,14 +4557,84 @@ fn open_import_wizard_preview_window(
         *nav_paths = if sanitized_nav_paths.is_empty() {
             vec![path.clone()]
         } else {
+            sanitized_nav_paths
+        };
+    }
+    preview_trace("wizard-state", &format!("state set path={path}"));
+    Ok(true)
+}
+
+#[tauri::command]
+fn set_image_preview_state(
+    path: String,
+    navigation_paths: Option<Vec<String>>,
+) -> Result<bool, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+    if let Ok(mut current) = image_preview_path_store().lock() {
+        *current = path.clone();
+    }
+    let sanitized_nav_paths = sanitize_navigation_paths(navigation_paths, &path);
+    if let Ok(mut nav_paths) = image_preview_nav_paths_store().lock() {
+        *nav_paths = if sanitized_nav_paths.is_empty() {
+            vec![path.clone()]
+        } else {
+            sanitized_nav_paths
+        };
+    }
+    preview_trace("image-state", &format!("state set path={path}"));
+    Ok(true)
+}
+
+#[tauri::command]
+fn open_import_wizard_preview_window(
+    app_handle: tauri::AppHandle,
+    path: String,
+    navigation_paths: Option<Vec<String>>,
+) -> Result<bool, String> {
+    let started = Instant::now();
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let source = PathBuf::from(&path);
+    if !source.exists() || !source.is_file() {
+        return Err("preview source file does not exist".to_string());
+    }
+    if let Ok(mut current) = import_wizard_preview_path_store().lock() {
+        *current = path.clone();
+    }
+    let sanitized_nav_paths = sanitize_navigation_paths(navigation_paths, &path);
+    preview_trace(
+        "wizard-open",
+        &format!(
+            "start path={} nav_count={}",
+            path,
+            sanitized_nav_paths.len()
+        ),
+    );
+    if let Ok(mut nav_paths) = import_wizard_preview_nav_paths_store().lock() {
+        *nav_paths = if sanitized_nav_paths.is_empty() {
+            vec![path.clone()]
+        } else {
             sanitized_nav_paths.clone()
         };
     }
 
     let label = "import_wizard_preview";
+    preview_trace("wizard-open", "checking existing window");
     let (window, created_now) = if let Some(existing) = app_handle.get_webview_window(label) {
+        preview_trace("wizard-open", "existing window found");
         (existing, false)
     } else {
+        let build_started = Instant::now();
+        preview_trace("wizard-open", "building new window");
         let settings = read_settings(&app_handle).unwrap_or_default();
         let state = settings.import_wizard_preview_window_state;
         let (width, height) = match state {
@@ -4570,13 +4658,30 @@ fn open_import_wizard_preview_window(
         .center()
         .build()
         .map_err(|e| e.to_string())?;
+        preview_trace(
+            "wizard-open",
+            &format!(
+                "window built label={} width={} height={} build_ms={}",
+                label,
+                width,
+                height,
+                build_started.elapsed().as_millis()
+            ),
+        );
         (created, true)
     };
 
     let is_visible = window.is_visible().unwrap_or(false);
+    preview_trace(
+        "wizard-open",
+        &format!("window visibility before show={is_visible}"),
+    );
     if created_now || !is_visible {
+        preview_trace("wizard-open", "calling window.show()");
         window.show().map_err(|e| e.to_string())?;
+        preview_trace("wizard-open", "window.show() returned");
     }
+    preview_trace("wizard-open", "calling window.emit(import-wizard-preview-file)");
     window
         .emit(
             "import-wizard-preview-file",
@@ -4586,6 +4691,16 @@ fn open_import_wizard_preview_window(
             }),
         )
         .map_err(|e| e.to_string())?;
+    preview_trace("wizard-open", "window.emit returned");
+    preview_trace(
+        "wizard-open",
+        &format!(
+            "done created_now={} was_visible={} total_ms={}",
+            created_now,
+            is_visible,
+            started.elapsed().as_millis()
+        ),
+    );
     Ok(true)
 }
 
@@ -4595,6 +4710,7 @@ fn open_image_preview_window(
     path: String,
     navigation_paths: Option<Vec<String>>,
 ) -> Result<bool, String> {
+    let started = Instant::now();
     let path = path.trim().to_string();
     if path.is_empty() {
         return Err("path is required".to_string());
@@ -4608,6 +4724,14 @@ fn open_image_preview_window(
     }
 
     let sanitized_nav_paths = sanitize_navigation_paths(navigation_paths, &path);
+    preview_trace(
+        "image-open",
+        &format!(
+            "start path={} nav_count={}",
+            path,
+            sanitized_nav_paths.len()
+        ),
+    );
     if let Ok(mut nav_paths) = image_preview_nav_paths_store().lock() {
         *nav_paths = if sanitized_nav_paths.is_empty() {
             vec![path.clone()]
@@ -4617,9 +4741,13 @@ fn open_image_preview_window(
     }
 
     let label = "image_preview";
+    preview_trace("image-open", "checking existing window");
     let (window, created_now) = if let Some(existing) = app_handle.get_webview_window(label) {
+        preview_trace("image-open", "existing window found");
         (existing, false)
     } else {
+        let build_started = Instant::now();
+        preview_trace("image-open", "building new window");
         let created = tauri::WebviewWindowBuilder::new(
             &app_handle,
             label,
@@ -4632,13 +4760,28 @@ fn open_image_preview_window(
         .center()
         .build()
         .map_err(|e| e.to_string())?;
+        preview_trace(
+            "image-open",
+            &format!(
+                "window built label={} build_ms={}",
+                label,
+                build_started.elapsed().as_millis()
+            ),
+        );
         (created, true)
     };
 
     let is_visible = window.is_visible().unwrap_or(false);
+    preview_trace(
+        "image-open",
+        &format!("window visibility before show={is_visible}"),
+    );
     if created_now || !is_visible {
+        preview_trace("image-open", "calling window.show()");
         window.show().map_err(|e| e.to_string())?;
+        preview_trace("image-open", "window.show() returned");
     }
+    preview_trace("image-open", "calling window.emit(image-preview-file)");
     window
         .emit(
             "image-preview-file",
@@ -4648,38 +4791,74 @@ fn open_image_preview_window(
             }),
         )
         .map_err(|e| e.to_string())?;
+    preview_trace("image-open", "window.emit returned");
+    preview_trace(
+        "image-open",
+        &format!(
+            "done created_now={} was_visible={} total_ms={}",
+            created_now,
+            is_visible,
+            started.elapsed().as_millis()
+        ),
+    );
     Ok(true)
 }
 
 #[tauri::command]
-fn get_import_wizard_preview_data_url(path: String) -> Result<String, String> {
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        return Err("path is required".to_string());
-    }
-    let source = PathBuf::from(&path);
-    if !source.exists() || !source.is_file() {
-        return Err("preview source file does not exist".to_string());
-    }
+async fn get_import_wizard_preview_data_url(path: String) -> Result<String, String> {
+    preview_trace("data-url", "spawn_blocking start");
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err("path is required".to_string());
+        }
+        let source = PathBuf::from(&path);
+        if !source.exists() || !source.is_file() {
+            return Err("preview source file does not exist".to_string());
+        }
 
-    let ext = source
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    let mime = match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "bmp" => "image/bmp",
-        "tif" | "tiff" => "image/tiff",
-        _ => "application/octet-stream",
-    };
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "bmp" => "image/bmp",
+            "tif" | "tiff" => "image/tiff",
+            _ => "application/octet-stream",
+        };
 
-    let bytes = fs::read(&source).map_err(|e| e.to_string())?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{mime};base64,{b64}"))
+        let bytes = fs::read(&source).map_err(|e| e.to_string())?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+        preview_trace(
+            "data-url",
+            &format!(
+                "ok path={} ext={} total_ms={}",
+                path,
+                ext,
+                started.elapsed().as_millis()
+            ),
+        );
+        Ok(format!("data:{mime};base64,{b64}"))
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            preview_trace("data-url", &format!("error {err}"));
+            Err(err)
+        }
+        Err(join_err) => {
+            let err = join_err.to_string();
+            preview_trace("data-url", &format!("join-error {err}"));
+            Err(err)
+        }
+    }
 }
 
 #[tauri::command]
@@ -4700,29 +4879,88 @@ fn get_import_wizard_quick_preview_data_url(path: String) -> Result<String, Stri
 }
 
 #[tauri::command]
-fn get_import_wizard_preview_src_path(app_handle: tauri::AppHandle, path: String) -> Result<String, String> {
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        return Err("path is required".to_string());
+async fn get_import_wizard_preview_src_path(
+    app_handle: tauri::AppHandle,
+    path: String,
+) -> Result<String, String> {
+    preview_trace("src-path", "spawn_blocking start");
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let started = Instant::now();
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err("path is required".to_string());
+        }
+        let source = PathBuf::from(&path);
+        if !source.exists() || !source.is_file() {
+            return Err("preview source file does not exist".to_string());
+        }
+        let mapped = ensure_webview_accessible_preview_path(&app_handle, &source);
+        preview_trace(
+            "src-path",
+            &format!(
+                "ok path={} mapped={} total_ms={}",
+                path,
+                mapped.to_string_lossy(),
+                started.elapsed().as_millis()
+            ),
+        );
+        Ok(mapped.to_string_lossy().to_string())
+    })
+    .await;
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(err)) => {
+            preview_trace("src-path", &format!("error {err}"));
+            Err(err)
+        }
+        Err(join_err) => {
+            let err = join_err.to_string();
+            preview_trace("src-path", &format!("join-error {err}"));
+            Err(err)
+        }
     }
-    let source = PathBuf::from(&path);
-    if !source.exists() || !source.is_file() {
-        return Err("preview source file does not exist".to_string());
-    }
-    let mapped = ensure_webview_accessible_preview_path(&app_handle, &source);
-    Ok(mapped.to_string_lossy().to_string())
 }
 
-fn import_wizard_image_structurally_complete(ext: &str, bytes: &[u8]) -> bool {
+fn import_wizard_image_structurally_complete(path: &Path, ext: &str, size: u64) -> bool {
     match ext {
-        "jpg" | "jpeg" => bytes.len() >= 2 && bytes.ends_with(&[0xFF, 0xD9]),
+        "jpg" | "jpeg" => {
+            if size < 2 {
+                return false;
+            }
+            let mut file = match fs::File::open(path) {
+                Ok(file) => file,
+                Err(_) => return false,
+            };
+            if file.seek(SeekFrom::End(-2)).is_err() {
+                return false;
+            }
+            let mut tail = [0u8; 2];
+            if file.read_exact(&mut tail).is_err() {
+                return false;
+            }
+            tail == [0xFF, 0xD9]
+        }
         "png" => {
             const PNG_IEND_TRAILER: [u8; 12] = [
                 0x00, 0x00, 0x00, 0x00, // IEND chunk length
                 0x49, 0x45, 0x4E, 0x44, // IEND
                 0xAE, 0x42, 0x60, 0x82, // CRC
             ];
-            bytes.len() >= PNG_IEND_TRAILER.len() && bytes.ends_with(&PNG_IEND_TRAILER)
+            if size < PNG_IEND_TRAILER.len() as u64 {
+                return false;
+            }
+            let mut file = match fs::File::open(path) {
+                Ok(file) => file,
+                Err(_) => return false,
+            };
+            if file.seek(SeekFrom::End(-(PNG_IEND_TRAILER.len() as i64))).is_err() {
+                return false;
+            }
+            let mut tail = [0u8; 12];
+            if file.read_exact(&mut tail).is_err() {
+                return false;
+            }
+            tail == PNG_IEND_TRAILER
         }
         _ => false,
     }
@@ -4759,8 +4997,8 @@ fn validate_import_wizard_image_complete(path: String) -> Result<ImportWizardIma
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .unwrap_or_default();
-    let bytes = match fs::read(&source) {
-        Ok(b) => b,
+    let metadata = match fs::metadata(&source) {
+        Ok(m) => m,
         Err(_) => {
             return Ok(ImportWizardImageValidationRow {
                 ready: false,
@@ -4771,10 +5009,16 @@ fn validate_import_wizard_image_complete(path: String) -> Result<ImportWizardIma
             });
         }
     };
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    let fingerprint = format!("{:016x}", hasher.finish());
-    let structurally_complete = import_wizard_image_structurally_complete(ext.as_str(), &bytes);
+    let size = metadata.len();
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let fingerprint = format!("{size}:{modified_ms}");
+    let structurally_complete =
+        import_wizard_image_structurally_complete(&source, ext.as_str(), size);
 
     let reader = match image::ImageReader::open(&source) {
         Ok(r) => r,
@@ -4783,7 +5027,7 @@ fn validate_import_wizard_image_complete(path: String) -> Result<ImportWizardIma
                 ready: false,
                 decodable: false,
                 structurally_complete,
-                size: bytes.len() as u64,
+                size,
                 fingerprint,
             });
         }
@@ -4795,17 +5039,17 @@ fn validate_import_wizard_image_complete(path: String) -> Result<ImportWizardIma
                 ready: false,
                 decodable: false,
                 structurally_complete,
-                size: bytes.len() as u64,
+                size,
                 fingerprint,
             });
         }
     };
-    let decodable = reader.decode().is_ok();
+    let decodable = reader.into_dimensions().is_ok();
     Ok(ImportWizardImageValidationRow {
         ready: decodable && structurally_complete,
         decodable,
         structurally_complete,
-        size: bytes.len() as u64,
+        size,
         fingerprint,
     })
 }
@@ -7032,6 +7276,9 @@ pub fn run() {
             get_import_wizard_preview_data_url,
             get_import_wizard_quick_preview_data_url,
             get_import_wizard_preview_src_path,
+            preview_trace_client,
+            set_import_wizard_preview_state,
+            set_image_preview_state,
             validate_import_wizard_image_complete,
             get_current_import_wizard_preview_path,
             get_current_import_wizard_preview_paths,

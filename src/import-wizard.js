@@ -1,6 +1,7 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 
 const params = new URLSearchParams(window.location.search);
 const workspaceDir = String(params.get("workspaceDir") ?? "").trim();
@@ -30,6 +31,7 @@ let pupilInterval = null;
 let pollInterval = null;
 let importExpanded = false;
 let lastLivePreviewPath = "";
+let livePreviewPinnedPath = "";
 let livePreviewManuallyClosed = false;
 let suppressNextPreviewClosedEvent = false;
 let importMode = false;
@@ -37,13 +39,39 @@ let importBusy = false;
 let importModeFilePaths = [];
 let allowWindowClose = false;
 let closeConfirmVisible = false;
+let livePreviewWindow = null;
+let livePreviewConfirmRefreshTimerId = null;
+let livePreviewBlockedByImport = false;
 const knownPaths = new Set();
 const pendingRows = [];
 const previewDataUrlByPath = new Map();
 const candidateRowsByPath = new Map();
 
-const BASELINE_EXISTING_FILE_AGE_MS = 60000;
-const FILE_DECODE_RETRY_MIN_MS = 1000;
+const FILE_DECODE_RETRY_MIN_MS = 250;
+const WATCH_FOLDER_POLL_MS = 400;
+const PREVIEW_DISPATCH_TIMEOUT_MS = 1500;
+let pollInFlight = false;
+let lastPreviewDispatchSignature = "";
+const WIZARD_TRACE_ENABLED = true;
+
+function wizardTrace(scope, message, extra = null) {
+  if (!WIZARD_TRACE_ENABLED) return;
+  const ts = new Date().toISOString();
+  if (extra === null || extra === undefined) {
+    console.log(`[wizard-trace][${scope}][${ts}] ${message}`);
+    void invoke("preview_trace_client", {
+      scope: `wizard-main:${scope}`,
+      message,
+    }).catch(() => {});
+    return;
+  }
+  const serialized = JSON.stringify(extra);
+  console.log(`[wizard-trace][${scope}][${ts}] ${message}`, extra);
+  void invoke("preview_trace_client", {
+    scope: `wizard-main:${scope}`,
+    message: `${message} ${serialized}`,
+  }).catch(() => {});
+}
 
 function getPendingPreviewPaths() {
   const seen = new Set();
@@ -123,6 +151,7 @@ function renderImportUi() {
       previewDataUrlByPath.delete(path);
       const idx = pendingRows.findIndex((entry) => String(entry?.path ?? "").trim() === path);
       if (idx >= 0) pendingRows.splice(idx, 1);
+      if (livePreviewPinnedPath === path) livePreviewPinnedPath = "";
       renderImportUi();
       updateActionButtonState();
       void syncLivePreviewNavigation();
@@ -222,11 +251,21 @@ async function clearWizardPreviewCache() {
 
 async function enterImportMode() {
   importMode = true;
+  livePreviewBlockedByImport = true;
+  livePreviewManuallyClosed = true;
+  if (livePreviewToggle) {
+    livePreviewToggle.checked = false;
+  }
   importModeFilePaths = pendingRows
     .map((row) => String(row?.path ?? "").trim())
     .filter(Boolean);
   importExpanded = false;
   await closeLivePreviewWindow();
+  // Safety retry in case preview window was still initializing during first close.
+  setTimeout(() => {
+    if (!importMode) return;
+    void closeLivePreviewWindow();
+  }, 120);
   renderImportUi();
   updateActionButtonState();
   if (treatmentInput) {
@@ -343,10 +382,21 @@ async function invalidateCachedPreview(path) {
 }
 
 async function pollWatchFolder() {
+  if (pollInFlight) return;
   if (!importWizardDir) return;
+  pollInFlight = true;
+  const pollStartedAt = performance.now();
+  wizardTrace("poll", "start");
   try {
     const rows = await invoke("list_import_wizard_files", { folderDir: importWizardDir });
-    const list = Array.isArray(rows) ? rows : [];
+    const list = (Array.isArray(rows) ? rows : [])
+      .slice()
+      .sort((a, b) => {
+        const aMs = Number(a?.modified_ms ?? a?.modifiedMs ?? a?.created_ms ?? a?.createdMs ?? 0) || 0;
+        const bMs = Number(b?.modified_ms ?? b?.modifiedMs ?? b?.created_ms ?? b?.createdMs ?? 0) || 0;
+        return bMs - aMs;
+      });
+    wizardTrace("poll", "list fetched", { totalRows: list.length });
     const now = Date.now();
     const seenCandidatePaths = new Set();
     const previousPendingCount = pendingRows.length;
@@ -357,12 +407,20 @@ async function pollWatchFolder() {
       if (!path || !isImage || knownPaths.has(path)) continue;
       if (pendingRows.some((entry) => String(entry?.path ?? "").trim() === path)) continue;
       seenCandidatePaths.add(path);
+      wizardTrace("detect", "candidate seen", { path, size: Number(row?.size ?? 0) || 0 });
       trackImportRowCandidate(row, now);
-      if (!await isImportRowDecodable(row, now)) continue;
+      if (!await isImportRowDecodable(row, now)) {
+        wizardTrace("detect", "candidate not ready yet", { path });
+        continue;
+      }
       candidateRowsByPath.delete(path);
       knownPaths.add(path);
       pendingRows.unshift(row);
-      latestAddedPath = path;
+      if (!latestAddedPath) latestAddedPath = path;
+      wizardTrace("detect", "candidate accepted", {
+        path,
+        pendingCount: pendingRows.length,
+      });
       void invalidateCachedPreview(path)
         .then(() => fetchPreviewForPath(path))
         .then(renderImportUi);
@@ -377,27 +435,73 @@ async function pollWatchFolder() {
     updateActionButtonState();
     void syncLivePreviewNavigation();
     const countIncreased = pendingRows.length > previousPendingCount;
-    if (livePreviewToggle?.checked && countIncreased && latestAddedPath && latestAddedPath !== lastLivePreviewPath) {
+    wizardTrace("poll", "post-process", {
+      pendingBefore: previousPendingCount,
+      pendingAfter: pendingRows.length,
+      countIncreased,
+      latestAddedPath,
+    });
+    if (
+      !importMode &&
+      !livePreviewBlockedByImport &&
+      livePreviewToggle?.checked &&
+      countIncreased &&
+      latestAddedPath &&
+      latestAddedPath !== lastLivePreviewPath
+    ) {
       livePreviewManuallyClosed = false;
+      livePreviewPinnedPath = "";
+      if (livePreviewConfirmRefreshTimerId !== null) {
+        clearTimeout(livePreviewConfirmRefreshTimerId);
+        livePreviewConfirmRefreshTimerId = null;
+      }
       requestAnimationFrame(() => {
-        void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths());
+        wizardTrace("preview", "dispatch newest accepted", {
+          path: latestAddedPath,
+          navCount: getPendingPreviewPaths().length,
+        });
+        void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths(), { force: true });
       });
+      // Re-emit shortly after first detection to avoid a white first frame
+      // when camera copy finishes a moment later.
+      livePreviewConfirmRefreshTimerId = setTimeout(() => {
+        livePreviewConfirmRefreshTimerId = null;
+        if (importMode || livePreviewBlockedByImport) return;
+        if (!livePreviewToggle?.checked) return;
+        if (livePreviewPinnedPath) return;
+        if (!pendingRows.some((entry) => String(entry?.path ?? "").trim() === latestAddedPath)) return;
+        wizardTrace("preview", "dispatch delayed confirm refresh", {
+          path: latestAddedPath,
+          navCount: getPendingPreviewPaths().length,
+        });
+        void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths(), { force: true });
+      }, 900);
     }
   } catch (err) {
+    wizardTrace("poll", "failed", { err: String(err ?? "") });
     console.error("list_import_wizard_files failed:", err);
+  } finally {
+    wizardTrace("poll", "end", { ms: Math.round(performance.now() - pollStartedAt) });
+    pollInFlight = false;
   }
 }
 
-function getRowModifiedMs(row) {
-  return Number(row?.modified_ms ?? row?.modifiedMs ?? 0) || 0;
-}
-
-function getRowCreatedMs(row) {
-  return Number(row?.created_ms ?? row?.createdMs ?? 0) || 0;
-}
-
-function getRowActivityMs(row) {
-  return Math.max(getRowCreatedMs(row), getRowModifiedMs(row), 0);
+async function withTimeout(promise, timeoutMs, label) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = window.setTimeout(() => {
+          reject(new Error(`${label} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== null) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function trackImportRowCandidate(row, nowMs = Date.now()) {
@@ -457,6 +561,13 @@ async function isImportRowDecodable(row, nowMs = Date.now()) {
         ? ((Number(current.decodeStablePasses ?? 0) || 0) + 1)
         : (readyNow ? 1 : 0);
       const readyAccepted = readyNow && stablePasses >= 2;
+      wizardTrace("decode", "validation result", {
+        path,
+        readyNow,
+        stablePasses,
+        readyAccepted,
+        size: Number(result?.size ?? 0) || 0,
+      });
       candidateRowsByPath.set(path, {
         ...current,
         decodeReady: readyAccepted,
@@ -469,6 +580,7 @@ async function isImportRowDecodable(row, nowMs = Date.now()) {
     }
     return false;
   } catch {
+    wizardTrace("decode", "validation failed", { path });
     const current = candidateRowsByPath.get(path);
     if (current) {
       candidateRowsByPath.set(path, {
@@ -484,23 +596,47 @@ async function isImportRowDecodable(row, nowMs = Date.now()) {
   }
 }
 
-function shouldTreatAsBaselineFile(row, nowMs = Date.now()) {
-  const activityMs = getRowActivityMs(row);
-  if (activityMs <= 0) return true;
-  return (nowMs - activityMs) >= BASELINE_EXISTING_FILE_AGE_MS;
-}
-
 async function closeLivePreviewWindow() {
   suppressNextPreviewClosedEvent = true;
   setTimeout(() => {
     suppressNextPreviewClosedEvent = false;
   }, 600);
   try {
-    await invoke("close_import_wizard_preview_window");
-  } catch {
-    // ignore
+    let closed = false;
+    if (livePreviewWindow) {
+      try {
+        await livePreviewWindow.close();
+        closed = true;
+      } catch (err) {
+        wizardTrace("preview", "close cached handle failed", { err: String(err ?? "") });
+      }
+    }
+    if (!closed) {
+      try {
+        const existing = await WebviewWindow.getByLabel("import_wizard_preview");
+        if (existing) {
+          await existing.close();
+          closed = true;
+        }
+      } catch (err) {
+        wizardTrace("preview", "close by label failed", { err: String(err ?? "") });
+      }
+    }
+    try {
+      await invoke("close_import_wizard_preview_window");
+    } catch (err) {
+      wizardTrace("preview", "rust close command failed", { err: String(err ?? "") });
+    }
+    wizardTrace("preview", "close requested", { closed });
   } finally {
+    livePreviewWindow = null;
+    if (livePreviewConfirmRefreshTimerId !== null) {
+      clearTimeout(livePreviewConfirmRefreshTimerId);
+      livePreviewConfirmRefreshTimerId = null;
+    }
     lastLivePreviewPath = "";
+    livePreviewPinnedPath = "";
+    lastPreviewDispatchSignature = "";
   }
 }
 
@@ -508,33 +644,98 @@ async function sendLivePreviewPath(path, navigationPaths = null, options = {}) {
   const force = Boolean(options?.force);
   const userInitiated = Boolean(options?.userInitiated);
   if (!path) return;
+  if (livePreviewBlockedByImport && !userInitiated) {
+    wizardTrace("preview", "dispatch skipped (blocked by import)", { path });
+    return;
+  }
+  if (importMode) {
+    wizardTrace("preview", "dispatch skipped (import mode)", { path });
+    return;
+  }
   if (!force && !livePreviewToggle?.checked) return;
   const navPaths = Array.isArray(navigationPaths) ? navigationPaths : getPendingPreviewPaths();
+  const normalizedNavPaths = navPaths.map((entry) => String(entry ?? "").trim()).filter(Boolean);
+  const signature = `${String(path ?? "").trim()}::${normalizedNavPaths.join("|")}`;
+  if (!force && !userInitiated && signature === lastPreviewDispatchSignature) {
+    wizardTrace("preview", "dispatch skipped (same signature)", { path });
+    return;
+  }
   try {
-    await invoke("open_import_wizard_preview_window", {
+    wizardTrace("preview", "dispatch start", {
       path,
-      navigationPaths: navPaths,
+      navCount: normalizedNavPaths.length,
+      force,
+      userInitiated,
+    });
+    await withTimeout(
+      invoke("set_import_wizard_preview_state", {
+        path,
+        navigationPaths: normalizedNavPaths,
+      }),
+      PREVIEW_DISPATCH_TIMEOUT_MS,
+      "set_import_wizard_preview_state",
+    );
+    const existing = await WebviewWindow.getByLabel("import_wizard_preview");
+    if (existing) {
+      livePreviewWindow = existing;
+    } else {
+      livePreviewWindow = new WebviewWindow("import_wizard_preview", {
+        title: "Import Live Preview",
+        width: 1024,
+        height: 760,
+        minWidth: 520,
+        minHeight: 420,
+        resizable: true,
+        center: true,
+        url: "import-preview.html",
+      });
+    }
+    const win = livePreviewWindow ?? await WebviewWindow.getByLabel("import_wizard_preview");
+    if (!win) return;
+    // Do not block the poll loop on show/permission.
+    void win.show().catch(() => {});
+    await win.emit("import-wizard-preview-file", { path, paths: normalizedNavPaths });
+    wizardTrace("preview", "dispatch emitted", {
+      path,
+      navCount: normalizedNavPaths.length,
+      force,
+      userInitiated,
     });
     lastLivePreviewPath = path;
+    if (userInitiated) {
+      livePreviewPinnedPath = path;
+    }
+    lastPreviewDispatchSignature = signature;
     if (force || userInitiated) {
       livePreviewManuallyClosed = false;
     }
   } catch (err) {
+    livePreviewWindow = null;
+    wizardTrace("preview", "dispatch failed", { path, err: String(err ?? "") });
     console.error("import wizard live preview update failed:", err);
   }
 }
 
 async function syncLivePreviewNavigation() {
+  if (livePreviewBlockedByImport) return;
   if (!livePreviewToggle?.checked || importMode) return;
   if (livePreviewManuallyClosed) return;
   const navPaths = getPendingPreviewPaths();
   if (navPaths.length < 1) {
     await closeLivePreviewWindow();
+    lastPreviewDispatchSignature = "";
     return;
   }
-  const activePath = navPaths.includes(lastLivePreviewPath) ? lastLivePreviewPath : navPaths[0];
+  const activePath = navPaths.includes(livePreviewPinnedPath)
+    ? livePreviewPinnedPath
+    : navPaths[0];
   if (!activePath) return;
-  await sendLivePreviewPath(activePath, navPaths);
+  wizardTrace("preview", "sync navigation dispatch", {
+    activePath,
+    navCount: navPaths.length,
+    pinnedPath: livePreviewPinnedPath,
+  });
+  void sendLivePreviewPath(activePath, navPaths);
 }
 
 function initDoctorAnimation() {
@@ -608,6 +809,10 @@ function cleanup() {
   if (blinkTimer) clearTimeout(blinkTimer);
   if (pupilInterval) clearInterval(pupilInterval);
   if (pollInterval) clearInterval(pollInterval);
+  if (livePreviewConfirmRefreshTimerId !== null) {
+    clearTimeout(livePreviewConfirmRefreshTimerId);
+    livePreviewConfirmRefreshTimerId = null;
+  }
   candidateRowsByPath.clear();
   void closeLivePreviewWindow();
   importModeFilePaths = [];
@@ -623,6 +828,8 @@ async function init() {
 
   if (importToggle) {
     importToggle.addEventListener("click", () => {
+      livePreviewManuallyClosed = true;
+      void closeLivePreviewWindow();
       if (importMode) return;
       importExpanded = !importExpanded;
       renderImportUi();
@@ -630,6 +837,11 @@ async function init() {
   }
   if (actionBtn) {
     actionBtn.addEventListener("click", () => {
+      if (!importMode) {
+        livePreviewBlockedByImport = true;
+        livePreviewManuallyClosed = true;
+        void closeLivePreviewWindow();
+      }
       if (!importMode) {
         void enterImportMode();
         return;
@@ -651,6 +863,7 @@ async function init() {
     void requestCloseWithWarning();
   });
   void listen("import-wizard-preview-window-closed", () => {
+    livePreviewWindow = null;
     if (suppressNextPreviewClosedEvent) {
       suppressNextPreviewClosedEvent = false;
       return;
@@ -677,35 +890,25 @@ async function init() {
         void closeLivePreviewWindow();
         return;
       }
+      livePreviewBlockedByImport = false;
       livePreviewManuallyClosed = false;
       void syncLivePreviewNavigation();
     });
   }
 
   if (importWizardDir && workspaceDir && patientFolder) {
-    const now = Date.now();
     const baseline = await invoke("list_import_wizard_files", { folderDir: importWizardDir }).catch(() => []);
     for (const row of Array.isArray(baseline) ? baseline : []) {
       const path = String(row?.path ?? "").trim();
       const isImage = Boolean(row?.is_image ?? row?.isImage ?? false);
       if (!path || !isImage) continue;
-      if (shouldTreatAsBaselineFile(row, now)) {
-        knownPaths.add(path);
-        continue;
-      }
-      candidateRowsByPath.set(path, {
-        size: Number(row?.size ?? 0),
-        firstSeenAtMs: now,
-        decodeReady: false,
-        decodeCheckInFlight: false,
-        lastDecodeAttemptAtMs: 0,
-        decodeFingerprint: "",
-        decodeStablePasses: 0,
-      });
+      // Treat all existing files at startup as baseline so polling can focus on newly arriving files.
+      knownPaths.add(path);
     }
     pollInterval = setInterval(() => {
       void pollWatchFolder();
-    }, 1300);
+    }, WATCH_FOLDER_POLL_MS);
+    void pollWatchFolder();
   }
 
   renderImportUi();

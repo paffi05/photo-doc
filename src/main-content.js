@@ -1,10 +1,54 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { TauriEvent } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createMainHeaderTimeline } from "./main-content-header";
 import { createImportPanel } from "./main-content-import";
 import { createTreatmentFilesPanel } from "./main-content-treatment-files";
+
+function previewTrace(scope, message, extra = null) {
+  const ts = new Date().toISOString();
+  if (extra === null || extra === undefined) {
+    console.log(`[preview-trace][main-content][${scope}][${ts}] ${message}`);
+    return;
+  }
+  console.log(`[preview-trace][main-content][${scope}][${ts}] ${message}`, extra);
+}
+
+async function ensureImagePreviewWindow(existingWindowRef) {
+  const byLabel = await WebviewWindow.getByLabel("image_preview");
+  if (byLabel) return byLabel;
+  const created = new WebviewWindow("image_preview", {
+    title: "Image Preview",
+    width: 980,
+    height: 740,
+    minWidth: 520,
+    minHeight: 420,
+    resizable: true,
+    center: true,
+    url: "import-preview.html?mode=image",
+  });
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn) => {
+      if (settled) return;
+      settled = true;
+      fn();
+    };
+    const timeoutId = setTimeout(() => done(resolve), 1400);
+    created.once("tauri://created", () => {
+      clearTimeout(timeoutId);
+      done(resolve);
+    });
+    created.once("tauri://error", (event) => {
+      clearTimeout(timeoutId);
+      const message = String(event?.payload ?? "window create error");
+      done(() => reject(new Error(message)));
+    });
+  });
+  return (await WebviewWindow.getByLabel("image_preview")) ?? created ?? existingWindowRef;
+}
 
 export function initMainContent({
   appView,
@@ -18,6 +62,7 @@ export function initMainContent({
   onSubmitMissingPatientId,
 }) {
   const mainCanvas = appView?.querySelector(".main-canvas") ?? null;
+  let imagePreviewWindow = null;
   if (!mainCanvas) {
     return {
       mainCanvas: null,
@@ -134,13 +179,46 @@ export function initMainContent({
       }
 
       try {
-        await invoke("open_image_preview_window", {
+        const startedAt = performance.now();
+        previewTrace("image", "set_image_preview_state invoke start", {
+          path,
+          navCount: navigationPaths.length,
+          scope,
+        });
+        await invoke("set_image_preview_state", {
           path,
           navigationPaths,
         });
+        previewTrace("image", "set_image_preview_state invoke ok", {
+          path,
+          navCount: navigationPaths.length,
+          scope,
+          ms: Math.round(performance.now() - startedAt),
+        });
+        const existing = await WebviewWindow.getByLabel("image_preview");
+        if (existing) {
+          imagePreviewWindow = existing;
+        } else {
+          imagePreviewWindow = await ensureImagePreviewWindow(imagePreviewWindow);
+        }
+        const win = imagePreviewWindow ?? await WebviewWindow.getByLabel("image_preview");
+        if (!win) return;
+        await win.show();
+        await win.emit("image-preview-file", { path, paths: navigationPaths });
+        previewTrace("image", "window show+emit done", {
+          path,
+          navCount: navigationPaths.length,
+          scope,
+          ms: Math.round(performance.now() - startedAt),
+        });
       } catch (err) {
-        console.error("open_image_preview_window failed, fallback to default opener:", err);
-        await invoke("open_path_with_default", { path });
+        previewTrace("image", "preview open/emit failed", {
+          path,
+          navCount: navigationPaths.length,
+          scope,
+          err: String(err ?? ""),
+        });
+        console.error("image preview open/emit failed:", err);
       }
     },
     onOpenTreatmentFolder: (folderName) => {

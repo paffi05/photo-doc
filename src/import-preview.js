@@ -33,6 +33,33 @@ let activePanTouchPointerId = null;
 let lastPanClientX = 0;
 let lastPanClientY = 0;
 let isMousePanning = false;
+let loadingVisibleSinceMs = 0;
+
+function previewTrace(scope, message, extra = null) {
+  const ts = new Date().toISOString();
+  const extraText = extra === null || extra === undefined
+    ? ""
+    : ` ${JSON.stringify(extra)}`;
+  try {
+    void invoke("preview_trace_client", {
+      scope: `window:${previewMode}:${scope}`,
+      message: `${message}${extraText}`,
+    });
+  } catch {
+    // ignore trace transport errors
+  }
+  if (extra === null || extra === undefined) {
+    console.log(`[preview-trace][window:${previewMode}][${scope}][${ts}] ${message}`);
+    return;
+  }
+  console.log(`[preview-trace][window:${previewMode}][${scope}][${ts}] ${message}`, extra);
+}
+
+previewTrace("boot", "import-preview script loaded", {
+  href: window.location.href,
+  mode: previewMode,
+  eventName: previewEventName,
+});
 
 function normalizePath(value) {
   return String(value ?? "").trim();
@@ -189,16 +216,26 @@ function updateNavigationButtons() {
 
 function showLoading(requestToken) {
   if (requestToken !== previewRequestToken) return;
+  if (loadingVisibleSinceMs <= 0) {
+    loadingVisibleSinceMs = performance.now();
+    previewTrace("ui", "loading shown", { requestToken });
+  }
   previewLoading?.classList.add("visible");
 }
 
 function hideLoading(requestToken) {
   if (requestToken !== previewRequestToken) return;
+  if (loadingVisibleSinceMs > 0) {
+    const visibleMs = Math.round(performance.now() - loadingVisibleSinceMs);
+    previewTrace("ui", "loading hidden", { requestToken, visibleMs });
+    loadingVisibleSinceMs = 0;
+  }
   previewLoading?.classList.remove("visible");
 }
 
 function loadImageWithVerification(src, requestToken) {
   return new Promise((resolve, reject) => {
+    const startedAt = performance.now();
     let done = false;
     const cleanup = () => {
       previewImage.onload = null;
@@ -209,6 +246,12 @@ function loadImageWithVerification(src, requestToken) {
       if (done) return;
       done = true;
       cleanup();
+      previewTrace("image", "img.onload", {
+        requestToken,
+        ms: Math.round(performance.now() - startedAt),
+        naturalWidth: Number(previewImage?.naturalWidth ?? 0),
+        naturalHeight: Number(previewImage?.naturalHeight ?? 0),
+      });
       if (requestToken !== previewRequestToken) {
         resolve(false);
         return;
@@ -220,9 +263,18 @@ function loadImageWithVerification(src, requestToken) {
       if (done) return;
       done = true;
       cleanup();
+      previewTrace("image", "img.onerror", {
+        requestToken,
+        ms: Math.round(performance.now() - startedAt),
+        srcKind: String(src ?? "").startsWith("data:") ? "data-url" : "file-src",
+      });
       reject(new Error("preview image failed to load"));
     };
 
+    previewTrace("image", "img.src set", {
+      requestToken,
+      srcKind: String(src ?? "").startsWith("data:") ? "data-url" : "file-src",
+    });
     previewImage.src = src;
   });
 }
@@ -230,6 +282,8 @@ function loadImageWithVerification(src, requestToken) {
 async function setPreview(path) {
   const normalized = normalizePath(path);
   if (!normalized) return;
+  const startedAt = performance.now();
+  previewTrace("setPreview", "start", { path: normalized });
   currentPreviewPath = normalized;
   resetTransform();
   updateNavigationButtons();
@@ -237,7 +291,13 @@ async function setPreview(path) {
   showLoading(requestToken);
   await new Promise((resolve) => requestAnimationFrame(resolve));
   try {
+    const srcInvokeStart = performance.now();
     const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
+    previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
+      requestToken,
+      path: normalized,
+      ms: Math.round(performance.now() - srcInvokeStart),
+    });
     if (requestToken !== previewRequestToken) return;
     const safePath = String(resolvedPath ?? "").trim() || normalized;
     const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
@@ -245,17 +305,44 @@ async function setPreview(path) {
     await loadImageWithVerification(src, requestToken);
     updateBaseImageSize();
     applyTransform();
+    previewTrace("setPreview", "completed via src_path", {
+      requestToken,
+      path: normalized,
+      totalMs: Math.round(performance.now() - startedAt),
+    });
   } catch (err) {
+    previewTrace("setPreview", "src_path failed, fallback to data_url", {
+      requestToken,
+      path: normalized,
+      err: String(err ?? ""),
+    });
     if (requestToken !== previewRequestToken) return;
     try {
+      const dataInvokeStart = performance.now();
       const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
+      previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
+        requestToken,
+        path: normalized,
+        ms: Math.round(performance.now() - dataInvokeStart),
+        length: String(dataUrl ?? "").length,
+      });
       if (requestToken !== previewRequestToken) return;
       const src = String(dataUrl ?? "").trim();
       if (!src) return;
       await loadImageWithVerification(src, requestToken);
       updateBaseImageSize();
       applyTransform();
+      previewTrace("setPreview", "completed via data_url fallback", {
+        requestToken,
+        path: normalized,
+        totalMs: Math.round(performance.now() - startedAt),
+      });
     } catch (fallbackErr) {
+      previewTrace("setPreview", "data_url fallback failed", {
+        requestToken,
+        path: normalized,
+        err: String(fallbackErr ?? ""),
+      });
       console.error("import preview original load failed:", err, fallbackErr);
     }
   } finally {
@@ -447,8 +534,13 @@ window.addEventListener("resize", () => {
 void listen(previewEventName, (event) => {
   const path = normalizePath(event?.payload?.path);
   const paths = Array.isArray(event?.payload?.paths) ? event.payload.paths : [];
+  previewTrace("event", "preview event received", {
+    path,
+    navCount: paths.length,
+  });
   const signature = buildEventSignature(path, paths);
   if (signature && signature === lastAppliedEventSignature) {
+    previewTrace("event", "event ignored (same signature)");
     return;
   }
   lastAppliedEventSignature = signature;
@@ -461,9 +553,21 @@ void listen(previewEventName, (event) => {
 
 void (async () => {
   try {
+    const navStart = performance.now();
     const navPaths = await invoke(getCurrentPathsCommand);
+    previewTrace("bootstrap", "getCurrentPaths ok", {
+      ms: Math.round(performance.now() - navStart),
+      navCount: Array.isArray(navPaths) ? navPaths.length : 0,
+      cmd: getCurrentPathsCommand,
+    });
     setNavigationPaths(navPaths);
+    const pathStart = performance.now();
     const path = await invoke(getCurrentPathCommand);
+    previewTrace("bootstrap", "getCurrentPath ok", {
+      ms: Math.round(performance.now() - pathStart),
+      cmd: getCurrentPathCommand,
+      path: normalizePath(path),
+    });
     const normalized = normalizePath(path);
     if (normalized) {
       if (!navigationPaths.includes(normalized)) {

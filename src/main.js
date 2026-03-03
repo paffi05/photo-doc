@@ -96,6 +96,15 @@ const indexingProgressSpinner = document.getElementById("indexingProgressSpinner
 const indexingProgressText = document.getElementById("indexingProgressText");
 const cacheReloadBtn = document.getElementById("cacheReloadBtn");
 
+function previewTrace(scope, message, extra = null) {
+  const ts = new Date().toISOString();
+  if (extra === null || extra === undefined) {
+    console.log(`[preview-trace][main][${scope}][${ts}] ${message}`);
+    return;
+  }
+  console.log(`[preview-trace][main][${scope}][${ts}] ${message}`, extra);
+}
+
 function setDebugState(state) {
   if (!debugBadge) return;
   debugBadge.textContent = `debug: (${state})`;
@@ -1978,6 +1987,7 @@ async function closeImportWizardPreviewWindow() {
       const existing = await WebviewWindow.getByLabel("import_wizard_preview");
       if (existing) await existing.close();
     }
+    await invoke("close_import_wizard_preview_window").catch(() => {});
   } catch {
     // Ignore close errors for already-closed windows.
   } finally {
@@ -1985,13 +1995,36 @@ async function closeImportWizardPreviewWindow() {
   }
 }
 
-async function sendImportWizardPreviewPath(path) {
+function getImportWizardPreviewNavigationPaths() {
+  return importWizardPendingRows
+    .map((row) => String(row?.path ?? "").trim())
+    .filter(Boolean);
+}
+
+async function sendImportWizardPreviewPath(path, navigationPaths = null) {
   if (!path || !importWizardLivePreviewToggle?.checked) return;
+  const navPaths = Array.isArray(navigationPaths)
+    ? navigationPaths.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+    : getImportWizardPreviewNavigationPaths();
+  const startedAt = performance.now();
   try {
+    previewTrace("wizard", "set_import_wizard_preview_state invoke start", {
+      path,
+      navCount: navPaths.length,
+    });
+    await invoke("set_import_wizard_preview_state", {
+      path,
+      navigationPaths: navPaths,
+    });
+    previewTrace("wizard", "set_import_wizard_preview_state invoke ok", {
+      path,
+      navCount: navPaths.length,
+      ms: Math.round(performance.now() - startedAt),
+    });
     const existing = await WebviewWindow.getByLabel("import_wizard_preview");
     if (existing) {
       importWizardPreviewWindow = existing;
-    } else if (!importWizardPreviewWindow) {
+    } else {
       const savedWidth = Number(importWizardPreviewWindowState?.width ?? 0);
       const savedHeight = Number(importWizardPreviewWindowState?.height ?? 0);
       const nextWidth = Number.isFinite(savedWidth) && savedWidth > 0 ? savedWidth : 1024;
@@ -2010,9 +2043,20 @@ async function sendImportWizardPreviewPath(path) {
     const win = importWizardPreviewWindow ?? await WebviewWindow.getByLabel("import_wizard_preview");
     if (!win) return;
     await win.show();
-    await win.emit("import-wizard-preview-file", { path });
+    await win.emit("import-wizard-preview-file", { path, paths: navPaths });
+    previewTrace("wizard", "window show+emit done", {
+      path,
+      navCount: navPaths.length,
+      ms: Math.round(performance.now() - startedAt),
+    });
     importWizardLastLivePreviewPath = path;
   } catch (err) {
+    previewTrace("wizard", "preview window open/emit failed", {
+      path,
+      navCount: navPaths.length,
+      ms: Math.round(performance.now() - startedAt),
+      err: String(err ?? ""),
+    });
     console.error("import wizard preview window update failed:", err);
   }
 }
@@ -2063,7 +2107,10 @@ async function pollImportWizardFolder() {
         newestIsImage &&
         importWizardLastLivePreviewPath !== importWizardNewestProbe.path
       ) {
-        await sendImportWizardPreviewPath(importWizardNewestProbe.path);
+        await sendImportWizardPreviewPath(
+          importWizardNewestProbe.path,
+          getImportWizardPreviewNavigationPaths(),
+        );
       }
     } else {
       importWizardNewestProbe = { path: "", size: -1, unchangedTicks: 0 };
@@ -3765,7 +3812,10 @@ importWizardLivePreviewToggle?.addEventListener("change", async () => {
     return;
   }
   if (importWizardNewestProbe.path && importWizardNewestProbe.unchangedTicks >= 1) {
-    await sendImportWizardPreviewPath(importWizardNewestProbe.path);
+    await sendImportWizardPreviewPath(
+      importWizardNewestProbe.path,
+      getImportWizardPreviewNavigationPaths(),
+    );
   }
 });
 importWizardTreatmentTitle?.addEventListener("input", updateImportWizardConfirmState);
