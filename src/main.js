@@ -1400,6 +1400,7 @@ async function refreshCacheUsageUi() {
 
 async function runManualCacheMaintenance() {
   if (!currentWorkspaceDir || isPreviewFillRunning || isCacheMaintenanceRunning) return;
+  const allowBackgroundStartNow = backgroundPreviewCreationEnabled && isIdleForBackgroundPreviewFill();
   previewFillPausedByUser = false;
   cacheMarkedNotSynchronized = false;
   const startedAt = Date.now();
@@ -1408,11 +1409,23 @@ async function runManualCacheMaintenance() {
   updateCacheReloadButtonState();
   setIndexingProgressUi({ running: true, message: "Organizing Cache ..." });
   try {
+    if (keepLocalCacheCopyEnabled) {
+      setIndexingProgressUi({ running: true, message: "Synchronizing Cache ..." });
+      await syncLocalCacheCopy({ manual: true, requireIdle: false });
+    }
+
     const counts = await invoke("get_preview_debug_counts", { workspaceDir: currentWorkspaceDir });
     const dbImageCount = Number(counts?.db_image_count ?? counts?.dbImageCount ?? 0) || 0;
     const cacheImageCount = Number(counts?.cache_image_count ?? counts?.cacheImageCount ?? 0) || 0;
 
     if (dbImageCount > cacheImageCount) {
+      if (!allowBackgroundStartNow) {
+        setIndexingProgressUi({ running: false, message: "Not synchronized" });
+        if (backgroundPreviewCreationEnabled) {
+          scheduleBackgroundPreviewFillWhenIdle();
+        }
+        return;
+      }
       if (activeViewPreviewLoading.running) {
         setIndexingProgressUi({ running: false, message: "Not synchronized" });
         scheduleBackgroundPreviewFillWhenIdle();

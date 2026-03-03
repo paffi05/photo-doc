@@ -327,7 +327,8 @@ async function pollWatchFolder() {
     const list = Array.isArray(rows) ? rows : [];
     const now = Date.now();
     const seenCandidatePaths = new Set();
-    const newImagePaths = [];
+    const previousPendingCount = pendingRows.length;
+    let latestAddedPath = "";
     for (const row of list) {
       const path = String(row?.path ?? "").trim();
       const isImage = Boolean(row?.is_image ?? row?.isImage ?? false);
@@ -339,8 +340,10 @@ async function pollWatchFolder() {
       candidateRowsByPath.delete(path);
       knownPaths.add(path);
       pendingRows.unshift(row);
-      newImagePaths.push(path);
-      void invalidateCachedPreview(path).then(() => fetchPreviewForPath(path)).then(renderImportUi);
+      latestAddedPath = path;
+      void invalidateCachedPreview(path)
+        .then(() => fetchPreviewForPath(path))
+        .then(renderImportUi);
     }
     for (const path of candidateRowsByPath.keys()) {
       if (!seenCandidatePaths.has(path)) {
@@ -348,15 +351,14 @@ async function pollWatchFolder() {
       }
     }
 
-    if (livePreviewToggle?.checked && newImagePaths.length > 0) {
-      const newestRecognized = newImagePaths[newImagePaths.length - 1];
-      if (newestRecognized && newestRecognized !== lastLivePreviewPath) {
-        await sendLivePreviewPath(newestRecognized);
-      }
-    }
-
     renderImportUi();
     updateActionButtonState();
+    const countIncreased = pendingRows.length > previousPendingCount;
+    if (livePreviewToggle?.checked && countIncreased && latestAddedPath && latestAddedPath !== lastLivePreviewPath) {
+      requestAnimationFrame(() => {
+        void sendLivePreviewPath(latestAddedPath);
+      });
+    }
   } catch (err) {
     console.error("list_import_wizard_files failed:", err);
   }

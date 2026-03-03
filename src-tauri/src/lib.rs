@@ -6066,7 +6066,10 @@ async fn set_keep_local_cache_copy(
     write_settings(&app_handle, &settings)?;
 
     if preview_was_running {
-        let _ = start_background_preview_fill(app_handle.clone(), workspace_dir);
+        let settings_now = read_settings(&app_handle).unwrap_or_default();
+        if settings_now.background_preview_creation.unwrap_or(false) {
+            let _ = start_background_preview_fill(app_handle.clone(), workspace_dir);
+        }
     }
 
     let runtime = local_cache_copy_runtime()
@@ -6494,6 +6497,11 @@ fn start_background_preview_fill(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
 ) -> Result<bool, String> {
+    let settings = read_settings(&app_handle).unwrap_or_default();
+    if !settings.background_preview_creation.unwrap_or(false) {
+        return Ok(false);
+    }
+
     let workspace = PathBuf::from(workspace_dir.trim());
     if !workspace.exists() || !workspace.is_dir() {
         return Err("workspace directory does not exist".to_string());

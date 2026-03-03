@@ -2,12 +2,15 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 
 const previewImage = document.getElementById("previewImage");
+let previewRequestToken = 0;
 
 async function setPreview(path) {
   const normalized = String(path ?? "").trim();
   if (!normalized) return;
+  const requestToken = ++previewRequestToken;
   try {
     const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
+    if (requestToken !== previewRequestToken) return;
     const src = String(dataUrl ?? "").trim();
     if (!src) return;
     previewImage.src = src;
