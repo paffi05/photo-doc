@@ -8,10 +8,12 @@ html, body { height: 100%; margin: 0; }
   --frost-bg: rgba(255,255,255,0.52);
   --frost-border: rgba(255,255,255,0.62);
   --frost-inset: inset 0 1px 0 rgba(255,255,255,0.54);
+  --header-frost-bg: rgba(255,255,255,0.80);
+  --header-frost-inset: inset 0 1px 0 rgba(255,255,255,0.78);
   --frost-filter: blur(11px) saturate(1.08);
-  --sidebar-frost-bg: rgba(255,255,255,0.62);
-  --sidebar-frost-border: rgba(255,255,255,0.72);
-  --sidebar-frost-inset: inset 0 1px 0 rgba(255,255,255,0.64);
+  --sidebar-frost-bg: rgba(255,255,255,0.74);
+  --sidebar-frost-border: rgba(255,255,255,0.82);
+  --sidebar-frost-inset: inset 0 1px 0 rgba(255,255,255,0.78);
 }
 
 body{
@@ -930,8 +932,8 @@ body{
   z-index: 10;
   pointer-events: none;
   opacity: 0;
-  background: var(--frost-bg);
-  box-shadow: var(--frost-inset);
+  background: var(--header-frost-bg);
+  box-shadow: var(--header-frost-inset);
   backdrop-filter: var(--frost-filter);
   -webkit-backdrop-filter: var(--frost-filter);
   transition: opacity 0.3s ease;
@@ -2526,16 +2528,16 @@ body{
   align-items: center;
   padding: 0 12px;
   gap: 10px;
-  background: var(--sidebar-frost-bg);
-  backdrop-filter: var(--frost-filter);
-  -webkit-backdrop-filter: var(--frost-filter);
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-bottom: 0;
 }
 
 .settings.is-scrolled .settings-header{
-  background: var(--sidebar-frost-bg);
-  backdrop-filter: var(--frost-filter);
-  -webkit-backdrop-filter: var(--frost-filter);
+  background: transparent;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   border-bottom: 0;
 }
 
@@ -2576,8 +2578,8 @@ body{
 }
 
 .app.platform-windows .main-header-frost{
-  background: var(--frost-bg);
-  box-shadow: var(--frost-inset);
+  background: var(--header-frost-bg);
+  box-shadow: var(--header-frost-inset);
 }
 
 .app.platform-windows .settings{
@@ -2588,7 +2590,7 @@ body{
 
 .app.platform-windows .settings-header,
 .app.platform-windows .settings.is-scrolled .settings-header{
-  background: var(--sidebar-frost-bg);
+  background: transparent;
 }
 
 .app.platform-windows .main-timeline-date{
