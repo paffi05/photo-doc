@@ -36,6 +36,12 @@ body{
   gap: 8px;
 }
 
+.wizard-treatment-picker{
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
 .wizard-action-btn{
   border: 0;
   border-radius: 10px;
@@ -63,7 +69,7 @@ body{
   border: 1px solid rgba(255,255,255,0.5);
   background: rgba(255,255,255,0.2);
   color: #ffffff;
-  padding: 0 8px;
+  padding: 0 30px 0 8px;
   outline: none;
   font-size: 12px;
   font-weight: 600;
@@ -74,9 +80,89 @@ body{
   color: rgba(255,255,255,0.72);
 }
 
+.wizard-treatment-input.is-existing-selected{
+  color: #fb923c;
+  border-color: rgba(251,146,60,0.85);
+}
+
 .wizard-treatment-input:focus{
   border-color: rgba(255,255,255,0.9);
   box-shadow: 0 0 0 1px rgba(255,255,255,0.2);
+}
+
+.wizard-treatment-dropdown-btn{
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: rgba(255,255,255,0.9);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+
+.wizard-treatment-dropdown-btn:hover{
+  background: rgba(255,255,255,0.12);
+}
+
+.wizard-treatment-dropdown-arrow{
+  width: 10px;
+  height: 10px;
+  transition: transform 0.18s ease;
+}
+
+.wizard-treatment-dropdown-btn[aria-expanded="true"] .wizard-treatment-dropdown-arrow{
+  transform: rotate(180deg);
+}
+
+.wizard-treatment-dropdown{
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  max-height: 148px;
+  overflow-y: auto;
+  border-radius: 8px;
+  background: rgba(255,255,255,0.16);
+  border: 1px solid rgba(255,255,255,0.24);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.16);
+  backdrop-filter: blur(11px) saturate(1.08);
+  -webkit-backdrop-filter: blur(11px) saturate(1.08);
+  z-index: 8;
+}
+
+.wizard-treatment-dropdown-list{
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wizard-treatment-dropdown-item{
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #ffffff;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: left;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.wizard-treatment-dropdown-item:hover{
+  background: rgba(255,255,255,0.1);
+}
+
+.wizard-treatment-dropdown-item.is-selected{
+  color: #fb923c;
+  background: rgba(251,146,60,0.12);
 }
 
 .wizard-files-count-bg{

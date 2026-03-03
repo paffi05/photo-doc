@@ -16,7 +16,11 @@ const importListWrap = document.getElementById("wizardImportListWrap");
 const importList = document.getElementById("wizardImportList");
 const filesCountBg = document.getElementById("wizardFilesCountBg");
 const actionBtn = document.getElementById("wizardActionBtn");
+const treatmentPicker = document.getElementById("wizardTreatmentPicker");
 const treatmentInput = document.getElementById("wizardTreatmentInput");
+const treatmentDropdownBtn = document.getElementById("wizardTreatmentDropdownBtn");
+const treatmentDropdown = document.getElementById("wizardTreatmentDropdown");
+const treatmentDropdownList = document.getElementById("wizardTreatmentDropdownList");
 const closeConfirm = document.getElementById("wizardCloseConfirm");
 const discardBtn = document.getElementById("wizardDiscardBtn");
 const confirmBtn = document.getElementById("wizardConfirmBtn");
@@ -42,6 +46,9 @@ let closeConfirmVisible = false;
 let livePreviewWindow = null;
 let livePreviewConfirmRefreshTimerId = null;
 let livePreviewBlockedByImport = false;
+let treatmentDropdownOpen = false;
+let selectedExistingTreatmentFolder = "";
+let existingTreatmentFolders = [];
 const knownPaths = new Set();
 const pendingRows = [];
 const previewDataUrlByPath = new Map();
@@ -170,6 +177,89 @@ function getTodayDateString() {
   return `${yyyy}-${mm}-${dd}`;
 }
 
+function setTreatmentDropdownOpen(open) {
+  treatmentDropdownOpen = Boolean(open);
+  if (treatmentDropdown) {
+    treatmentDropdown.hidden = !treatmentDropdownOpen;
+  }
+  if (treatmentDropdownBtn) {
+    treatmentDropdownBtn.setAttribute("aria-expanded", treatmentDropdownOpen ? "true" : "false");
+  }
+}
+
+function clearExistingTreatmentSelection(clearInput = false) {
+  selectedExistingTreatmentFolder = "";
+  if (treatmentInput) {
+    treatmentInput.classList.remove("is-existing-selected");
+    if (clearInput) {
+      treatmentInput.value = "";
+    }
+  }
+}
+
+function selectExistingTreatmentFolder(folderName) {
+  const selected = String(folderName ?? "").trim();
+  if (!selected) return;
+  selectedExistingTreatmentFolder = selected;
+  if (treatmentInput) {
+    treatmentInput.value = selected;
+    treatmentInput.classList.add("is-existing-selected");
+  }
+  updateActionButtonState();
+}
+
+function renderTreatmentDropdown() {
+  if (!treatmentDropdownList || !treatmentDropdownBtn) return;
+  treatmentDropdownList.innerHTML = "";
+  const folders = Array.isArray(existingTreatmentFolders) ? existingTreatmentFolders : [];
+  treatmentDropdownBtn.hidden = folders.length < 1;
+  if (folders.length < 1) {
+    setTreatmentDropdownOpen(false);
+    return;
+  }
+  for (const folder of folders) {
+    const name = String(folder ?? "").trim();
+    if (!name) continue;
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "wizard-treatment-dropdown-item";
+    if (name === selectedExistingTreatmentFolder) {
+      btn.classList.add("is-selected");
+    }
+    btn.textContent = name;
+    btn.title = name;
+    btn.addEventListener("click", () => {
+      selectExistingTreatmentFolder(name);
+      setTreatmentDropdownOpen(false);
+    });
+    li.appendChild(btn);
+    treatmentDropdownList.appendChild(li);
+  }
+}
+
+async function loadExistingTreatmentFolders() {
+  if (!workspaceDir || !patientFolder) {
+    existingTreatmentFolders = [];
+    renderTreatmentDropdown();
+    return;
+  }
+  try {
+    const rows = await invoke("list_patient_treatment_folders", {
+      workspaceDir,
+      patientFolder,
+    });
+    const seen = new Set();
+    existingTreatmentFolders = (Array.isArray(rows) ? rows : [])
+      .map((value) => String(value ?? "").trim())
+      .filter((value) => value.length > 0 && !seen.has(value) && seen.add(value));
+  } catch (err) {
+    console.error("list_patient_treatment_folders failed:", err);
+    existingTreatmentFolders = [];
+  }
+  renderTreatmentDropdown();
+}
+
 function updateActionButtonState() {
   const hasFiles = importMode ? importModeFilePaths.length > 0 : pendingRows.length > 0;
   if (actionBtn) {
@@ -182,10 +272,11 @@ function updateActionButtonState() {
   if (!importMode) {
     actionBtn.textContent = "Import";
     actionBtn.disabled = !hasFiles || importBusy;
-    if (treatmentInput) treatmentInput.hidden = true;
+    if (treatmentPicker) treatmentPicker.hidden = true;
+    setTreatmentDropdownOpen(false);
     return;
   }
-  if (treatmentInput) treatmentInput.hidden = false;
+  if (treatmentPicker) treatmentPicker.hidden = false;
   actionBtn.textContent = "Done";
   const hasTreatment = Boolean(String(treatmentInput?.value ?? "").trim());
   actionBtn.disabled = !hasTreatment || !hasFiles || importBusy;
@@ -267,16 +358,25 @@ async function enterImportMode() {
     void closeLivePreviewWindow();
   }, 120);
   renderImportUi();
+  await loadExistingTreatmentFolders();
+  clearExistingTreatmentSelection(false);
   updateActionButtonState();
   if (treatmentInput) {
-    treatmentInput.hidden = false;
+    treatmentInput.value = "";
+    treatmentInput.classList.remove("is-existing-selected");
     treatmentInput.focus();
   }
+  setTreatmentDropdownOpen(false);
 }
 
 async function runImportDone() {
   if (!workspaceDir || !patientFolder) return;
   const treatmentName = String(treatmentInput?.value ?? "").trim();
+  const useExistingFolder = Boolean(
+    selectedExistingTreatmentFolder &&
+    selectedExistingTreatmentFolder === treatmentName &&
+    existingTreatmentFolders.includes(selectedExistingTreatmentFolder)
+  );
   if (!treatmentName || importModeFilePaths.length < 1 || importBusy) return;
 
   importBusy = true;
@@ -286,9 +386,9 @@ async function runImportDone() {
     const result = await invoke("start_import_files", {
       workspaceDir,
       patientFolder,
-      existingFolder: null,
-      date: getTodayDateString(),
-      treatmentName,
+      existingFolder: useExistingFolder ? selectedExistingTreatmentFolder : null,
+      date: useExistingFolder ? null : getTodayDateString(),
+      treatmentName: useExistingFolder ? null : treatmentName,
       filePaths,
       deleteOrigin: true,
     });
@@ -874,6 +974,16 @@ async function init() {
   });
   if (treatmentInput) {
     treatmentInput.addEventListener("input", updateActionButtonState);
+    treatmentInput.addEventListener("focus", () => {
+      if (!selectedExistingTreatmentFolder) return;
+      clearExistingTreatmentSelection(true);
+      updateActionButtonState();
+    });
+    treatmentInput.addEventListener("input", () => {
+      if (!selectedExistingTreatmentFolder) return;
+      clearExistingTreatmentSelection(false);
+      updateActionButtonState();
+    });
     treatmentInput.addEventListener("keydown", (event) => {
       if (event.key !== "Enter") return;
       event.preventDefault();
@@ -881,6 +991,23 @@ async function init() {
       void runImportDone();
     });
   }
+  if (treatmentDropdownBtn) {
+    treatmentDropdownBtn.addEventListener("click", (event) => {
+      event.preventDefault();
+      if (!importMode || importBusy || existingTreatmentFolders.length < 1) return;
+      setTreatmentDropdownOpen(!treatmentDropdownOpen);
+    });
+  }
+  window.addEventListener("pointerdown", (event) => {
+    if (!treatmentDropdownOpen) return;
+    const target = event.target;
+    if (!(target instanceof Node)) {
+      setTreatmentDropdownOpen(false);
+      return;
+    }
+    if (treatmentPicker?.contains(target)) return;
+    setTreatmentDropdownOpen(false);
+  });
   if (livePreviewToggle) {
     livePreviewToggle.addEventListener("change", () => {
       if (importMode) return;

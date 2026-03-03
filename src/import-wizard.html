@@ -20,14 +20,29 @@
             <span id="wizardImportCountText">0 Files</span>
           </button>
           <div class="wizard-top-actions">
-            <input
-              id="wizardTreatmentInput"
-              class="wizard-treatment-input"
-              type="text"
-              placeholder="Treatment"
-              autocomplete="off"
-              hidden
-            />
+            <div id="wizardTreatmentPicker" class="wizard-treatment-picker" hidden>
+              <input
+                id="wizardTreatmentInput"
+                class="wizard-treatment-input"
+                type="text"
+                placeholder="Treatment"
+                autocomplete="off"
+              />
+              <button
+                id="wizardTreatmentDropdownBtn"
+                class="wizard-treatment-dropdown-btn"
+                type="button"
+                aria-label="Show existing treatment folders"
+                aria-expanded="false"
+              >
+                <svg class="wizard-treatment-dropdown-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                  <path d="M6 8L10 12L14 8" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
+                </svg>
+              </button>
+              <div id="wizardTreatmentDropdown" class="wizard-treatment-dropdown" hidden>
+                <ul id="wizardTreatmentDropdownList" class="wizard-treatment-dropdown-list"></ul>
+              </div>
+            </div>
             <button id="wizardActionBtn" class="wizard-action-btn" type="button">Import</button>
           </div>
         </div>
