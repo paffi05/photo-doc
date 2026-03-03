@@ -66,6 +66,20 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Show Tauri CLI version
+        run: npx tauri --version
+
+      - name: Validate Tauri signing secrets
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ] && [ -z "${{ secrets.TAURI_PRIVATE_KEY }}" ]; then
+            echo "::error::Missing signing key secret. Set TAURI_SIGNING_PRIVATE_KEY or TAURI_PRIVATE_KEY."
+            exit 1
+          fi
+          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ] && [ -z "${{ secrets.TAURI_KEY_PASSWORD }}" ]; then
+            echo "::warning::No signing key password secret set. This is only valid for unencrypted keys."
+          fi
+
       - name: Clean Tauri target (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
@@ -75,11 +89,13 @@ jobs:
           }
 
       - name: Build and publish Tauri release
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@action-v0.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY || secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD || secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           releaseName: "photo-doc ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
