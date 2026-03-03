@@ -7,6 +7,11 @@ on:
         description: "Release tag (example: v1.0.4)"
         required: true
         type: string
+      allow_unsigned:
+        description: "Allow unsigned build when signing secrets are missing (use only for test tags)"
+        required: false
+        default: false
+        type: boolean
   push:
     tags:
       - "v*"
@@ -31,6 +36,11 @@ jobs:
     runs-on: ${{ matrix.platform }}
     permissions:
       contents: write
+    env:
+      # Allow unsigned builds for explicit manual runs or tags like v1.2.3-test.
+      ALLOW_UNSIGNED: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.allow_unsigned == 'true') || contains(github.ref_name, '-test') }}
+      TAURI_PRIVATE_KEY_RESOLVED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || secrets.TAURI_PRIVATE_KEY }}
+      TAURI_PRIVATE_KEY_PASSWORD_RESOLVED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD }}
 
     steps:
       - name: Checkout
@@ -69,16 +79,22 @@ jobs:
       - name: Show Tauri CLI version
         run: npx tauri --version
 
-      - name: Validate Tauri signing secrets
-        shell: bash
+      - name: Validate signing configuration
+        shell: pwsh
         run: |
-          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ] && [ -z "${{ secrets.TAURI_PRIVATE_KEY }}" ]; then
-            echo "::error::Missing signing key secret. Set TAURI_SIGNING_PRIVATE_KEY or TAURI_PRIVATE_KEY."
-            exit 1
-          fi
-          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}" ] && [ -z "${{ secrets.TAURI_KEY_PASSWORD }}" ]; then
-            echo "::warning::No signing key password secret set. This is only valid for unencrypted keys."
-          fi
+          $hasKey = -not [string]::IsNullOrWhiteSpace("${{ env.TAURI_PRIVATE_KEY_RESOLVED }}")
+          $hasPass = -not [string]::IsNullOrWhiteSpace("${{ env.TAURI_PRIVATE_KEY_PASSWORD_RESOLVED }}")
+          $allowUnsigned = "${{ env.ALLOW_UNSIGNED }}" -eq "true"
+          if ($hasKey -and $hasPass) {
+            Write-Host "Signing secrets are present."
+            exit 0
+          }
+          if ($allowUnsigned) {
+            Write-Warning "Signing secrets missing. Continuing with unsigned build because ALLOW_UNSIGNED=true."
+            exit 0
+          }
+          Write-Error "Missing signing secrets. Configure TAURI_SIGNING_PRIVATE_KEY (or TAURI_PRIVATE_KEY) and TAURI_SIGNING_PRIVATE_KEY_PASSWORD (or TAURI_KEY_PASSWORD), or run workflow_dispatch with allow_unsigned=true for test tags."
+          exit 1
 
       - name: Clean Tauri target (Windows)
         if: matrix.platform == 'windows-latest'
@@ -92,10 +108,10 @@ jobs:
         uses: tauri-apps/tauri-action@action-v0.6.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY || secrets.TAURI_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD || secrets.TAURI_KEY_PASSWORD }}
-          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY || secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD || secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_PRIVATE_KEY_RESOLVED }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_PRIVATE_KEY_PASSWORD_RESOLVED }}
+          TAURI_PRIVATE_KEY: ${{ env.TAURI_PRIVATE_KEY_RESOLVED }}
+          TAURI_KEY_PASSWORD: ${{ env.TAURI_PRIVATE_KEY_PASSWORD_RESOLVED }}
         with:
           tagName: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
           releaseName: "photo-doc ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}"
