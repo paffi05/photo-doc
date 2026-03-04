@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
+import { FULL_TRACE } from "./trace-config";
 
 const params = new URLSearchParams(window.location.search);
 const previewMode = params.get("mode") === "image" ? "image" : "wizard";
@@ -34,19 +35,22 @@ let lastPanClientX = 0;
 let lastPanClientY = 0;
 let isMousePanning = false;
 let loadingVisibleSinceMs = 0;
+const PREVIEW_TRACE_FORWARD_TO_RUST = FULL_TRACE;
 
 function previewTrace(scope, message, extra = null) {
   const ts = new Date().toISOString();
   const extraText = extra === null || extra === undefined
     ? ""
     : ` ${JSON.stringify(extra)}`;
-  try {
-    void invoke("preview_trace_client", {
-      scope: `window:${previewMode}:${scope}`,
-      message: `${message}${extraText}`,
-    });
-  } catch {
-    // ignore trace transport errors
+  if (PREVIEW_TRACE_FORWARD_TO_RUST) {
+    try {
+      void invoke("preview_trace_client", {
+        scope: `window:${previewMode}:${scope}`,
+        message: `${message}${extraText}`,
+      });
+    } catch {
+      // ignore trace transport errors
+    }
   }
   if (extra === null || extra === undefined) {
     console.log(`[preview-trace][window:${previewMode}][${scope}][${ts}] ${message}`);
@@ -291,59 +295,79 @@ async function setPreview(path) {
   showLoading(requestToken);
   await new Promise((resolve) => requestAnimationFrame(resolve));
   try {
-    const srcInvokeStart = performance.now();
-    const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
-    previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
-      requestToken,
-      path: normalized,
-      ms: Math.round(performance.now() - srcInvokeStart),
-    });
-    if (requestToken !== previewRequestToken) return;
-    const safePath = String(resolvedPath ?? "").trim() || normalized;
-    const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
+    // Prefer original file path first so live preview is independent from thumbnail/cache generation.
+    const directSrc = `${convertFileSrc(normalized)}?t=${Date.now()}`;
     previewImage.decoding = "async";
-    await loadImageWithVerification(src, requestToken);
+    await loadImageWithVerification(directSrc, requestToken);
     updateBaseImageSize();
     applyTransform();
-    previewTrace("setPreview", "completed via src_path", {
+    previewTrace("setPreview", "completed via original-path", {
       requestToken,
       path: normalized,
       totalMs: Math.round(performance.now() - startedAt),
     });
   } catch (err) {
-    previewTrace("setPreview", "src_path failed, fallback to data_url", {
+    previewTrace("setPreview", "original-path failed, fallback to src_path", {
       requestToken,
       path: normalized,
       err: String(err ?? ""),
     });
     if (requestToken !== previewRequestToken) return;
     try {
-      const dataInvokeStart = performance.now();
-      const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
-      previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
+      const srcInvokeStart = performance.now();
+      const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
+      previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
         requestToken,
         path: normalized,
-        ms: Math.round(performance.now() - dataInvokeStart),
-        length: String(dataUrl ?? "").length,
+        ms: Math.round(performance.now() - srcInvokeStart),
       });
       if (requestToken !== previewRequestToken) return;
-      const src = String(dataUrl ?? "").trim();
-      if (!src) return;
+      const safePath = String(resolvedPath ?? "").trim() || normalized;
+      const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
+      previewImage.decoding = "async";
       await loadImageWithVerification(src, requestToken);
       updateBaseImageSize();
       applyTransform();
-      previewTrace("setPreview", "completed via data_url fallback", {
+      previewTrace("setPreview", "completed via src_path fallback", {
         requestToken,
         path: normalized,
         totalMs: Math.round(performance.now() - startedAt),
       });
-    } catch (fallbackErr) {
-      previewTrace("setPreview", "data_url fallback failed", {
+    } catch (srcPathErr) {
+      previewTrace("setPreview", "src_path failed, fallback to data_url", {
         requestToken,
         path: normalized,
-        err: String(fallbackErr ?? ""),
+        err: String(srcPathErr ?? ""),
       });
-      console.error("import preview original load failed:", err, fallbackErr);
+      if (requestToken !== previewRequestToken) return;
+      try {
+        const dataInvokeStart = performance.now();
+        const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
+        previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
+          requestToken,
+          path: normalized,
+          ms: Math.round(performance.now() - dataInvokeStart),
+          length: String(dataUrl ?? "").length,
+        });
+        if (requestToken !== previewRequestToken) return;
+        const src = String(dataUrl ?? "").trim();
+        if (!src) return;
+        await loadImageWithVerification(src, requestToken);
+        updateBaseImageSize();
+        applyTransform();
+        previewTrace("setPreview", "completed via data_url fallback", {
+          requestToken,
+          path: normalized,
+          totalMs: Math.round(performance.now() - startedAt),
+        });
+      } catch (fallbackErr) {
+        previewTrace("setPreview", "data_url fallback failed", {
+          requestToken,
+          path: normalized,
+          err: String(fallbackErr ?? ""),
+        });
+        console.error("import preview original load failed:", err, srcPathErr, fallbackErr);
+      }
     }
   } finally {
     hideLoading(requestToken);

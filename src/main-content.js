@@ -6,14 +6,27 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { createMainHeaderTimeline } from "./main-content-header";
 import { createImportPanel } from "./main-content-import";
 import { createTreatmentFilesPanel } from "./main-content-treatment-files";
+import { FULL_TRACE } from "./trace-config";
 
 function previewTrace(scope, message, extra = null) {
   const ts = new Date().toISOString();
   if (extra === null || extra === undefined) {
     console.log(`[preview-trace][main-content][${scope}][${ts}] ${message}`);
+    if (FULL_TRACE) {
+      void invoke("preview_trace_client", {
+        scope: `main-content:${scope}`,
+        message,
+      }).catch(() => {});
+    }
     return;
   }
   console.log(`[preview-trace][main-content][${scope}][${ts}] ${message}`, extra);
+  if (FULL_TRACE) {
+    void invoke("preview_trace_client", {
+      scope: `main-content:${scope}`,
+      message: `${message} ${JSON.stringify(extra)}`,
+    }).catch(() => {});
+  }
 }
 
 async function ensureImagePreviewWindow(existingWindowRef) {

@@ -5,6 +5,7 @@ use rusqlite::{params, params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Cursor;
@@ -611,6 +612,7 @@ struct WorkspaceReindexStatus {
 
 static IMPORT_JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static IMPORT_ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
+static FULL_TRACE_ENABLED: AtomicBool = AtomicBool::new(true);
 static PREVIEW_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PREVIEW_FILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static PREVIEW_FILL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -4593,6 +4595,9 @@ fn sanitize_navigation_paths(paths: Option<Vec<String>>, active_path: &str) -> V
 }
 
 fn preview_trace(scope: &str, message: &str) {
+    if !FULL_TRACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let ts_ms = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -4600,8 +4605,50 @@ fn preview_trace(scope: &str, message: &str) {
     eprintln!("[preview-trace][rust][{scope}][{ts_ms}] {message}");
 }
 
+fn parse_full_trace_env() -> bool {
+    let raw = env::var("PHOTO_DOC_FULL_TRACE").unwrap_or_else(|_| "1".to_string());
+    !matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+fn init_full_trace_from_env() {
+    let enabled = parse_full_trace_env();
+    FULL_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!(
+        "[preview-trace][rust][trace-config][{ts_ms}] PHOTO_DOC_FULL_TRACE={} (enabled={})",
+        env::var("PHOTO_DOC_FULL_TRACE").unwrap_or_else(|_| "1".to_string()),
+        enabled
+    );
+}
+
+#[tauri::command]
+fn set_full_trace_enabled(enabled: bool) -> Result<bool, String> {
+    FULL_TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+    let state = FULL_TRACE_ENABLED.load(Ordering::Relaxed);
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    eprintln!("[preview-trace][rust][trace-config][{ts_ms}] set_full_trace_enabled={state}");
+    Ok(state)
+}
+
+#[tauri::command]
+fn get_full_trace_enabled() -> bool {
+    FULL_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
 #[tauri::command]
 fn preview_trace_client(scope: String, message: String) -> Result<bool, String> {
+    if !FULL_TRACE_ENABLED.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
     let safe_scope = scope.trim();
     let safe_message = message.trim();
     if safe_scope.is_empty() || safe_message.is_empty() {
@@ -5095,31 +5142,9 @@ fn validate_import_wizard_image_complete(path: String) -> Result<ImportWizardIma
     let structurally_complete =
         import_wizard_image_structurally_complete(&source, ext.as_str(), size);
 
-    let reader = match image::ImageReader::open(&source) {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(ImportWizardImageValidationRow {
-                ready: false,
-                decodable: false,
-                structurally_complete,
-                size,
-                fingerprint,
-            });
-        }
-    };
-    let reader = match reader.with_guessed_format() {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(ImportWizardImageValidationRow {
-                ready: false,
-                decodable: false,
-                structurally_complete,
-                size,
-                fingerprint,
-            });
-        }
-    };
-    let decodable = reader.into_dimensions().is_ok();
+    // Keep wizard validation cheap/non-blocking: full image header decoding can stall
+    // while files are still being transferred (especially on network paths).
+    let decodable = structurally_complete;
     Ok(ImportWizardImageValidationRow {
         ready: decodable && structurally_complete,
         decodable,
@@ -6334,6 +6359,7 @@ fn start_import_files(
     treatment_name: Option<String>,
     file_paths: Vec<String>,
     delete_origin: bool,
+    import_wizard_dir: Option<String>,
 ) -> Result<StartImportResponse, String> {
     let workspace_dir = workspace_dir.trim().to_string();
     let patient_folder = patient_folder.trim().to_string();
@@ -6404,10 +6430,29 @@ fn start_import_files(
     let job_id = IMPORT_JOB_COUNTER.fetch_add(1, Ordering::Relaxed);
     let app_handle_clone = app_handle.clone();
     let workspace_dir_for_preview_sync = workspace_dir.clone();
-    let import_wizard_cache_dir = read_settings(&app_handle)
+    let import_wizard_cache_dir = import_wizard_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            read_settings(&app_handle)
+                .ok()
+                .and_then(|s| s.import_wizard_dir)
+                .map(|dir| PathBuf::from(dir.trim()))
+        })
+        .map(|dir| dir.join(".preview-cache"));
+    let preview_perf_mode = read_settings(&app_handle)
         .ok()
-        .and_then(|s| s.import_wizard_dir)
-        .map(|dir| PathBuf::from(dir.trim()).join(".preview-cache"));
+        .map(|settings| {
+            normalize_preview_performance_mode(
+                settings
+                    .preview_performance_mode
+                    .as_deref()
+                    .unwrap_or(PREVIEW_PERF_AUTO),
+            )
+        })
+        .unwrap_or_else(|| PREVIEW_PERF_AUTO.to_string());
     let import_files = file_paths
         .into_iter()
         .map(|p| p.trim().to_string())
@@ -6490,6 +6535,18 @@ fn start_import_files(
                 Ok(written) => {
                     if is_supported_preview_image(&dst_path) {
                         if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
+                            let _ = fs::create_dir_all(cache_dir);
+                            let src_for_cache = src_path.to_string_lossy().to_string();
+                            let _ = resolve_cached_previews_in_cache_dir(
+                                &vec![src_for_cache],
+                                false,
+                                true,
+                                cache_dir,
+                                PREVIEW_CACHE_MAX_BYTES_FIXED,
+                                &preview_perf_mode,
+                                None,
+                                None,
+                            );
                             let _ = seed_active_preview_cache_from_import_wizard_cache(
                                 &app_handle_clone,
                                 cache_dir,
@@ -7288,6 +7345,7 @@ fn start_background_preview_fill(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    init_full_trace_from_env();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -7352,6 +7410,8 @@ pub fn run() {
             get_import_wizard_quick_preview_data_url,
             get_import_wizard_preview_src_path,
             preview_trace_client,
+            set_full_trace_enabled,
+            get_full_trace_enabled,
             set_import_wizard_preview_state,
             set_image_preview_state,
             validate_import_wizard_image_complete,

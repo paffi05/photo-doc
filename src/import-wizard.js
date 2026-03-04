@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { FULL_TRACE } from "./trace-config";
 
 const params = new URLSearchParams(window.location.search);
 const workspaceDir = String(params.get("workspaceDir") ?? "").trim();
@@ -44,6 +45,7 @@ let importModeFilePaths = [];
 let allowWindowClose = false;
 let closeConfirmVisible = false;
 let livePreviewWindow = null;
+let livePreviewWindowWasOpened = false;
 let livePreviewConfirmRefreshTimerId = null;
 let livePreviewBlockedByImport = false;
 let treatmentDropdownOpen = false;
@@ -53,35 +55,42 @@ const knownPaths = new Set();
 const pendingRows = [];
 const previewDataUrlByPath = new Map();
 const candidateRowsByPath = new Map();
+const thumbnailFetchInFlight = new Set();
 
 const FILE_DECODE_RETRY_MIN_MS = 250;
 const WATCH_FOLDER_POLL_MS = 400;
 const PREVIEW_DISPATCH_TIMEOUT_MS = 1500;
-const PREVIEW_EMIT_TIMEOUT_MS = 1500;
 let pollInFlight = false;
 let lastPreviewDispatchSignature = "";
 let livePreviewDispatchInFlight = false;
 let queuedLivePreviewDispatch = null;
-let latestAcceptedPreviewRevision = 0;
+let cacheWarmFlushTimerId = null;
+const pendingCacheWarmPaths = new Set();
 const WIZARD_TRACE_ENABLED = true;
+const WIZARD_TRACE_FORWARD_TO_RUST = FULL_TRACE;
 
 function wizardTrace(scope, message, extra = null) {
   if (!WIZARD_TRACE_ENABLED) return;
   const ts = new Date().toISOString();
+  const shouldForward = WIZARD_TRACE_FORWARD_TO_RUST;
   if (extra === null || extra === undefined) {
     console.log(`[wizard-trace][${scope}][${ts}] ${message}`);
-    void invoke("preview_trace_client", {
-      scope: `wizard-main:${scope}`,
-      message,
-    }).catch(() => {});
+    if (shouldForward) {
+      void invoke("preview_trace_client", {
+        scope: `wizard-main:${scope}`,
+        message,
+      }).catch(() => {});
+    }
     return;
   }
   const serialized = JSON.stringify(extra);
   console.log(`[wizard-trace][${scope}][${ts}] ${message}`, extra);
-  void invoke("preview_trace_client", {
-    scope: `wizard-main:${scope}`,
-    message: `${message} ${serialized}`,
-  }).catch(() => {});
+  if (shouldForward) {
+    void invoke("preview_trace_client", {
+      scope: `wizard-main:${scope}`,
+      message: `${message} ${serialized}`,
+    }).catch(() => {});
+  }
 }
 
 function getPendingPreviewPaths() {
@@ -94,6 +103,46 @@ function getPendingPreviewPaths() {
     out.push(path);
   }
   return out;
+}
+
+function scheduleImportWizardCacheWarm(path) {
+  const safePath = String(path ?? "").trim();
+  if (!importWizardDir || !safePath) return;
+  pendingCacheWarmPaths.add(safePath);
+  if (cacheWarmFlushTimerId !== null) return;
+  cacheWarmFlushTimerId = window.setTimeout(() => {
+    cacheWarmFlushTimerId = null;
+    const batch = Array.from(pendingCacheWarmPaths);
+    pendingCacheWarmPaths.clear();
+    if (!batch.length) return;
+    void invoke("get_import_wizard_cached_previews", {
+      folderDir: importWizardDir,
+      paths: batch,
+      includeDataUrl: false,
+      generateIfMissing: true,
+    }).catch((err) => {
+      console.error("get_import_wizard_cached_previews warmup failed:", err);
+    });
+  }, 30);
+}
+
+function requestListThumbnail(path) {
+  const safePath = String(path ?? "").trim();
+  if (!safePath) return;
+  if (previewDataUrlByPath.has(safePath)) return;
+  if (thumbnailFetchInFlight.has(safePath)) return;
+  thumbnailFetchInFlight.add(safePath);
+  window.setTimeout(() => {
+    void fetchPreviewForPath(safePath)
+      .then(() => {
+        if (previewDataUrlByPath.has(safePath)) {
+          renderImportUi();
+        }
+      })
+      .finally(() => {
+        thumbnailFetchInFlight.delete(safePath);
+      });
+  }, 0);
 }
 
 function renderImportUi() {
@@ -110,6 +159,7 @@ function renderImportUi() {
 
   if (!expanded || count < 1) return;
   importList.innerHTML = "";
+  const missingThumbPaths = [];
   for (const row of pendingRows) {
     const path = String(row?.path ?? "").trim();
     const name = String(row?.name ?? "").trim() || path;
@@ -124,6 +174,8 @@ function renderImportUi() {
       img.src = dataUrl;
       img.alt = "";
       thumb.appendChild(img);
+    } else if (path) {
+      missingThumbPaths.push(path);
     }
     li.appendChild(thumb);
 
@@ -144,32 +196,45 @@ function renderImportUi() {
     removeBtn.type = "button";
     removeBtn.className = "wizard-import-remove";
     removeBtn.setAttribute("aria-label", `Remove ${name}`);
-    removeBtn.textContent = "×";
+    removeBtn.textContent = "\u00D7";
     removeBtn.disabled = importMode;
-    removeBtn.addEventListener("click", async (event) => {
+    removeBtn.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (importWizardDir && path) {
-        try {
-          await invoke("remove_import_wizard_cached_preview", {
-            folderDir: importWizardDir,
-            path,
-          });
-        } catch (err) {
-          console.error("remove_import_wizard_cached_preview failed:", err);
-        }
-      }
+      if (removeBtn.disabled) return;
+      removeBtn.disabled = true;
       previewDataUrlByPath.delete(path);
       const idx = pendingRows.findIndex((entry) => String(entry?.path ?? "").trim() === path);
       if (idx >= 0) pendingRows.splice(idx, 1);
+      const importIdx = importModeFilePaths.findIndex((entry) => String(entry ?? "").trim() === path);
+      if (importIdx >= 0) importModeFilePaths.splice(importIdx, 1);
       if (livePreviewPinnedPath === path) livePreviewPinnedPath = "";
+      if (lastLivePreviewPath === path) {
+        lastLivePreviewPath = "";
+        lastPreviewDispatchSignature = "";
+      }
       renderImportUi();
       updateActionButtonState();
-      void syncLivePreviewNavigation();
+      window.setTimeout(() => {
+        void syncLivePreviewNavigation();
+      }, 0);
+      if (importWizardDir && path) {
+        window.setTimeout(() => {
+          void invoke("remove_import_wizard_cached_preview", {
+            folderDir: importWizardDir,
+            path,
+          }).catch((err) => {
+            console.error("remove_import_wizard_cached_preview failed:", err);
+          });
+        }, 0);
+      }
     });
     li.appendChild(removeBtn);
 
     importList.appendChild(li);
+  }
+  for (const path of missingThumbPaths) {
+    requestListThumbnail(path);
   }
 }
 
@@ -408,6 +473,7 @@ async function runImportDone() {
       treatmentName: useExistingFolder ? null : treatmentName,
       filePaths,
       deleteOrigin: true,
+      importWizardDir: importWizardDir || null,
     });
     const jobId = Number(result?.job_id ?? result?.jobId ?? 0) || null;
     await invoke("notify_import_wizard_completed", {
@@ -470,19 +536,14 @@ async function saveLivePreviewToggleSetting(enabled) {
 async function fetchPreviewForPath(path) {
   if (!path || previewDataUrlByPath.has(path)) return;
   try {
-    const rows = await invoke("get_import_wizard_cached_previews", {
-      folderDir: importWizardDir,
-      paths: [path],
-      includeDataUrl: true,
-      generateIfMissing: true,
-    });
-    const row = Array.isArray(rows) ? rows[0] : null;
-    const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
+    const dataUrl = String(
+      await invoke("get_import_wizard_quick_preview_data_url", { path })
+    ).trim();
     if (dataUrl) {
       previewDataUrlByPath.set(path, dataUrl);
     }
   } catch (err) {
-    console.error("get_import_wizard_cached_previews failed:", err);
+    console.error("get_import_wizard_quick_preview_data_url failed:", err);
   }
 }
 
@@ -538,9 +599,16 @@ async function pollWatchFolder() {
         path,
         pendingCount: pendingRows.length,
       });
-      void invalidateCachedPreview(path)
-        .then(() => fetchPreviewForPath(path))
-        .then(renderImportUi);
+      scheduleImportWizardCacheWarm(path);
+      // Avoid heavy thumbnail generation directly on first-detect path.
+      // The full live preview window handles image loading; list thumbs can load lazily.
+      if (importExpanded) {
+        window.setTimeout(() => {
+          void invalidateCachedPreview(path)
+            .then(() => fetchPreviewForPath(path))
+            .then(renderImportUi);
+        }, 50);
+      }
     }
     for (const path of candidateRowsByPath.keys()) {
       if (!seenCandidatePaths.has(path)) {
@@ -567,7 +635,6 @@ async function pollWatchFolder() {
       latestAddedPath !== lastLivePreviewPath
     ) {
       dispatchedFromIncrease = true;
-      const revision = ++latestAcceptedPreviewRevision;
       livePreviewManuallyClosed = false;
       livePreviewPinnedPath = "";
       if (livePreviewConfirmRefreshTimerId !== null) {
@@ -581,21 +648,6 @@ async function pollWatchFolder() {
         });
         void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths(), { force: true });
       });
-      // Re-emit shortly after first detection to avoid a white first frame
-      // when camera copy finishes a moment later.
-      livePreviewConfirmRefreshTimerId = setTimeout(() => {
-        livePreviewConfirmRefreshTimerId = null;
-        if (revision !== latestAcceptedPreviewRevision) return;
-        if (importMode || livePreviewBlockedByImport) return;
-        if (!livePreviewToggle?.checked) return;
-        if (livePreviewPinnedPath) return;
-        if (!pendingRows.some((entry) => String(entry?.path ?? "").trim() === latestAddedPath)) return;
-        wizardTrace("preview", "dispatch delayed confirm refresh", {
-          path: latestAddedPath,
-          navCount: getPendingPreviewPaths().length,
-        });
-        void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths(), { force: true });
-      }, 900);
     }
     if (!dispatchedFromIncrease) {
       void syncLivePreviewNavigation();
@@ -726,27 +778,9 @@ async function closeLivePreviewWindow() {
   }, 600);
   try {
     let closed = false;
-    if (livePreviewWindow) {
-      try {
-        await livePreviewWindow.close();
-        closed = true;
-      } catch (err) {
-        wizardTrace("preview", "close cached handle failed", { err: String(err ?? "") });
-      }
-    }
-    if (!closed) {
-      try {
-        const existing = await WebviewWindow.getByLabel("import_wizard_preview");
-        if (existing) {
-          await existing.close();
-          closed = true;
-        }
-      } catch (err) {
-        wizardTrace("preview", "close by label failed", { err: String(err ?? "") });
-      }
-    }
     try {
-      await invoke("close_import_wizard_preview_window");
+      const result = await invoke("close_import_wizard_preview_window");
+      closed = Boolean(result);
     } catch (err) {
       wizardTrace("preview", "rust close command failed", { err: String(err ?? "") });
     }
@@ -754,6 +788,7 @@ async function closeLivePreviewWindow() {
   } finally {
     queuedLivePreviewDispatch = null;
     livePreviewWindow = null;
+    livePreviewWindowWasOpened = false;
     if (livePreviewConfirmRefreshTimerId !== null) {
       clearTimeout(livePreviewConfirmRefreshTimerId);
       livePreviewConfirmRefreshTimerId = null;
@@ -766,9 +801,7 @@ async function closeLivePreviewWindow() {
 
 async function sendLivePreviewPath(path, navigationPaths = null, options = {}) {
   queuedLivePreviewDispatch = { path, navigationPaths, options };
-  if (livePreviewDispatchInFlight) {
-    return;
-  }
+  if (livePreviewDispatchInFlight) return;
   livePreviewDispatchInFlight = true;
   try {
     while (queuedLivePreviewDispatch) {
@@ -835,11 +868,8 @@ async function sendLivePreviewPathNow(path, navigationPaths = null, options = {}
     if (!win) return;
     // Do not block the poll loop on show/permission.
     void win.show().catch(() => {});
-    await withTimeout(
-      win.emit("import-wizard-preview-file", { path, paths: normalizedNavPaths }),
-      PREVIEW_EMIT_TIMEOUT_MS,
-      "import-wizard-preview-file emit",
-    );
+    await win.emit("import-wizard-preview-file", { path, paths: normalizedNavPaths });
+    livePreviewWindowWasOpened = true;
     wizardTrace("preview", "dispatch emitted", {
       path,
       navCount: normalizedNavPaths.length,
@@ -865,9 +895,11 @@ async function syncLivePreviewNavigation() {
   if (livePreviewBlockedByImport) return;
   if (!livePreviewToggle?.checked || importMode) return;
   if (livePreviewManuallyClosed) return;
+  if (livePreviewDispatchInFlight) return;
   const navPaths = getPendingPreviewPaths();
   if (navPaths.length < 1) {
-    await closeLivePreviewWindow();
+    if (!livePreviewWindowWasOpened && !livePreviewWindow) return;
+    void closeLivePreviewWindow();
     lastPreviewDispatchSignature = "";
     return;
   }
@@ -958,6 +990,12 @@ function cleanup() {
     clearTimeout(livePreviewConfirmRefreshTimerId);
     livePreviewConfirmRefreshTimerId = null;
   }
+  if (cacheWarmFlushTimerId !== null) {
+    clearTimeout(cacheWarmFlushTimerId);
+    cacheWarmFlushTimerId = null;
+  }
+  pendingCacheWarmPaths.clear();
+  thumbnailFetchInFlight.clear();
   candidateRowsByPath.clear();
   void closeLivePreviewWindow();
   importModeFilePaths = [];
@@ -973,8 +1011,6 @@ async function init() {
 
   if (importToggle) {
     importToggle.addEventListener("click", () => {
-      livePreviewManuallyClosed = true;
-      void closeLivePreviewWindow();
       if (importMode) return;
       importExpanded = !importExpanded;
       renderImportUi();
@@ -1102,3 +1138,4 @@ async function init() {
 
 window.addEventListener("beforeunload", cleanup);
 void init();
+

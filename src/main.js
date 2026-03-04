@@ -8,6 +8,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import confetti from "canvas-confetti";
 import { initSidebarLayout } from "./sidebar-layout";
 import { initMainContent } from "./main-content";
+import { FULL_TRACE } from "./trace-config";
 
 // ---------- DOM ----------
 const onboardingView = document.getElementById("onboardingView");
@@ -100,9 +101,21 @@ function previewTrace(scope, message, extra = null) {
   const ts = new Date().toISOString();
   if (extra === null || extra === undefined) {
     console.log(`[preview-trace][main][${scope}][${ts}] ${message}`);
+    if (FULL_TRACE) {
+      void invoke("preview_trace_client", {
+        scope: `main:${scope}`,
+        message,
+      }).catch(() => {});
+    }
     return;
   }
   console.log(`[preview-trace][main][${scope}][${ts}] ${message}`, extra);
+  if (FULL_TRACE) {
+    void invoke("preview_trace_client", {
+      scope: `main:${scope}`,
+      message: `${message} ${JSON.stringify(extra)}`,
+    }).catch(() => {});
+  }
 }
 
 function setDebugState(state) {
@@ -4007,16 +4020,6 @@ void listen("import-wizard-completed", async (event) => {
   if (!workspace || !patient) return;
   if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
 
-  selectedPatient = patient;
-  selectedPatientId = "";
-  await searchPatients(patientSearchInput?.value ?? "");
-  const selectedEntry = (lastRenderedPatientEntries ?? [])
-    .map((entry) => normalizePatientEntry(entry))
-    .find((entry) => entry.folderName === patient);
-  selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
-  const { lastName, firstName } = splitPatientName(patient);
-  mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
-  updateImportWizardButtonState();
   if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
     if (wizardDir) {
       importWizardCleanupByJobId.set(jobId, wizardDir);
@@ -4027,9 +4030,23 @@ void listen("import-wizard-completed", async (event) => {
       workspaceDir: workspace,
       patientFolder: patient,
     });
-    return;
+  } else {
+    void mainContent.refreshTimelineForSelection();
   }
-  await mainContent.refreshTimelineForSelection();
+
+  // Keep event handling non-blocking so progress updates stay smooth during import.
+  void (async () => {
+    selectedPatient = patient;
+    selectedPatientId = "";
+    await searchPatients(patientSearchInput?.value ?? "");
+    const selectedEntry = (lastRenderedPatientEntries ?? [])
+      .map((entry) => normalizePatientEntry(entry))
+      .find((entry) => entry.folderName === patient);
+    selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
+    const { lastName, firstName } = splitPatientName(patient);
+    mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
+    updateImportWizardButtonState();
+  })();
 });
 void listen("import-progress", async (event) => {
   const payload = event?.payload ?? {};
