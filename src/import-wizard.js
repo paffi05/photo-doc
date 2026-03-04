@@ -57,8 +57,12 @@ const candidateRowsByPath = new Map();
 const FILE_DECODE_RETRY_MIN_MS = 250;
 const WATCH_FOLDER_POLL_MS = 400;
 const PREVIEW_DISPATCH_TIMEOUT_MS = 1500;
+const PREVIEW_EMIT_TIMEOUT_MS = 1500;
 let pollInFlight = false;
 let lastPreviewDispatchSignature = "";
+let livePreviewDispatchInFlight = false;
+let queuedLivePreviewDispatch = null;
+let latestAcceptedPreviewRevision = 0;
 const WIZARD_TRACE_ENABLED = true;
 
 function wizardTrace(scope, message, extra = null) {
@@ -208,11 +212,23 @@ function selectExistingTreatmentFolder(folderName) {
   updateActionButtonState();
 }
 
-function renderTreatmentDropdown() {
+function getFilteredTreatmentFolders(filterText = "") {
+  const folders = Array.isArray(existingTreatmentFolders) ? existingTreatmentFolders : [];
+  const needle = String(filterText ?? "").trim().toLowerCase();
+  if (!needle) return folders;
+  return folders.filter((name) => String(name ?? "").toLowerCase().includes(needle));
+}
+
+function renderTreatmentDropdown(filterText = "") {
   if (!treatmentDropdownList || !treatmentDropdownBtn) return;
   treatmentDropdownList.innerHTML = "";
-  const folders = Array.isArray(existingTreatmentFolders) ? existingTreatmentFolders : [];
-  treatmentDropdownBtn.hidden = folders.length < 1;
+  const allFolders = Array.isArray(existingTreatmentFolders) ? existingTreatmentFolders : [];
+  const folders = getFilteredTreatmentFolders(filterText);
+  treatmentDropdownBtn.hidden = allFolders.length < 1;
+  if (allFolders.length < 1) {
+    setTreatmentDropdownOpen(false);
+    return;
+  }
   if (folders.length < 1) {
     setTreatmentDropdownOpen(false);
     return;
@@ -257,7 +273,7 @@ async function loadExistingTreatmentFolders() {
     console.error("list_patient_treatment_folders failed:", err);
     existingTreatmentFolders = [];
   }
-  renderTreatmentDropdown();
+  renderTreatmentDropdown(String(treatmentInput?.value ?? "").trim());
 }
 
 function updateActionButtonState() {
@@ -366,6 +382,7 @@ async function enterImportMode() {
     treatmentInput.classList.remove("is-existing-selected");
     treatmentInput.focus();
   }
+  renderTreatmentDropdown("");
   setTreatmentDropdownOpen(false);
 }
 
@@ -533,7 +550,6 @@ async function pollWatchFolder() {
 
     renderImportUi();
     updateActionButtonState();
-    void syncLivePreviewNavigation();
     const countIncreased = pendingRows.length > previousPendingCount;
     wizardTrace("poll", "post-process", {
       pendingBefore: previousPendingCount,
@@ -541,6 +557,7 @@ async function pollWatchFolder() {
       countIncreased,
       latestAddedPath,
     });
+    let dispatchedFromIncrease = false;
     if (
       !importMode &&
       !livePreviewBlockedByImport &&
@@ -549,6 +566,8 @@ async function pollWatchFolder() {
       latestAddedPath &&
       latestAddedPath !== lastLivePreviewPath
     ) {
+      dispatchedFromIncrease = true;
+      const revision = ++latestAcceptedPreviewRevision;
       livePreviewManuallyClosed = false;
       livePreviewPinnedPath = "";
       if (livePreviewConfirmRefreshTimerId !== null) {
@@ -566,6 +585,7 @@ async function pollWatchFolder() {
       // when camera copy finishes a moment later.
       livePreviewConfirmRefreshTimerId = setTimeout(() => {
         livePreviewConfirmRefreshTimerId = null;
+        if (revision !== latestAcceptedPreviewRevision) return;
         if (importMode || livePreviewBlockedByImport) return;
         if (!livePreviewToggle?.checked) return;
         if (livePreviewPinnedPath) return;
@@ -576,6 +596,9 @@ async function pollWatchFolder() {
         });
         void sendLivePreviewPath(latestAddedPath, getPendingPreviewPaths(), { force: true });
       }, 900);
+    }
+    if (!dispatchedFromIncrease) {
+      void syncLivePreviewNavigation();
     }
   } catch (err) {
     wizardTrace("poll", "failed", { err: String(err ?? "") });
@@ -729,6 +752,7 @@ async function closeLivePreviewWindow() {
     }
     wizardTrace("preview", "close requested", { closed });
   } finally {
+    queuedLivePreviewDispatch = null;
     livePreviewWindow = null;
     if (livePreviewConfirmRefreshTimerId !== null) {
       clearTimeout(livePreviewConfirmRefreshTimerId);
@@ -741,6 +765,23 @@ async function closeLivePreviewWindow() {
 }
 
 async function sendLivePreviewPath(path, navigationPaths = null, options = {}) {
+  queuedLivePreviewDispatch = { path, navigationPaths, options };
+  if (livePreviewDispatchInFlight) {
+    return;
+  }
+  livePreviewDispatchInFlight = true;
+  try {
+    while (queuedLivePreviewDispatch) {
+      const next = queuedLivePreviewDispatch;
+      queuedLivePreviewDispatch = null;
+      await sendLivePreviewPathNow(next.path, next.navigationPaths, next.options);
+    }
+  } finally {
+    livePreviewDispatchInFlight = false;
+  }
+}
+
+async function sendLivePreviewPathNow(path, navigationPaths = null, options = {}) {
   const force = Boolean(options?.force);
   const userInitiated = Boolean(options?.userInitiated);
   if (!path) return;
@@ -794,7 +835,11 @@ async function sendLivePreviewPath(path, navigationPaths = null, options = {}) {
     if (!win) return;
     // Do not block the poll loop on show/permission.
     void win.show().catch(() => {});
-    await win.emit("import-wizard-preview-file", { path, paths: normalizedNavPaths });
+    await withTimeout(
+      win.emit("import-wizard-preview-file", { path, paths: normalizedNavPaths }),
+      PREVIEW_EMIT_TIMEOUT_MS,
+      "import-wizard-preview-file emit",
+    );
     wizardTrace("preview", "dispatch emitted", {
       path,
       navCount: normalizedNavPaths.length,
@@ -973,7 +1018,6 @@ async function init() {
     lastLivePreviewPath = "";
   });
   if (treatmentInput) {
-    treatmentInput.addEventListener("input", updateActionButtonState);
     treatmentInput.addEventListener("focus", () => {
       if (!selectedExistingTreatmentFolder) return;
       clearExistingTreatmentSelection(true);
@@ -984,7 +1028,14 @@ async function init() {
       clearExistingTreatmentSelection(false);
       updateActionButtonState();
     });
+    treatmentInput.addEventListener("input", () => {
+      updateActionButtonState();
+    });
     treatmentInput.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        setTreatmentDropdownOpen(false);
+        return;
+      }
       if (event.key !== "Enter") return;
       event.preventDefault();
       if (!importMode || actionBtn?.disabled) return;
@@ -995,6 +1046,13 @@ async function init() {
     treatmentDropdownBtn.addEventListener("click", (event) => {
       event.preventDefault();
       if (!importMode || importBusy || existingTreatmentFolders.length < 1) return;
+      const filterValue = String(treatmentInput?.value ?? "").trim();
+      const matches = getFilteredTreatmentFolders(filterValue);
+      renderTreatmentDropdown(filterValue);
+      if (!matches.length) {
+        setTreatmentDropdownOpen(false);
+        return;
+      }
       setTreatmentDropdownOpen(!treatmentDropdownOpen);
     });
   }

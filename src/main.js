@@ -2808,12 +2808,15 @@ async function loadPatients(workspaceDir, options = {}) {
   };
 
   try {
-    setStartupStageIfChanged("Updating Database...");
+    setStartupStageIfChanged("Starting workspace indexing...");
     let startAccepted = await withTimeout(
       invoke("start_workspace_reindex", { workspaceDir }),
       WORKSPACE_REINDEX_START_TIMEOUT_MS,
       "start_workspace_reindex",
     ).catch(() => false);
+    if (!startAccepted) {
+      setStartupStageIfChanged("Retrying indexing worker startup...");
+    }
     let indexedCount = 0;
     while (true) {
       if (Date.now() > loadDeadline) {
@@ -2826,6 +2829,7 @@ async function loadPatients(workspaceDir, options = {}) {
       ).catch(() => null);
       if (!status) {
         if (!startAccepted && allowBlockingFallback) {
+          setStartupStageIfChanged("Running fallback indexing...");
           indexedCount = await withTimeout(
             invoke("reindex_patient_folders", { workspaceDir }),
             WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
@@ -2857,15 +2861,24 @@ async function loadPatients(workspaceDir, options = {}) {
       const importingKeywords = /importing keywords/i.test(statusMessage);
       if (running) {
         if (importingKeywords) {
-          setStartupStageIfChanged("Importing Keywords...");
+          if (total > 0) {
+            setStartupStageIfChanged(`Importing keywords... (${completed}/${total})`);
+          } else {
+            setStartupStageIfChanged("Importing keywords...");
+          }
         } else {
-          setStartupStageIfChanged("Updating Database...");
+          if (total > 0) {
+            setStartupStageIfChanged(`Indexing workspace... (${completed}/${total})`);
+          } else {
+            setStartupStageIfChanged("Updating database index...");
+          }
         }
       }
       if (isDbUpdating && dbStatusText) {
         dbStatusText.textContent = importingKeywords ? "importing keywords..." : "updating...";
       }
       if (!statusWorkspaceDir && !running && !startAccepted && allowBlockingFallback) {
+        setStartupStageIfChanged("Running fallback indexing...");
         indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
         if (onReindexProgress) onReindexProgress(100);
         break;
@@ -2884,8 +2897,10 @@ async function loadPatients(workspaceDir, options = {}) {
       await delay(120);
     }
     console.log(`[patients ${ts()}] indexed ${indexedCount} folders`);
+    setStartupStageIfChanged(`Indexing finished (${indexedCount} folders)`);
   } catch (err) {
     console.error("reindex_patient_folders failed:", err);
+    setStartupStageIfChanged("Indexing failed, using cached data...");
     reindexFailed = true;
   }
 
@@ -2938,12 +2953,12 @@ async function loadPatients(workspaceDir, options = {}) {
       void loadTimelineTask;
       void loadCountsTask;
     } else {
-      setStartupStageIfChanged("Scanning invalid files...");
       await loadListTask;
+      setStartupStageIfChanged("Scanning invalid folders...");
       await loadInvalidTask;
       setStartupStageIfChanged("Preparing timeline...");
       await loadTimelineTask;
-      setStartupStageIfChanged("Counting indexed images...");
+      setStartupStageIfChanged("Refreshing index counters...");
       await loadCountsTask;
     }
   } finally {
@@ -3032,6 +3047,18 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   setStartupProcessStatus("Counting indexed images...");
   setStartupSpinnerPercent(92);
   await refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir);
+  setStartupProcessStatus("Loading cache usage...");
+  setStartupSpinnerPercent(95);
+  const cacheStats = await refreshCacheUsageUi();
+  setStartupProcessStatus("Preparing preview maintenance...");
+  setStartupSpinnerPercent(97);
+  await ensureBackgroundPreviewFill(cacheStats);
+  setStartupProcessStatus("Refreshing cache status...");
+  setStartupSpinnerPercent(98);
+  await refreshLocalCacheCopyStatus();
+  setStartupProcessStatus("Refreshing indexing status...");
+  setStartupSpinnerPercent(99);
+  await refreshIndexingStatus();
   setStartupProcessStatus("Finalizing startup...");
   setStartupSpinnerPercent(100);
   appView.hidden = false;
@@ -3047,15 +3074,7 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
     schedulePatientNameTruncationRefresh();
   });
   initialMainReadyInProgress = false;
-  const postStartupDelayMs = skipLoadPatients ? 1200 : 450;
-  setTimeout(() => {
-    if (String(currentWorkspaceDir ?? "").trim() !== String(workspaceDir ?? "").trim()) return;
-    void (async () => {
-      const stats = await refreshCacheUsageUi();
-      await ensureBackgroundPreviewFill(stats);
-      await refreshIndexingDebugCounts();
-    })();
-  }, postStartupDelayMs);
+  void refreshIndexingDebugCounts();
   requestAnimationFrame(sidebarLayout.updateTopButtonSpacing);
   console.log(
     `[transition ${ts()}] view flags onboarding.hidden=${onboardingView.hidden} app.hidden=${appView.hidden}`
