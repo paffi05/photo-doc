@@ -110,18 +110,93 @@ fn persist_import_wizard_preview_window_state(
     write_settings(app_handle, &settings)
 }
 
+fn clamp_i32(value: i32, min_value: i32, max_value: i32) -> i32 {
+    if min_value > max_value {
+        return min_value;
+    }
+    value.max(min_value).min(max_value)
+}
+
+fn has_minimum_visible_overlap(
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    mon_left: i32,
+    mon_top: i32,
+    mon_right: i32,
+    mon_bottom: i32,
+) -> bool {
+    let win_right = x.saturating_add(width);
+    let win_bottom = y.saturating_add(height);
+    let overlap_w = (win_right.min(mon_right) - x.max(mon_left)).max(0);
+    let overlap_h = (win_bottom.min(mon_bottom) - y.max(mon_top)).max(0);
+    overlap_w >= 120 && overlap_h >= 120
+}
+
 fn apply_saved_window_state(app_handle: &tauri::AppHandle, window: &tauri::WebviewWindow) -> Result<(), String> {
     let settings = read_settings(app_handle)?;
     let Some(state) = settings.window_state else {
         return Ok(());
     };
 
+    let default_min_w: u32 = 900;
+    let default_min_h: u32 = 600;
+
+    let (width, height, x, y, should_center) = match window.current_monitor() {
+        Ok(Some(monitor)) => {
+            let mon_pos = monitor.position();
+            let mon_size = monitor.size();
+            let mon_left = mon_pos.x;
+            let mon_top = mon_pos.y;
+            let mon_right = mon_left.saturating_add(mon_size.width as i32);
+            let mon_bottom = mon_top.saturating_add(mon_size.height as i32);
+
+            let max_w = mon_size.width.max(default_min_w);
+            let max_h = mon_size.height.max(default_min_h);
+            let width = state.width.max(default_min_w).min(max_w);
+            let height = state.height.max(default_min_h).min(max_h);
+
+            let width_i = width as i32;
+            let height_i = height as i32;
+            let visible = has_minimum_visible_overlap(
+                state.x,
+                state.y,
+                width_i,
+                height_i,
+                mon_left,
+                mon_top,
+                mon_right,
+                mon_bottom,
+            );
+
+            let min_x = mon_left;
+            let max_x = mon_right.saturating_sub(width_i);
+            let min_y = mon_top;
+            let max_y = mon_bottom.saturating_sub(height_i);
+            let x = clamp_i32(state.x, min_x, max_x);
+            let y = clamp_i32(state.y, min_y, max_y);
+            (width, height, x, y, !visible)
+        }
+        _ => (
+            state.width.max(default_min_w),
+            state.height.max(default_min_h),
+            state.x,
+            state.y,
+            false,
+        ),
+    };
+
     window
-        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(state.width, state.height)))
+        .set_size(tauri::Size::Physical(tauri::PhysicalSize::new(width, height)))
         .map_err(|e| e.to_string())?;
-    window
-        .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(state.x, state.y)))
-        .map_err(|e| e.to_string())?;
+    if should_center {
+        window.center().map_err(|e| e.to_string())?;
+    } else {
+        window
+            .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)))
+            .map_err(|e| e.to_string())?;
+    }
     if state.maximized {
         window.maximize().map_err(|e| e.to_string())?;
     }
