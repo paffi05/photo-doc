@@ -123,6 +123,17 @@ function setDebugState(state) {
   debugBadge.textContent = `debug: (${state})`;
 }
 
+function normalizeWorkspacePathForCompare(pathLike = "") {
+  const raw = String(pathLike ?? "").trim();
+  if (!raw) return "";
+  let normalized = raw.replace(/\\/g, "/").replace(/\/+$/, "");
+  // Windows paths: compare case-insensitively for drive-letter paths.
+  if (/^[a-zA-Z]:\//.test(normalized)) {
+    normalized = normalized.toLowerCase();
+  }
+  return normalized;
+}
+
 function setStartupProcessStatus(message = "") {
   if (!startupProcessText) return;
   const text = String(message ?? "").trim();
@@ -4022,7 +4033,11 @@ void listen("import-wizard-completed", async (event) => {
     ? plannedPathsRaw.map((p) => String(p ?? "").trim()).filter(Boolean)
     : [];
   if (!workspace || !patient) return;
-  if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
+  const eventWorkspaceKey = normalizeWorkspacePathForCompare(workspace);
+  const currentWorkspaceKey = normalizeWorkspacePathForCompare(currentWorkspaceDir);
+  const workspaceMatches = Boolean(currentWorkspaceKey) && eventWorkspaceKey === currentWorkspaceKey;
+  const selectedPatientMatches = String(selectedPatient ?? "").trim() === patient;
+  if (!workspaceMatches && !selectedPatientMatches) return;
 
   if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
     if (wizardDir) {
