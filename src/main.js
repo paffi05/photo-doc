@@ -4039,6 +4039,14 @@ void listen("import-wizard-completed", async (event) => {
   const selectedPatientMatches = String(selectedPatient ?? "").trim() === patient;
   if (!workspaceMatches && !selectedPatientMatches) return;
 
+  // Switch context first so timeline/import job refresh runs against the correct patient immediately.
+  selectedPatient = patient;
+  const cachedPatient = patientEntryCacheByFolder.get(patient);
+  selectedPatientId = String(cachedPatient?.patientId ?? "").trim();
+  const { lastName, firstName } = splitPatientName(patient);
+  mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
+  updateImportWizardButtonState();
+
   if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
     if (wizardDir) {
       importWizardCleanupByJobId.set(jobId, wizardDir);
@@ -4056,15 +4064,14 @@ void listen("import-wizard-completed", async (event) => {
 
   // Keep event handling non-blocking so progress updates stay smooth during import.
   void (async () => {
-    selectedPatient = patient;
-    selectedPatientId = "";
     await searchPatients(patientSearchInput?.value ?? "");
     const selectedEntry = (lastRenderedPatientEntries ?? [])
       .map((entry) => normalizePatientEntry(entry))
       .find((entry) => entry.folderName === patient);
-    selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
-    const { lastName, firstName } = splitPatientName(patient);
-    mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
+    if (selectedEntry) {
+      selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
+      mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
+    }
     updateImportWizardButtonState();
   })();
 });
