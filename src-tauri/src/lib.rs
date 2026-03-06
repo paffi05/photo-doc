@@ -4047,13 +4047,19 @@ fn copy_file_to_destination(source_path: String, destination_dir: String) -> Res
 }
 
 #[tauri::command]
-async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String) -> Result<bool, String> {
+async fn rotate_image_right_in_place(
+    app_handle: tauri::AppHandle,
+    path: String,
+    steps: Option<u8>,
+    op_id: Option<u64>,
+) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _rotate_guard = rotate_image_lock().lock().map_err(|e| e.to_string())?;
         let path = path.trim().to_string();
         if path.is_empty() {
             return Err("path is required".to_string());
         }
+        let steps = steps.unwrap_or(1).clamp(1, 3);
         let source = PathBuf::from(&path);
         if !source.exists() || !source.is_file() {
             return Err("source file does not exist".to_string());
@@ -4081,11 +4087,13 @@ async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String)
             _ => return Err("unsupported image format".to_string()),
         };
 
-        let decoded = image::ImageReader::open(&source)
+        let mut rotated = image::ImageReader::open(&source)
             .map_err(|e| e.to_string())?
             .decode()
             .map_err(|e| e.to_string())?;
-        let rotated = decoded.rotate90();
+        for _ in 0..steps {
+            rotated = rotated.rotate90();
+        }
 
         let tmp_path = source.with_extension(format!("{}.rotating", ext));
         rotated
@@ -4177,6 +4185,16 @@ async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String)
                     json!({
                         "path": path,
                         "preview_path": preview_path,
+                        "op_id": op_id,
+                    }),
+                );
+                let _ = app_handle.emit(
+                    "image-preview-rotation-committed",
+                    json!({
+                        "path": path,
+                        "preview_path": preview_path,
+                        "op_id": op_id,
+                        "rotation_delta_deg": (steps as i32) * 90,
                     }),
                 );
             }
@@ -4809,6 +4827,7 @@ fn emit_image_preview_rotated(
     app_handle: tauri::AppHandle,
     path: String,
     rotation_deg: i32,
+    op_id: Option<u64>,
 ) -> Result<bool, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
@@ -4821,6 +4840,7 @@ fn emit_image_preview_rotated(
             json!({
                 "path": path,
                 "rotation_deg": normalized,
+                "op_id": op_id,
             }),
         )
         .map_err(|e| e.to_string())?;

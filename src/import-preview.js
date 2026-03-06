@@ -38,8 +38,12 @@ let controlsVisible = false;
 let markModeActive = false;
 let selectedDrawColor = "white";
 const pendingRotationStepsByPath = new Map();
+const optimisticRotationOverrideDegByPath = new Map();
+const inflightRotationStepsByPath = new Map();
 const rotateSaveTimerByPath = new Map();
 const rotateSaveRunningByPath = new Map();
+const latestRotationOpIdByPath = new Map();
+let rotationOpCounter = 0;
 const ROTATE_SAVE_DEBOUNCE_MS = 800;
 let baseImageWidth = 0;
 let baseImageHeight = 0;
@@ -65,6 +69,7 @@ let saveDropdownOpen = false;
 let previewWorkspaceDir = "";
 let previewPatientFolder = "";
 let folderRefreshRequestId = 0;
+const ROTATION_UI_STATE_STORAGE_KEY = "mpm.imagePreviewRotationUiState.v1";
 const PREVIEW_TRACE_FORWARD_TO_RUST = FULL_TRACE;
 
 function previewTrace(scope, message, extra = null) {
@@ -184,7 +189,7 @@ function updatePanCursorState() {
 function applyTransform() {
   if (!previewImage) return;
   previewImage.style.transform =
-    `translate(${translateX}px, ${translateY}px) rotate(${rotationDeg}deg) scale(${currentScale})`;
+    `translate(-50%, -50%) translate(${translateX}px, ${translateY}px) rotate(${rotationDeg}deg) scale(${currentScale})`;
   updatePanCursorState();
 }
 
@@ -263,11 +268,103 @@ function normalizeRotationSteps(value) {
   return mod;
 }
 
+function persistRotationUiState() {
+  try {
+    const payload = {
+      pendingSteps: Object.fromEntries(
+        Array.from(pendingRotationStepsByPath.entries()).map(([k, v]) => [k, normalizeRotationSteps(v)])
+      ),
+      optimisticDeg: Object.fromEntries(
+        Array.from(optimisticRotationOverrideDegByPath.entries()).map(([k, v]) => [k, normalizeRotationDeg(v)])
+      ),
+    };
+    localStorage.setItem(ROTATION_UI_STATE_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // ignore persistence errors
+  }
+}
+
+function pruneStaleRotationUiState() {
+  const keys = new Set([
+    ...Array.from(pendingRotationStepsByPath.keys()),
+    ...Array.from(optimisticRotationOverrideDegByPath.keys()),
+  ]);
+  for (const key of keys) {
+    const steps = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
+    if (steps === 0) {
+      pendingRotationStepsByPath.delete(key);
+      optimisticRotationOverrideDegByPath.delete(key);
+      continue;
+    }
+    const expected = normalizeRotationDeg(steps * 90);
+    if (expected === 0) {
+      optimisticRotationOverrideDegByPath.delete(key);
+    } else {
+      optimisticRotationOverrideDegByPath.set(key, expected);
+    }
+  }
+}
+
+function loadRotationUiState() {
+  try {
+    const raw = localStorage.getItem(ROTATION_UI_STATE_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw);
+    const pending = parsed?.pendingSteps && typeof parsed.pendingSteps === "object" ? parsed.pendingSteps : {};
+    const optimistic = parsed?.optimisticDeg && typeof parsed.optimisticDeg === "object" ? parsed.optimisticDeg : {};
+    for (const [path, value] of Object.entries(pending)) {
+      const key = normalizePath(path);
+      const steps = normalizeRotationSteps(value);
+      if (!key || steps === 0) continue;
+      pendingRotationStepsByPath.set(key, steps);
+    }
+    for (const [path, value] of Object.entries(optimistic)) {
+      const key = normalizePath(path);
+      const deg = normalizeRotationDeg(value);
+      if (!key || deg === 0) continue;
+      optimisticRotationOverrideDegByPath.set(key, deg);
+    }
+    pruneStaleRotationUiState();
+    persistRotationUiState();
+  } catch {
+    // ignore parse errors
+  }
+}
+
 function getPendingRotationDeg(path) {
   const key = normalizePath(path);
   if (!key) return 0;
   const steps = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
   return steps * 90;
+}
+
+function normalizeRotationDeg(value) {
+  const n = Number(value) || 0;
+  return ((n % 360) + 360) % 360;
+}
+
+function getOptimisticRotationOverrideDeg(path) {
+  const key = normalizePath(path);
+  if (!key) return 0;
+  const pending = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
+  const inflight = normalizeRotationSteps(inflightRotationStepsByPath.get(key) ?? 0);
+  if (pending === 0 && inflight === 0) return 0;
+  return normalizeRotationDeg(optimisticRotationOverrideDegByPath.get(key) ?? 0);
+}
+
+function addOptimisticRotationOverride(path, deltaDeg) {
+  const key = normalizePath(path);
+  if (!key) return;
+  const next = normalizeRotationDeg(getOptimisticRotationOverrideDeg(key) + (Number(deltaDeg) || 0));
+  if (next === 0) {
+    optimisticRotationOverrideDegByPath.delete(key);
+    pruneStaleRotationUiState();
+    persistRotationUiState();
+    return;
+  }
+  optimisticRotationOverrideDegByPath.set(key, next);
+  pruneStaleRotationUiState();
+  persistRotationUiState();
 }
 
 function addPendingRotationStep(path) {
@@ -276,9 +373,15 @@ function addPendingRotationStep(path) {
   const next = normalizeRotationSteps((pendingRotationStepsByPath.get(key) ?? 0) + 1);
   if (next === 0) {
     pendingRotationStepsByPath.delete(key);
+    optimisticRotationOverrideDegByPath.delete(key);
+    pruneStaleRotationUiState();
+    persistRotationUiState();
     return;
   }
   pendingRotationStepsByPath.set(key, next);
+  optimisticRotationOverrideDegByPath.set(key, normalizeRotationDeg(next * 90));
+  pruneStaleRotationUiState();
+  persistRotationUiState();
 }
 
 function consumePendingRotationStep(path) {
@@ -287,38 +390,55 @@ function consumePendingRotationStep(path) {
   const current = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
   if (current === 0) {
     pendingRotationStepsByPath.delete(key);
+    optimisticRotationOverrideDegByPath.delete(key);
+    pruneStaleRotationUiState();
+    persistRotationUiState();
     return;
   }
   const next = normalizeRotationSteps(current - 1);
   if (next === 0) {
     pendingRotationStepsByPath.delete(key);
+    optimisticRotationOverrideDegByPath.delete(key);
+    pruneStaleRotationUiState();
+    persistRotationUiState();
     return;
   }
   pendingRotationStepsByPath.set(key, next);
+  optimisticRotationOverrideDegByPath.set(key, normalizeRotationDeg(next * 90));
+  pruneStaleRotationUiState();
+  persistRotationUiState();
 }
 
 async function flushPendingRotationSave(path) {
   const key = normalizePath(path);
   if (!key) return;
   if (rotateSaveRunningByPath.get(key)) return;
+  if (normalizeRotationSteps(inflightRotationStepsByPath.get(key) ?? 0) > 0) return;
   const steps = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
   if (steps === 0) return;
+  const opId = ++rotationOpCounter;
+  latestRotationOpIdByPath.set(key, opId);
+  pendingRotationStepsByPath.delete(key);
+  inflightRotationStepsByPath.set(key, steps);
+  persistRotationUiState();
 
   rotateSaveRunningByPath.set(key, true);
   try {
-    for (let i = 0; i < steps; i += 1) {
-      // Persist only net pending rotation.
-      await invoke("rotate_image_right_in_place", { path: key });
-      consumePendingRotationStep(key);
-    }
-    previewTrace("rotate", "debounced rotate save ok", { path: key, steps });
+    // Persist only net pending rotation for latest op.
+    await invoke("rotate_image_right_in_place", { path: key, steps, opId });
+    addOptimisticRotationOverride(key, -(steps * 90));
+    previewTrace("rotate", "debounced rotate save ok", { path: key, steps, opId });
   } catch (err) {
+    pendingRotationStepsByPath.set(key, steps);
     previewTrace("rotate", "debounced rotate save failed", {
       path: key,
+      opId,
       err: String(err ?? ""),
     });
     console.error("debounced rotate save failed:", err);
+    persistRotationUiState();
   } finally {
+    inflightRotationStepsByPath.delete(key);
     rotateSaveRunningByPath.set(key, false);
     const remaining = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
     if (remaining > 0) {
@@ -339,6 +459,16 @@ function schedulePendingRotationSave(path) {
     void flushPendingRotationSave(key);
   }, ROTATE_SAVE_DEBOUNCE_MS);
   rotateSaveTimerByPath.set(key, timerId);
+  persistRotationUiState();
+}
+
+function scheduleAllPendingRotationSaves() {
+  for (const [rawPath, rawSteps] of pendingRotationStepsByPath.entries()) {
+    const path = normalizePath(rawPath);
+    const steps = normalizeRotationSteps(rawSteps ?? 0);
+    if (!path || steps === 0) continue;
+    schedulePendingRotationSave(path);
+  }
 }
 
 function setControlsVisible(visible) {
@@ -619,18 +749,23 @@ function updateBaseImageSize() {
   const naturalWidth = Number(previewImage.naturalWidth) || 0;
   const naturalHeight = Number(previewImage.naturalHeight) || 0;
   const { width: rootWidth, height: rootHeight } = getRootSize();
+  const FIT_SAFETY = 0.999;
   if (naturalWidth <= 0 || naturalHeight <= 0 || rootWidth <= 0 || rootHeight <= 0) {
     baseImageWidth = Math.max(1, rootWidth);
     baseImageHeight = Math.max(1, rootHeight);
-    previewImage.style.width = `${Math.round(baseImageWidth)}px`;
-    previewImage.style.height = `${Math.round(baseImageHeight)}px`;
+    previewImage.style.width = `${baseImageWidth}px`;
+    previewImage.style.height = `${baseImageHeight}px`;
     return;
   }
-  const containRatio = Math.min(rootWidth / naturalWidth, rootHeight / naturalHeight);
-  baseImageWidth = Math.max(1, naturalWidth * containRatio);
-  baseImageHeight = Math.max(1, naturalHeight * containRatio);
-  previewImage.style.width = `${Math.round(baseImageWidth)}px`;
-  previewImage.style.height = `${Math.round(baseImageHeight)}px`;
+  // Uniform scale only (no distortion). For quarter-turn rotations, fit against swapped bounds.
+  const containRatio = isQuarterTurnOdd()
+    ? Math.min(rootWidth / naturalHeight, rootHeight / naturalWidth)
+    : Math.min(rootWidth / naturalWidth, rootHeight / naturalHeight);
+  const safeRatio = Math.max(0, containRatio * FIT_SAFETY);
+  baseImageWidth = Math.max(1, naturalWidth * safeRatio);
+  baseImageHeight = Math.max(1, naturalHeight * safeRatio);
+  previewImage.style.width = `${baseImageWidth}px`;
+  previewImage.style.height = `${baseImageHeight}px`;
 }
 
 function resetTransform() {
@@ -731,7 +866,10 @@ async function setPreview(path) {
   currentPreviewPath = normalized;
   resetTransform();
   clearDrawCanvas();
-  rotationDeg = getPendingRotationDeg(normalized);
+  rotationDeg = getOptimisticRotationOverrideDeg(normalized);
+  if (normalizeRotationSteps(pendingRotationStepsByPath.get(normalized) ?? 0) > 0) {
+    schedulePendingRotationSave(normalized);
+  }
   applyTransform();
   updateNavigationButtons();
   const requestToken = ++previewRequestToken;
@@ -750,66 +888,66 @@ async function setPreview(path) {
       totalMs: Math.round(performance.now() - startedAt),
     });
   } catch (err) {
-    previewTrace("setPreview", "original-path failed, fallback to src_path", {
+    previewTrace("setPreview", "original-path failed, fallback to data_url", {
       requestToken,
       path: normalized,
       err: String(err ?? ""),
     });
     if (requestToken !== previewRequestToken) return;
     try {
-      const srcInvokeStart = performance.now();
-      const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
-      previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
+      const dataInvokeStart = performance.now();
+      const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
+      previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
         requestToken,
         path: normalized,
-        ms: Math.round(performance.now() - srcInvokeStart),
+        ms: Math.round(performance.now() - dataInvokeStart),
+        length: String(dataUrl ?? "").length,
       });
       if (requestToken !== previewRequestToken) return;
-      const safePath = String(resolvedPath ?? "").trim() || normalized;
-      const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
-      previewImage.decoding = "async";
+      const src = String(dataUrl ?? "").trim();
+      if (!src) return;
       await loadImageWithVerification(src, requestToken);
       updateBaseImageSize();
       applyTransform();
-      previewTrace("setPreview", "completed via src_path fallback", {
+      previewTrace("setPreview", "completed via data_url fallback", {
         requestToken,
         path: normalized,
         totalMs: Math.round(performance.now() - startedAt),
       });
-    } catch (srcPathErr) {
-      previewTrace("setPreview", "src_path failed, fallback to data_url", {
+    } catch (dataErr) {
+      previewTrace("setPreview", "data_url fallback failed, fallback to src_path", {
         requestToken,
         path: normalized,
-        err: String(srcPathErr ?? ""),
+        err: String(dataErr ?? ""),
       });
       if (requestToken !== previewRequestToken) return;
       try {
-        const dataInvokeStart = performance.now();
-        const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
-        previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
+        const srcInvokeStart = performance.now();
+        const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
+        previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
           requestToken,
           path: normalized,
-          ms: Math.round(performance.now() - dataInvokeStart),
-          length: String(dataUrl ?? "").length,
+          ms: Math.round(performance.now() - srcInvokeStart),
         });
         if (requestToken !== previewRequestToken) return;
-        const src = String(dataUrl ?? "").trim();
-        if (!src) return;
+        const safePath = String(resolvedPath ?? "").trim() || normalized;
+        const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
+        previewImage.decoding = "async";
         await loadImageWithVerification(src, requestToken);
         updateBaseImageSize();
         applyTransform();
-        previewTrace("setPreview", "completed via data_url fallback", {
+        previewTrace("setPreview", "completed via src_path fallback", {
           requestToken,
           path: normalized,
           totalMs: Math.round(performance.now() - startedAt),
         });
       } catch (fallbackErr) {
-        previewTrace("setPreview", "data_url fallback failed", {
+        previewTrace("setPreview", "src_path fallback failed", {
           requestToken,
           path: normalized,
           err: String(fallbackErr ?? ""),
         });
-        console.error("import preview original load failed:", err, srcPathErr, fallbackErr);
+        console.error("import preview original load failed:", err, dataErr, fallbackErr);
       }
     }
   } finally {
@@ -996,10 +1134,10 @@ previewRoot?.addEventListener("pointerleave", (event) => {
 
 window.addEventListener("resize", () => {
   resizeDrawCanvas();
+  currentScale = MIN_SCALE;
+  translateX = 0;
+  translateY = 0;
   updateBaseImageSize();
-  const clamped = clampTranslation(translateX, translateY);
-  translateX = clamped.x;
-  translateY = clamped.y;
   applyTransform();
 });
 
@@ -1027,14 +1165,16 @@ rotateRightBtn?.addEventListener("click", () => {
   if (!currentPreviewPath) return;
   const path = currentPreviewPath;
   addPendingRotationStep(path);
-  rotationDeg = getPendingRotationDeg(path);
-  const clamped = clampTranslation(translateX, translateY);
-  translateX = clamped.x;
-  translateY = clamped.y;
+  rotationDeg = getOptimisticRotationOverrideDeg(path);
+  currentScale = MIN_SCALE;
+  translateX = 0;
+  translateY = 0;
+  updateBaseImageSize();
   applyTransform();
   void invoke("emit_image_preview_rotated", {
     path,
     rotationDeg,
+    opId: null,
   }).catch(() => {});
   schedulePendingRotationSave(path);
 });
@@ -1178,6 +1318,8 @@ drawCanvas?.addEventListener("pointercancel", (event) => {
 });
 
 void listen(previewEventName, (event) => {
+  loadRotationUiState();
+  scheduleAllPendingRotationSaves();
   const path = normalizePath(event?.payload?.path);
   const paths = Array.isArray(event?.payload?.paths) ? event.payload.paths : [];
   const workspaceDir = normalizePath(event?.payload?.workspaceDir ?? "");
@@ -1207,6 +1349,8 @@ void listen(previewEventName, (event) => {
 
 void (async () => {
   try {
+    loadRotationUiState();
+    scheduleAllPendingRotationSaves();
     resizeDrawCanvas();
     setSelectedDrawColor("white");
     setControlsVisible(false);
@@ -1227,6 +1371,7 @@ void (async () => {
     });
     const normalized = normalizePath(path);
     if (normalized) {
+      loadRotationUiState();
       if (!navigationPaths.includes(normalized)) {
         navigationPaths.unshift(normalized);
       }

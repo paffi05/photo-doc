@@ -189,6 +189,7 @@ export function createTreatmentFilesPanel({
   let activeLoadedFiles = [];
   let activeFileOffset = 0;
   const optimisticThumbRotationByPath = new Map();
+  const latestCommittedRotateOpByPath = new Map();
   let previewLoadingStatus = { running: false, completed: 0, total: 0 };
   let activeOverviewKeywords = [];
 
@@ -248,9 +249,42 @@ export function createTreatmentFilesPanel({
   void listen("import-preview-ready", (event) => {
     const path = normalizePath(event?.payload?.path ?? "");
     const previewPath = normalizePath(event?.payload?.preview_path ?? event?.payload?.previewPath ?? "");
+    const opId = Number(event?.payload?.op_id ?? event?.payload?.opId ?? 0) || 0;
     if (!path || !previewPath) return;
     if (!activeCardsByPath.has(path)) return;
-    consumeOptimisticThumbRotationStep(path);
+    if (opId > 0) {
+      const latestOp = Number(latestCommittedRotateOpByPath.get(path) ?? 0) || 0;
+      if (opId >= latestOp) {
+        latestCommittedRotateOpByPath.set(path, opId);
+        optimisticThumbRotationByPath.delete(path);
+      }
+    }
+    let src = "";
+    try {
+      src = convertFileSrc(previewPath);
+    } catch {
+      src = "";
+    }
+    if (!src) return;
+    setThumbImage(path, activeCardsByPath, src, {
+      requestId: activeRequestId,
+      allowPathFallback: true,
+      previewQuality: "full",
+    });
+    applyThumbRotation(path, activeCardsByPath);
+  });
+  void listen("image-preview-rotation-committed", (event) => {
+    const path = normalizePath(event?.payload?.path ?? "");
+    const previewPath = normalizePath(event?.payload?.preview_path ?? event?.payload?.previewPath ?? "");
+    const opId = Number(event?.payload?.op_id ?? event?.payload?.opId ?? 0) || 0;
+    if (!path || !previewPath || !activeCardsByPath.has(path)) return;
+    const latestOp = Number(latestCommittedRotateOpByPath.get(path) ?? 0) || 0;
+    if (opId > 0 && opId < latestOp) return;
+    if (opId > 0) {
+      latestCommittedRotateOpByPath.set(path, opId);
+    }
+    optimisticThumbRotationByPath.delete(path);
+    applyThumbRotation(path, activeCardsByPath);
     let src = "";
     try {
       src = convertFileSrc(previewPath);
@@ -267,9 +301,14 @@ export function createTreatmentFilesPanel({
   void listen("image-preview-rotated", (event) => {
     const path = normalizePath(event?.payload?.path ?? "");
     const rotationDeg = Number(event?.payload?.rotation_deg ?? event?.payload?.rotationDeg ?? 0) || 0;
+    const opId = Number(event?.payload?.op_id ?? event?.payload?.opId ?? 0) || 0;
     if (!path) return;
     const normalizedRotation = ((rotationDeg % 360) + 360) % 360;
     if (!activeCardsByPath.has(path)) return;
+    if (opId > 0) {
+      const latestOp = Number(latestCommittedRotateOpByPath.get(path) ?? 0) || 0;
+      if (opId < latestOp) return;
+    }
     optimisticThumbRotationByPath.set(path, normalizedRotation);
     applyThumbRotation(path, activeCardsByPath);
   });
@@ -291,6 +330,7 @@ export function createTreatmentFilesPanel({
     activeLoadedFiles = [];
     activeFileOffset = 0;
     optimisticThumbRotationByPath.clear();
+    latestCommittedRotateOpByPath.clear();
     activeOverviewKeywords = [];
     panel.hidden = true;
     titleEl.textContent = "Treatment Files";
@@ -343,6 +383,7 @@ export function createTreatmentFilesPanel({
     loadMoreBtn.disabled = false;
     loadMoreBtn.onclick = null;
     optimisticThumbRotationByPath.clear();
+    latestCommittedRotateOpByPath.clear();
     activeOverviewKeywords = [];
     foldersOverviewGridEl.innerHTML = "";
     keywordsListEl.innerHTML = "";
@@ -1017,20 +1058,6 @@ export function createTreatmentFilesPanel({
   function normalizeRotationDeg(value = 0) {
     const n = Number(value) || 0;
     return ((n % 360) + 360) % 360;
-  }
-
-  function consumeOptimisticThumbRotationStep(path) {
-    const current = normalizeRotationDeg(optimisticThumbRotationByPath.get(path) ?? 0);
-    if (current === 0) {
-      optimisticThumbRotationByPath.delete(path);
-      return;
-    }
-    const next = normalizeRotationDeg(current - 90);
-    if (next === 0) {
-      optimisticThumbRotationByPath.delete(path);
-      return;
-    }
-    optimisticThumbRotationByPath.set(path, next);
   }
 
   function previewSrcFromRow(row) {
