@@ -76,6 +76,7 @@ export function initMainContent({
 }) {
   const mainCanvas = appView?.querySelector(".main-canvas") ?? null;
   let imagePreviewWindow = null;
+  let latestImagePreviewRequestId = 0;
   if (!mainCanvas) {
     return {
       mainCanvas: null,
@@ -141,6 +142,7 @@ export function initMainContent({
   const treatmentFilesPanel = createTreatmentFilesPanel({
     container: contentScrollLayer,
     onOpenPath: async (openRequest) => {
+      const requestId = ++latestImagePreviewRequestId;
       const path = typeof openRequest === "string"
         ? String(openRequest ?? "").trim()
         : String(openRequest?.path ?? "").trim();
@@ -163,21 +165,29 @@ export function initMainContent({
         : [];
 
       try {
-        if (scope === "treatment" && workspaceDir && patientFolder && treatmentFolder) {
+        if (
+          scope === "treatment" &&
+          workspaceDir &&
+          patientFolder &&
+          treatmentFolder &&
+          navigationPaths.length < 2
+        ) {
           const rows = await invoke("list_treatment_image_paths", {
             workspaceDir,
             patientFolder,
             treatmentFolder,
           });
+          if (requestId !== latestImagePreviewRequestId) return;
           const normalized = Array.isArray(rows)
             ? rows.map((entry) => String(entry ?? "").trim()).filter(Boolean)
             : [];
           if (normalized.length > 0) navigationPaths = normalized;
-        } else if (scope === "patient_root" && workspaceDir && patientFolder) {
+        } else if (scope === "patient_root" && workspaceDir && patientFolder && navigationPaths.length < 2) {
           const rows = await invoke("list_patient_root_image_paths", {
             workspaceDir,
             patientFolder,
           });
+          if (requestId !== latestImagePreviewRequestId) return;
           const normalized = Array.isArray(rows)
             ? rows.map((entry) => String(entry ?? "").trim()).filter(Boolean)
             : [];
@@ -190,6 +200,7 @@ export function initMainContent({
       if (!navigationPaths.includes(path)) {
         navigationPaths.unshift(path);
       }
+      if (requestId !== latestImagePreviewRequestId) return;
 
       try {
         const startedAt = performance.now();
@@ -202,6 +213,7 @@ export function initMainContent({
           path,
           navigationPaths,
         });
+        if (requestId !== latestImagePreviewRequestId) return;
         previewTrace("image", "set_image_preview_state invoke ok", {
           path,
           navCount: navigationPaths.length,
@@ -209,15 +221,35 @@ export function initMainContent({
           ms: Math.round(performance.now() - startedAt),
         });
         const existing = await WebviewWindow.getByLabel("image_preview");
+        if (requestId !== latestImagePreviewRequestId) return;
         if (existing) {
           imagePreviewWindow = existing;
         } else {
           imagePreviewWindow = await ensureImagePreviewWindow(imagePreviewWindow);
         }
+        if (requestId !== latestImagePreviewRequestId) return;
         const win = imagePreviewWindow ?? await WebviewWindow.getByLabel("image_preview");
         if (!win) return;
-        await win.show();
-        await win.emit("image-preview-file", { path, paths: navigationPaths });
+        try {
+          await win.show();
+        } catch (showErr) {
+          previewTrace("image", "window show skipped/failed", {
+            path,
+            navCount: navigationPaths.length,
+            scope,
+            err: String(showErr ?? ""),
+          });
+        }
+        if (requestId !== latestImagePreviewRequestId) return;
+        await win.emit("image-preview-file", {
+          path,
+          paths: navigationPaths,
+          workspaceDir,
+          patientFolder,
+          treatmentFolder,
+          scope,
+        });
+        if (requestId !== latestImagePreviewRequestId) return;
         previewTrace("image", "window show+emit done", {
           path,
           navCount: navigationPaths.length,

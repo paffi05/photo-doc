@@ -614,6 +614,7 @@ static IMPORT_JOB_COUNTER: AtomicU64 = AtomicU64::new(1);
 static IMPORT_ACTIVE_COUNT: AtomicU64 = AtomicU64::new(0);
 static FULL_TRACE_ENABLED: AtomicBool = AtomicBool::new(true);
 static PREVIEW_CACHE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ROTATE_IMAGE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static PREVIEW_FILL_RUNNING: AtomicBool = AtomicBool::new(false);
 static PREVIEW_FILL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
 static LOCAL_CACHE_COPY_RUNTIME: OnceLock<Mutex<LocalCacheCopyRuntime>> = OnceLock::new();
@@ -1346,6 +1347,10 @@ fn now_ms() -> u64 {
 
 fn preview_cache_lock() -> &'static Mutex<()> {
     PREVIEW_CACHE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn rotate_image_lock() -> &'static Mutex<()> {
+    ROTATE_IMAGE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn import_wizard_preview_path_store() -> &'static Mutex<String> {
@@ -4042,6 +4047,147 @@ fn copy_file_to_destination(source_path: String, destination_dir: String) -> Res
 }
 
 #[tauri::command]
+async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _rotate_guard = rotate_image_lock().lock().map_err(|e| e.to_string())?;
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err("path is required".to_string());
+        }
+        let source = PathBuf::from(&path);
+        if !source.exists() || !source.is_file() {
+            return Err("source file does not exist".to_string());
+        }
+        if !is_supported_preview_image(&source) {
+            return Err("unsupported image format".to_string());
+        }
+        let old_meta = fs::metadata(&source).map_err(|e| e.to_string())?;
+        let old_size = old_meta.len();
+        let old_modified_ms = old_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let format = match ext.as_str() {
+            "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+            "png" => image::ImageFormat::Png,
+            _ => return Err("unsupported image format".to_string()),
+        };
+
+        let decoded = image::ImageReader::open(&source)
+            .map_err(|e| e.to_string())?
+            .decode()
+            .map_err(|e| e.to_string())?;
+        let rotated = decoded.rotate90();
+
+        let tmp_path = source.with_extension(format!("{}.rotating", ext));
+        rotated
+            .save_with_format(&tmp_path, format)
+            .map_err(|e| e.to_string())?;
+        fs::rename(&tmp_path, &source).map_err(|e| e.to_string())?;
+
+        let new_meta = fs::metadata(&source).map_err(|e| e.to_string())?;
+        let new_size = new_meta.len();
+        let new_modified_ms = file_modified_ms(&source);
+
+        let settings = read_settings(&app_handle).unwrap_or_default();
+        let workspace_root = settings.workspace_dir
+            .as_ref()
+            .map(|v| PathBuf::from(v.trim()))
+            .filter(|p| p.exists() && p.is_dir());
+        let workspace_root_ref = workspace_root.as_deref();
+
+        // Keep DB file metadata in sync so future cache-key resolution cannot drift.
+        if let Some(workspace) = workspace_root_ref {
+            if source.starts_with(workspace) {
+                if let Some((patient_folder, treatment_folder, file_name)) =
+                    parse_workspace_file_index_key(workspace, &source)
+                {
+                    if let Ok(conn) = open_db(&app_handle) {
+                        let _ = conn.execute(
+                            "UPDATE patient_file_index
+                             SET size_bytes = ?1, modified_ms = ?2
+                             WHERE workspace_dir = ?3
+                               AND patient_folder = ?4
+                               AND treatment_folder = ?5
+                               AND file_name = ?6",
+                            params![
+                                new_size as i64,
+                                new_modified_ms as i64,
+                                workspace.to_string_lossy().to_string(),
+                                patient_folder,
+                                treatment_folder,
+                                file_name
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+
+        // Write rotated preview bytes directly to cache files (old and new key variants)
+        // across all relevant cache dirs so UI never flips back to stale orientation.
+        if let Ok(bytes) = generate_preview_cache_bytes(&source) {
+            let mut cache_dirs: Vec<PathBuf> = Vec::new();
+            cache_dirs.push(get_active_preview_cache_dir(&app_handle));
+            cache_dirs.push(preview_cache_dir_path(&app_handle));
+            if let Some(workspace) = workspace_root_ref {
+                cache_dirs.push(get_local_cache_copy_dir(workspace));
+            }
+
+            let mut seen_dirs = HashSet::new();
+            for cache_dir in cache_dirs {
+                let key = cache_dir.to_string_lossy().to_string();
+                if !seen_dirs.insert(key) {
+                    continue;
+                }
+                let _ = fs::create_dir_all(&cache_dir);
+                let old_path = resolve_existing_cache_file_path(
+                    &cache_dir,
+                    &source,
+                    workspace_root_ref,
+                    old_size,
+                    old_modified_ms,
+                );
+                let new_path = resolve_existing_cache_file_path(
+                    &cache_dir,
+                    &source,
+                    workspace_root_ref,
+                    new_size,
+                    new_modified_ms,
+                );
+                let _ = fs::write(&old_path, &bytes);
+                let _ = fs::write(&new_path, &bytes);
+            }
+        }
+
+        // Emit updated preview location for immediate thumbnail refresh in active views.
+        let rows = resolve_cached_previews(&app_handle, &[path.clone()], false, true).unwrap_or_default();
+        if let Some(row) = rows.into_iter().find(|entry| entry.path == path) {
+            if let Some(preview_path) = row.preview_path {
+                let _ = app_handle.emit(
+                    "import-preview-ready",
+                    json!({
+                        "path": path,
+                        "preview_path": preview_path,
+                    }),
+                );
+            }
+        }
+        Ok(true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
 fn copy_patient_folder_to_destination(
     workspace_dir: String,
     patient_folder: String,
@@ -4659,6 +4805,29 @@ fn preview_trace_client(scope: String, message: String) -> Result<bool, String> 
 }
 
 #[tauri::command]
+fn emit_image_preview_rotated(
+    app_handle: tauri::AppHandle,
+    path: String,
+    rotation_deg: i32,
+) -> Result<bool, String> {
+    let path = path.trim().to_string();
+    if path.is_empty() {
+        return Err("path is required".to_string());
+    }
+    let normalized = ((rotation_deg % 360) + 360) % 360;
+    app_handle
+        .emit(
+            "image-preview-rotated",
+            json!({
+                "path": path,
+                "rotation_deg": normalized,
+            }),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(true)
+}
+
+#[tauri::command]
 fn set_import_wizard_preview_state(
     path: String,
     navigation_paths: Option<Vec<String>>,
@@ -4998,6 +5167,44 @@ fn get_import_wizard_quick_preview_data_url(path: String) -> Result<String, Stri
     }
     generate_quick_preview_data_url(&source)
         .ok_or_else(|| "failed to generate quick preview".to_string())
+}
+
+#[tauri::command]
+fn save_import_wizard_preview_data_url_to_temp(
+    data_url: String,
+    file_ext: Option<String>,
+) -> Result<String, String> {
+    let data_url = data_url.trim().to_string();
+    if data_url.is_empty() {
+        return Err("data url is required".to_string());
+    }
+    let comma_idx = data_url
+        .find(',')
+        .ok_or_else(|| "invalid data url".to_string())?;
+    let b64 = data_url[(comma_idx + 1)..].trim();
+    if b64.is_empty() {
+        return Err("invalid data url payload".to_string());
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| e.to_string())?;
+    if bytes.is_empty() {
+        return Err("decoded image is empty".to_string());
+    }
+    let ext = file_ext
+        .unwrap_or_else(|| "jpg".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let safe_ext = if ext == "png" { "png" } else { "jpg" };
+    let file_name = format!(
+        "photo-doc-draw-{}-{}.{}",
+        std::process::id(),
+        now_ms(),
+        safe_ext
+    );
+    let out_path = std::env::temp_dir().join(file_name);
+    fs::write(&out_path, bytes).map_err(|e| e.to_string())?;
+    Ok(out_path.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -5720,6 +5927,8 @@ fn search_patients_page(
     offset: usize,
     limit: usize,
 ) -> Result<PatientSearchPageRow, String> {
+    let patient_name_sort_sql = "lower(replace(replace(replace(replace(replace(replace(replace(replace(last_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss'))";
+    let patient_first_sort_sql = "lower(replace(replace(replace(replace(replace(replace(replace(replace(first_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss'))";
     let conn = open_db(&app_handle)?;
     let q = query.trim().to_lowercase();
     let query_terms: Vec<String> = if q.is_empty() {
@@ -5752,7 +5961,9 @@ fn search_patients_page(
                 "SELECT folder_name, patient_id
                  FROM patient_index
                  WHERE workspace_dir = ?1
-                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+                 ORDER BY
+                 lower(replace(replace(replace(replace(replace(replace(replace(replace(last_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss')),
+                 lower(replace(replace(replace(replace(replace(replace(replace(replace(first_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss'))
                  LIMIT ?2 OFFSET ?3",
             )
             .map_err(|e| e.to_string())?;
@@ -5778,7 +5989,9 @@ fn search_patients_page(
                 "SELECT folder_name, patient_id
                  FROM patient_index
                  WHERE workspace_dir = ?1 AND search_text LIKE ?2
-                 ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+                 ORDER BY
+                 lower(replace(replace(replace(replace(replace(replace(replace(replace(last_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss')),
+                 lower(replace(replace(replace(replace(replace(replace(replace(replace(first_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss'))
                  LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| e.to_string())?;
@@ -5813,9 +6026,9 @@ fn search_patients_page(
         let limit_idx = query_terms.len() + 2;
         let offset_idx = query_terms.len() + 3;
         sql.push_str(&format!(
-            " ORDER BY last_name COLLATE NOCASE, first_name COLLATE NOCASE
+            " ORDER BY {}, {}
               LIMIT ?{} OFFSET ?{}",
-            limit_idx, offset_idx
+            patient_name_sort_sql, patient_first_sort_sql, limit_idx, offset_idx
         ));
         bind_values.push(rusqlite::types::Value::Integer(fetch_limit as i64));
         bind_values.push(rusqlite::types::Value::Integer(offset as i64));
@@ -7397,6 +7610,7 @@ pub fn run() {
             open_path_with_default,
             copy_treatment_folder_to_destination,
             copy_file_to_destination,
+            rotate_image_right_in_place,
             copy_patient_folder_to_destination,
             list_treatment_image_paths,
             list_patient_root_image_paths,
@@ -7408,8 +7622,10 @@ pub fn run() {
             open_image_preview_window,
             get_import_wizard_preview_data_url,
             get_import_wizard_quick_preview_data_url,
+            save_import_wizard_preview_data_url_to_temp,
             get_import_wizard_preview_src_path,
             preview_trace_client,
+            emit_image_preview_rotated,
             set_full_trace_enabled,
             get_full_trace_enabled,
             set_import_wizard_preview_state,

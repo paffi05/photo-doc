@@ -12,16 +12,35 @@ const getCurrentPathsCommand =
 
 const previewImage = document.getElementById("previewImage");
 const previewRoot = document.querySelector(".preview-root");
+const drawCanvas = document.getElementById("drawCanvas");
 const previewLoading = document.getElementById("previewLoading");
+const previewToolbar = document.getElementById("previewToolbar");
+const markBtn = document.getElementById("markBtn");
+const drawColorPicker = document.getElementById("drawColorPicker");
+const clearDrawBtn = document.getElementById("clearDrawBtn");
+const drawSaveWrap = document.getElementById("drawSaveWrap");
+const drawSaveInput = document.getElementById("drawSaveInput");
+const drawSaveDropdownBtn = document.getElementById("drawSaveDropdownBtn");
+const drawSaveSuggestions = document.getElementById("drawSaveSuggestions");
+const drawSaveSuggestionsList = document.getElementById("drawSaveSuggestionsList");
+const drawSaveBtn = document.getElementById("drawSaveBtn");
+const rotateRightBtn = document.getElementById("rotateRightBtn");
 const navPrevBtn = document.getElementById("navPrevBtn");
 const navNextBtn = document.getElementById("navNextBtn");
 let previewRequestToken = 0;
 let currentPreviewPath = "";
 let navigationPaths = [];
-let lastAppliedEventSignature = "";
 let currentScale = 1;
+let rotationDeg = 0;
 let translateX = 0;
 let translateY = 0;
+let controlsVisible = false;
+let markModeActive = false;
+let selectedDrawColor = "white";
+const pendingRotationStepsByPath = new Map();
+const rotateSaveTimerByPath = new Map();
+const rotateSaveRunningByPath = new Map();
+const ROTATE_SAVE_DEBOUNCE_MS = 800;
 let baseImageWidth = 0;
 let baseImageHeight = 0;
 const MIN_SCALE = 1;
@@ -35,6 +54,17 @@ let lastPanClientX = 0;
 let lastPanClientY = 0;
 let isMousePanning = false;
 let loadingVisibleSinceMs = 0;
+let isDrawingLine = false;
+let lastDrawPoint = null;
+let hasDrawnLines = false;
+let lineSegments = [];
+let saveModeActive = false;
+let availableTreatmentFolders = [];
+let selectedExistingTreatmentFolder = "";
+let saveDropdownOpen = false;
+let previewWorkspaceDir = "";
+let previewPatientFolder = "";
+let folderRefreshRequestId = 0;
 const PREVIEW_TRACE_FORWARD_TO_RUST = FULL_TRACE;
 
 function previewTrace(scope, message, extra = null) {
@@ -99,25 +129,36 @@ function setNavigationPaths(paths = []) {
   }
 }
 
-function buildEventSignature(path, paths = []) {
-  const safePath = normalizePath(path);
-  const safePaths = Array.isArray(paths)
-    ? paths.map((entry) => normalizePath(entry)).filter((entry) => entry.length > 0)
-    : [];
-  return `${safePath}::${safePaths.join("|")}`;
-}
-
 function clampScale(scale) {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, Number(scale) || MIN_SCALE));
 }
 
+function isQuarterTurnOdd() {
+  const normalized = ((rotationDeg % 360) + 360) % 360;
+  return normalized === 90 || normalized === 270;
+}
+
+function getEffectiveBaseImageSize() {
+  if (isQuarterTurnOdd()) {
+    return {
+      width: baseImageHeight,
+      height: baseImageWidth,
+    };
+  }
+  return {
+    width: baseImageWidth,
+    height: baseImageHeight,
+  };
+}
+
 function getPanLimits(scale = currentScale) {
   const { width: rootWidth, height: rootHeight } = getRootSize();
-  if (rootWidth <= 0 || rootHeight <= 0 || baseImageWidth <= 0 || baseImageHeight <= 0) {
+  const effectiveBase = getEffectiveBaseImageSize();
+  if (rootWidth <= 0 || rootHeight <= 0 || effectiveBase.width <= 0 || effectiveBase.height <= 0) {
     return { maxX: 0, maxY: 0 };
   }
-  const scaledWidth = baseImageWidth * scale;
-  const scaledHeight = baseImageHeight * scale;
+  const scaledWidth = effectiveBase.width * scale;
+  const scaledHeight = effectiveBase.height * scale;
   return {
     maxX: Math.max(0, (scaledWidth - rootWidth) / 2),
     maxY: Math.max(0, (scaledHeight - rootHeight) / 2),
@@ -142,8 +183,406 @@ function updatePanCursorState() {
 
 function applyTransform() {
   if (!previewImage) return;
-  previewImage.style.transform = `translate(${translateX}px, ${translateY}px) scale(${currentScale})`;
+  previewImage.style.transform =
+    `translate(${translateX}px, ${translateY}px) rotate(${rotationDeg}deg) scale(${currentScale})`;
   updatePanCursorState();
+}
+
+function drawColorToCss(color) {
+  if (color === "red") return "#e3342f";
+  if (color === "blue") return "#2563eb";
+  return "#ffffff";
+}
+
+function resizeDrawCanvas() {
+  if (!drawCanvas || !previewRoot) return;
+  const rect = previewRoot.getBoundingClientRect();
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const w = Math.max(1, Math.round(rect.width * dpr));
+  const h = Math.max(1, Math.round(rect.height * dpr));
+  if (drawCanvas.width !== w) drawCanvas.width = w;
+  if (drawCanvas.height !== h) drawCanvas.height = h;
+  drawCanvas.style.width = `${Math.round(rect.width)}px`;
+  drawCanvas.style.height = `${Math.round(rect.height)}px`;
+}
+
+function clearDrawCanvas() {
+  if (!drawCanvas) return;
+  const ctx = drawCanvas.getContext("2d");
+  if (!ctx) return;
+  ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  hasDrawnLines = false;
+  lineSegments = [];
+  previewToolbar?.classList.remove("has-lines");
+  setSaveModeActive(false);
+}
+
+function drawPointFromClient(clientX, clientY) {
+  if (!drawCanvas || !previewRoot) return null;
+  const rect = previewRoot.getBoundingClientRect();
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const sx = drawCanvas.width / rect.width;
+  const sy = drawCanvas.height / rect.height;
+  return {
+    x: (clientX - rect.left) * sx,
+    y: (clientY - rect.top) * sy,
+  };
+}
+
+function continueDrawingTo(clientX, clientY) {
+  if (!drawCanvas || !isDrawingLine || !lastDrawPoint) return;
+  const next = drawPointFromClient(clientX, clientY);
+  if (!next) return;
+  const ctx = drawCanvas.getContext("2d");
+  if (!ctx) return;
+  ctx.strokeStyle = drawColorToCss(selectedDrawColor);
+  ctx.lineWidth = Math.max(2, Math.round((window.devicePixelRatio || 1) * 2.2));
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(lastDrawPoint.x, lastDrawPoint.y);
+  ctx.lineTo(next.x, next.y);
+  ctx.stroke();
+  lineSegments.push({
+    color: selectedDrawColor,
+    x1: lastDrawPoint.x,
+    y1: lastDrawPoint.y,
+    x2: next.x,
+    y2: next.y,
+  });
+  if (!hasDrawnLines) {
+    hasDrawnLines = true;
+    previewToolbar?.classList.add("has-lines");
+  }
+  lastDrawPoint = next;
+}
+
+function normalizeRotationSteps(value) {
+  const n = Number(value) || 0;
+  const mod = ((n % 4) + 4) % 4;
+  return mod;
+}
+
+function getPendingRotationDeg(path) {
+  const key = normalizePath(path);
+  if (!key) return 0;
+  const steps = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
+  return steps * 90;
+}
+
+function addPendingRotationStep(path) {
+  const key = normalizePath(path);
+  if (!key) return;
+  const next = normalizeRotationSteps((pendingRotationStepsByPath.get(key) ?? 0) + 1);
+  if (next === 0) {
+    pendingRotationStepsByPath.delete(key);
+    return;
+  }
+  pendingRotationStepsByPath.set(key, next);
+}
+
+function consumePendingRotationStep(path) {
+  const key = normalizePath(path);
+  if (!key) return;
+  const current = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
+  if (current === 0) {
+    pendingRotationStepsByPath.delete(key);
+    return;
+  }
+  const next = normalizeRotationSteps(current - 1);
+  if (next === 0) {
+    pendingRotationStepsByPath.delete(key);
+    return;
+  }
+  pendingRotationStepsByPath.set(key, next);
+}
+
+async function flushPendingRotationSave(path) {
+  const key = normalizePath(path);
+  if (!key) return;
+  if (rotateSaveRunningByPath.get(key)) return;
+  const steps = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
+  if (steps === 0) return;
+
+  rotateSaveRunningByPath.set(key, true);
+  try {
+    for (let i = 0; i < steps; i += 1) {
+      // Persist only net pending rotation.
+      await invoke("rotate_image_right_in_place", { path: key });
+      consumePendingRotationStep(key);
+    }
+    previewTrace("rotate", "debounced rotate save ok", { path: key, steps });
+  } catch (err) {
+    previewTrace("rotate", "debounced rotate save failed", {
+      path: key,
+      err: String(err ?? ""),
+    });
+    console.error("debounced rotate save failed:", err);
+  } finally {
+    rotateSaveRunningByPath.set(key, false);
+    const remaining = normalizeRotationSteps(pendingRotationStepsByPath.get(key) ?? 0);
+    if (remaining > 0) {
+      schedulePendingRotationSave(key);
+    }
+  }
+}
+
+function schedulePendingRotationSave(path) {
+  const key = normalizePath(path);
+  if (!key) return;
+  const existingTimer = rotateSaveTimerByPath.get(key);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+  const timerId = setTimeout(() => {
+    rotateSaveTimerByPath.delete(key);
+    void flushPendingRotationSave(key);
+  }, ROTATE_SAVE_DEBOUNCE_MS);
+  rotateSaveTimerByPath.set(key, timerId);
+}
+
+function setControlsVisible(visible) {
+  controlsVisible = Boolean(visible);
+  previewRoot?.classList.toggle("controls-visible", controlsVisible);
+  previewToolbar?.setAttribute("aria-hidden", controlsVisible ? "false" : "true");
+}
+
+function toggleControlsVisible() {
+  setControlsVisible(!controlsVisible);
+}
+
+function setMarkModeActive(active) {
+  markModeActive = Boolean(active);
+  markBtn?.classList.toggle("active", markModeActive);
+  markBtn?.setAttribute("aria-pressed", markModeActive ? "true" : "false");
+  previewRoot?.classList.toggle("draw-mode", markModeActive);
+  if (!markModeActive) {
+    isDrawingLine = false;
+    lastDrawPoint = null;
+    previewToolbar?.classList.remove("has-lines");
+    setSaveModeActive(false);
+  }
+}
+
+function setSaveModeActive(active) {
+  saveModeActive = Boolean(active);
+  previewToolbar?.classList.toggle("save-mode", saveModeActive);
+  if (drawSaveBtn) {
+    drawSaveBtn.textContent = saveModeActive ? "Done" : "Save";
+  }
+  if (!saveModeActive) {
+    setSaveDropdownOpen(false);
+    if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
+    selectedExistingTreatmentFolder = "";
+    if (drawSaveInput) drawSaveInput.classList.remove("is-existing-selected");
+    return;
+  }
+  availableTreatmentFolders = [];
+  folderRefreshRequestId += 1;
+  if (drawSaveDropdownBtn) drawSaveDropdownBtn.hidden = true;
+  setSaveDropdownOpen(false);
+  if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
+  void refreshAvailableTreatmentFolders();
+  requestAnimationFrame(() => {
+    drawSaveInput?.focus();
+    drawSaveInput?.select();
+  });
+}
+
+function isLikelyPatientFolderName(name) {
+  const value = String(name ?? "").trim();
+  return value.includes(",") && value.length > 2;
+}
+
+async function refreshAvailableTreatmentFolders() {
+  const requestId = ++folderRefreshRequestId;
+  if ((!previewWorkspaceDir || !previewPatientFolder) && currentPreviewPath) {
+    try {
+      const settings = await invoke("load_settings");
+      const workspaceRaw = String(
+        settings?.workspace_dir ?? settings?.workspaceDir ?? ""
+      ).trim();
+      if (workspaceRaw) {
+        const ws = workspaceRaw.replace(/\\/g, "/").replace(/\/+$/, "");
+        const filePath = String(currentPreviewPath).replace(/\\/g, "/");
+        const prefix = `${ws}/`;
+        if (filePath.startsWith(prefix)) {
+          const relative = filePath.slice(prefix.length);
+          const patient = String(relative.split("/")[0] ?? "").trim();
+          if (patient && isLikelyPatientFolderName(patient)) {
+            previewWorkspaceDir = workspaceRaw;
+            previewPatientFolder = patient;
+          }
+        }
+      }
+    } catch {
+      // keep existing context values on fallback failure
+    }
+  }
+
+  if (!previewWorkspaceDir || !previewPatientFolder || !isLikelyPatientFolderName(previewPatientFolder)) {
+    availableTreatmentFolders = [];
+    if (requestId !== folderRefreshRequestId) return;
+    renderSaveDropdown(String(drawSaveInput?.value ?? "").trim());
+    return;
+  }
+  try {
+    const rows = await invoke("list_patient_treatment_folders", {
+      workspaceDir: previewWorkspaceDir,
+      patientFolder: previewPatientFolder,
+    });
+    availableTreatmentFolders = Array.isArray(rows)
+      ? rows.map((entry) => String(entry ?? "").trim()).filter(Boolean)
+      : [];
+    if (requestId !== folderRefreshRequestId) return;
+    if (saveModeActive) {
+      renderSaveDropdown(drawSaveInput?.value ?? "");
+    }
+  } catch {
+    availableTreatmentFolders = [];
+    if (requestId !== folderRefreshRequestId) return;
+    renderSaveDropdown(String(drawSaveInput?.value ?? "").trim());
+  }
+}
+
+function setSaveDropdownOpen(open) {
+  saveDropdownOpen = Boolean(open);
+  if (drawSaveSuggestions) {
+    drawSaveSuggestions.hidden = !saveDropdownOpen;
+  }
+  if (drawSaveDropdownBtn) {
+    drawSaveDropdownBtn.setAttribute("aria-expanded", saveDropdownOpen ? "true" : "false");
+  }
+}
+
+function clearSelectedExistingTreatmentFolder(clearInput = false) {
+  selectedExistingTreatmentFolder = "";
+  if (drawSaveInput) {
+    drawSaveInput.classList.remove("is-existing-selected");
+    if (clearInput) drawSaveInput.value = "";
+  }
+}
+
+function selectExistingTreatmentFolder(folderName) {
+  const selected = String(folderName ?? "").trim();
+  if (!selected) return;
+  selectedExistingTreatmentFolder = selected;
+  if (drawSaveInput) {
+    drawSaveInput.value = selected;
+    drawSaveInput.classList.add("is-existing-selected");
+  }
+}
+
+function getFilteredTreatmentFolders(filterText = "") {
+  const folders = Array.isArray(availableTreatmentFolders) ? availableTreatmentFolders : [];
+  const needle = String(filterText ?? "").trim().toLowerCase();
+  if (!needle) return folders;
+  return folders.filter((name) => String(name ?? "").toLowerCase().includes(needle));
+}
+
+function renderSaveDropdown(filterText = "") {
+  if (!drawSaveSuggestionsList || !drawSaveDropdownBtn) return;
+  drawSaveSuggestionsList.innerHTML = "";
+  const allFolders = Array.isArray(availableTreatmentFolders) ? availableTreatmentFolders : [];
+  const folders = getFilteredTreatmentFolders(filterText);
+  drawSaveDropdownBtn.hidden = allFolders.length < 1;
+  if (allFolders.length < 1) {
+    setSaveDropdownOpen(false);
+    return;
+  }
+  if (folders.length < 1) {
+    setSaveDropdownOpen(false);
+    return;
+  }
+  for (const folder of folders) {
+    const name = String(folder ?? "").trim();
+    if (!name) continue;
+    const li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "draw-save-suggestion";
+    if (name === selectedExistingTreatmentFolder) {
+      btn.classList.add("is-selected");
+    }
+    btn.textContent = name;
+    btn.title = name;
+    btn.addEventListener("click", () => {
+      selectExistingTreatmentFolder(name);
+      setSaveDropdownOpen(false);
+    });
+    li.appendChild(btn);
+    drawSaveSuggestionsList.appendChild(li);
+  }
+}
+
+function currentDateYmd() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+async function exportAnnotatedTempFile() {
+  if (!drawCanvas || !currentPreviewPath) {
+    throw new Error("missing preview state");
+  }
+  const ext = String(currentPreviewPath.split(".").pop() ?? "").toLowerCase();
+  const mime = ext === "png" ? "image/png" : "image/jpeg";
+  const outExt = ext === "png" ? "png" : "jpg";
+  const loadBaseImage = (src) =>
+    new Promise((resolve, reject) => {
+      const img = new Image();
+      img.decoding = "async";
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("base image load failed"));
+      img.src = src;
+    });
+  let baseImage = null;
+  try {
+    baseImage = await loadBaseImage(`${convertFileSrc(currentPreviewPath)}?t=${Date.now()}`);
+  } catch {
+    const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: currentPreviewPath });
+    baseImage = await loadBaseImage(String(dataUrl ?? ""));
+  }
+  const targetCanvas = document.createElement("canvas");
+  const w = Math.max(1, Number(baseImage?.naturalWidth) || 0);
+  const h = Math.max(1, Number(baseImage?.naturalHeight) || 0);
+  targetCanvas.width = w;
+  targetCanvas.height = h;
+  const ctx = targetCanvas.getContext("2d");
+  if (!ctx) throw new Error("2d context unavailable");
+  ctx.drawImage(baseImage, 0, 0, w, h);
+
+  const viewW = Math.max(1, drawCanvas.width);
+  const viewH = Math.max(1, drawCanvas.height);
+  for (const seg of lineSegments) {
+    ctx.strokeStyle = drawColorToCss(seg.color);
+    ctx.lineWidth = Math.max(2, Math.round((w / viewW) * 2.4));
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo((seg.x1 / viewW) * w, (seg.y1 / viewH) * h);
+    ctx.lineTo((seg.x2 / viewW) * w, (seg.y2 / viewH) * h);
+    ctx.stroke();
+  }
+
+  const dataUrl = targetCanvas.toDataURL(mime, 0.95);
+  return await invoke("save_import_wizard_preview_data_url_to_temp", {
+    dataUrl,
+    fileExt: outExt,
+  });
+}
+
+function setSelectedDrawColor(color) {
+  const next = ["white", "red", "blue"].includes(String(color)) ? String(color) : "white";
+  selectedDrawColor = next;
+  const dots = Array.from(drawColorPicker?.querySelectorAll(".draw-color-dot") ?? []);
+  for (const dot of dots) {
+    const isActive = String(dot?.dataset?.color ?? "") === selectedDrawColor;
+    dot.classList.toggle("active", isActive);
+    dot.setAttribute("aria-pressed", isActive ? "true" : "false");
+  }
 }
 
 function setScaleAt(nextScale, clientX, clientY) {
@@ -196,6 +635,7 @@ function updateBaseImageSize() {
 
 function resetTransform() {
   currentScale = MIN_SCALE;
+  rotationDeg = 0;
   translateX = 0;
   translateY = 0;
   pinchStartDistance = 0;
@@ -290,6 +730,9 @@ async function setPreview(path) {
   previewTrace("setPreview", "start", { path: normalized });
   currentPreviewPath = normalized;
   resetTransform();
+  clearDrawCanvas();
+  rotationDeg = getPendingRotationDeg(normalized);
+  applyTransform();
   updateNavigationButtons();
   const requestToken = ++previewRequestToken;
   showLoading(requestToken);
@@ -419,6 +862,7 @@ window.addEventListener("keydown", (event) => {
 });
 
 previewRoot?.addEventListener("wheel", (event) => {
+  if (markModeActive) return;
   event.preventDefault();
   const delta = Number(event.deltaY) || 0;
   if (!Number.isFinite(delta) || delta === 0) return;
@@ -428,7 +872,9 @@ previewRoot?.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 previewRoot?.addEventListener("pointerdown", (event) => {
+  if (markModeActive) return;
   if (event.target instanceof Element && event.target.closest(".preview-nav")) return;
+  if (event.target instanceof Element && event.target.closest(".preview-toolbar")) return;
 
   if (event.pointerType === "touch") {
     activeTouchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -461,6 +907,7 @@ previewRoot?.addEventListener("pointerdown", (event) => {
 });
 
 previewRoot?.addEventListener("pointermove", (event) => {
+  if (markModeActive) return;
   if (event.pointerType === "touch") {
     if (!activeTouchPoints.has(event.pointerId)) return;
     activeTouchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -548,6 +995,7 @@ previewRoot?.addEventListener("pointerleave", (event) => {
 });
 
 window.addEventListener("resize", () => {
+  resizeDrawCanvas();
   updateBaseImageSize();
   const clamped = clampTranslation(translateX, translateY);
   translateX = clamped.x;
@@ -555,28 +1003,213 @@ window.addEventListener("resize", () => {
   applyTransform();
 });
 
+window.addEventListener("pointerdown", (event) => {
+  if (!saveDropdownOpen) return;
+  const target = event.target;
+  if (!(target instanceof Node)) {
+    setSaveDropdownOpen(false);
+    return;
+  }
+  if (drawSaveWrap?.contains(target)) return;
+  setSaveDropdownOpen(false);
+});
+
+previewRoot?.addEventListener("click", (event) => {
+  if (!(event.target instanceof Element)) return;
+  if (event.target.closest(".draw-canvas")) return;
+  if (event.target.closest(".preview-nav")) return;
+  if (event.target.closest(".preview-toolbar")) return;
+  if (event.target.closest(".preview-loading")) return;
+  toggleControlsVisible();
+});
+
+rotateRightBtn?.addEventListener("click", () => {
+  if (!currentPreviewPath) return;
+  const path = currentPreviewPath;
+  addPendingRotationStep(path);
+  rotationDeg = getPendingRotationDeg(path);
+  const clamped = clampTranslation(translateX, translateY);
+  translateX = clamped.x;
+  translateY = clamped.y;
+  applyTransform();
+  void invoke("emit_image_preview_rotated", {
+    path,
+    rotationDeg,
+  }).catch(() => {});
+  schedulePendingRotationSave(path);
+});
+
+markBtn?.addEventListener("click", () => {
+  setMarkModeActive(!markModeActive);
+});
+
+drawColorPicker?.addEventListener("click", (event) => {
+  const dot = event.target instanceof Element ? event.target.closest(".draw-color-dot") : null;
+  if (!dot) return;
+  setSelectedDrawColor(dot.dataset.color ?? "white");
+});
+
+clearDrawBtn?.addEventListener("click", () => {
+  clearDrawCanvas();
+});
+
+drawSaveInput?.addEventListener("input", () => {
+  if (!saveModeActive) return;
+  if (selectedExistingTreatmentFolder) {
+    clearSelectedExistingTreatmentFolder(false);
+  }
+  renderSaveDropdown(drawSaveInput.value);
+});
+
+drawSaveInput?.addEventListener("focus", () => {
+  if (!saveModeActive) return;
+  if (selectedExistingTreatmentFolder) {
+    clearSelectedExistingTreatmentFolder(true);
+  }
+  renderSaveDropdown(drawSaveInput.value);
+  if (getFilteredTreatmentFolders(drawSaveInput.value).length > 0) {
+    setSaveDropdownOpen(true);
+  }
+});
+
+drawSaveInput?.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") {
+    setSaveDropdownOpen(false);
+  }
+});
+
+drawSaveDropdownBtn?.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  if (!saveModeActive) return;
+  void (async () => {
+    await refreshAvailableTreatmentFolders();
+    const filterValue = String(drawSaveInput?.value ?? "").trim();
+    const matches = getFilteredTreatmentFolders(filterValue);
+    renderSaveDropdown(filterValue);
+    if (!matches.length) {
+      setSaveDropdownOpen(false);
+      return;
+    }
+    setSaveDropdownOpen(!saveDropdownOpen);
+  })();
+});
+
+drawSaveBtn?.addEventListener("click", () => {
+  if (!hasDrawnLines) return;
+  if (!saveModeActive) {
+    setSaveModeActive(true);
+    renderSaveDropdown(drawSaveInput?.value ?? "");
+    return;
+  }
+  if (!previewWorkspaceDir || !previewPatientFolder) return;
+  const typed = String(drawSaveInput?.value ?? "").trim();
+  if (!typed) return;
+  drawSaveBtn.disabled = true;
+  void (async () => {
+    try {
+      const tempPath = await exportAnnotatedTempFile();
+      const existingMatch = availableTreatmentFolders.find(
+        (name) => name.toLowerCase() === typed.toLowerCase()
+      ) ?? "";
+      const result = await invoke("start_import_files", {
+        workspaceDir: previewWorkspaceDir,
+        patientFolder: previewPatientFolder,
+        existingFolder: existingMatch || null,
+        date: existingMatch ? null : currentDateYmd(),
+        treatmentName: existingMatch ? null : typed,
+        filePaths: [tempPath],
+        deleteOrigin: true,
+        importWizardDir: null,
+      });
+      const startedJobId = Number(result?.job_id ?? result?.jobId ?? 0) || null;
+      const startedTargetFolder = String(result?.target_folder ?? result?.targetFolder ?? "").trim();
+      await invoke("notify_import_wizard_completed", {
+        workspaceDir: previewWorkspaceDir,
+        patientFolder: previewPatientFolder,
+        targetFolder: startedTargetFolder,
+        jobId: startedJobId,
+        importWizardDir: null,
+      }).catch(() => {});
+      clearDrawCanvas();
+      setSaveModeActive(false);
+      setMarkModeActive(false);
+    } catch (err) {
+      console.error("save drawn image import failed:", err);
+    } finally {
+      drawSaveBtn.disabled = false;
+    }
+  })();
+});
+
+drawCanvas?.addEventListener("pointerdown", (event) => {
+  if (!markModeActive) return;
+  if (event.button !== undefined && event.button !== 0) return;
+  event.preventDefault();
+  resizeDrawCanvas();
+  const start = drawPointFromClient(event.clientX, event.clientY);
+  if (!start) return;
+  isDrawingLine = true;
+  lastDrawPoint = start;
+  drawCanvas.setPointerCapture?.(event.pointerId);
+});
+
+drawCanvas?.addEventListener("pointermove", (event) => {
+  if (!markModeActive || !isDrawingLine) return;
+  event.preventDefault();
+  continueDrawingTo(event.clientX, event.clientY);
+});
+
+function stopDrawing(pointerId = null) {
+  if (!isDrawingLine) return;
+  isDrawingLine = false;
+  lastDrawPoint = null;
+  if (pointerId !== null) {
+    drawCanvas?.releasePointerCapture?.(pointerId);
+  }
+}
+
+drawCanvas?.addEventListener("pointerup", (event) => {
+  stopDrawing(event.pointerId);
+});
+
+drawCanvas?.addEventListener("pointercancel", (event) => {
+  stopDrawing(event.pointerId);
+});
+
 void listen(previewEventName, (event) => {
   const path = normalizePath(event?.payload?.path);
   const paths = Array.isArray(event?.payload?.paths) ? event.payload.paths : [];
+  const workspaceDir = normalizePath(event?.payload?.workspaceDir ?? "");
+  const patientFolder = normalizePath(event?.payload?.patientFolder ?? "");
   previewTrace("event", "preview event received", {
     path,
     navCount: paths.length,
   });
-  const signature = buildEventSignature(path, paths);
-  if (signature && signature === lastAppliedEventSignature) {
-    previewTrace("event", "event ignored (same signature)");
-    return;
-  }
-  lastAppliedEventSignature = signature;
   setNavigationPaths(paths);
+  previewWorkspaceDir = workspaceDir;
+  previewPatientFolder = patientFolder;
+  availableTreatmentFolders = [];
+  folderRefreshRequestId += 1;
+  if (drawSaveDropdownBtn) drawSaveDropdownBtn.hidden = true;
+  setSaveDropdownOpen(false);
+  if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
   if (path && !navigationPaths.includes(path)) {
     navigationPaths.unshift(path);
   }
+  if (!path) {
+    updateNavigationButtons();
+    return;
+  }
   void setPreview(path);
+  void refreshAvailableTreatmentFolders();
 });
 
 void (async () => {
   try {
+    resizeDrawCanvas();
+    setSelectedDrawColor("white");
+    setControlsVisible(false);
     const navStart = performance.now();
     const navPaths = await invoke(getCurrentPathsCommand);
     previewTrace("bootstrap", "getCurrentPaths ok", {
@@ -597,7 +1230,6 @@ void (async () => {
       if (!navigationPaths.includes(normalized)) {
         navigationPaths.unshift(normalized);
       }
-      lastAppliedEventSignature = buildEventSignature(normalized, navigationPaths);
       await setPreview(normalized);
     } else {
       updateNavigationButtons();

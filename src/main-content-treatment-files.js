@@ -188,6 +188,7 @@ export function createTreatmentFilesPanel({
   let activeImageFiles = [];
   let activeLoadedFiles = [];
   let activeFileOffset = 0;
+  const optimisticThumbRotationByPath = new Map();
   let previewLoadingStatus = { running: false, completed: 0, total: 0 };
   let activeOverviewKeywords = [];
 
@@ -249,6 +250,7 @@ export function createTreatmentFilesPanel({
     const previewPath = normalizePath(event?.payload?.preview_path ?? event?.payload?.previewPath ?? "");
     if (!path || !previewPath) return;
     if (!activeCardsByPath.has(path)) return;
+    consumeOptimisticThumbRotationStep(path);
     let src = "";
     try {
       src = convertFileSrc(previewPath);
@@ -261,6 +263,15 @@ export function createTreatmentFilesPanel({
       allowPathFallback: true,
       previewQuality: "full",
     });
+  });
+  void listen("image-preview-rotated", (event) => {
+    const path = normalizePath(event?.payload?.path ?? "");
+    const rotationDeg = Number(event?.payload?.rotation_deg ?? event?.payload?.rotationDeg ?? 0) || 0;
+    if (!path) return;
+    const normalizedRotation = ((rotationDeg % 360) + 360) % 360;
+    if (!activeCardsByPath.has(path)) return;
+    optimisticThumbRotationByPath.set(path, normalizedRotation);
+    applyThumbRotation(path, activeCardsByPath);
   });
   void (async () => {
     try {
@@ -279,6 +290,7 @@ export function createTreatmentFilesPanel({
     activeImageFiles = [];
     activeLoadedFiles = [];
     activeFileOffset = 0;
+    optimisticThumbRotationByPath.clear();
     activeOverviewKeywords = [];
     panel.hidden = true;
     titleEl.textContent = "Treatment Files";
@@ -330,6 +342,7 @@ export function createTreatmentFilesPanel({
     loadMoreBtn.hidden = true;
     loadMoreBtn.disabled = false;
     loadMoreBtn.onclick = null;
+    optimisticThumbRotationByPath.clear();
     activeOverviewKeywords = [];
     foldersOverviewGridEl.innerHTML = "";
     keywordsListEl.innerHTML = "";
@@ -985,7 +998,39 @@ export function createTreatmentFilesPanel({
     runtimePreviewByPath.delete(path);
     thumb.classList.remove("loading");
     thumb.classList.add("fallback");
+    thumb.style.transform = "";
     thumb.textContent = "IMG";
+  }
+
+  function applyThumbRotation(path, cardsByPath) {
+    const card = cardsByPath.get(path);
+    const thumb = card?.querySelector(".treatment-image-thumb");
+    if (!thumb) return;
+    const rotationDeg = Number(optimisticThumbRotationByPath.get(path) ?? 0) || 0;
+    if (rotationDeg === 0) {
+      thumb.style.transform = "";
+      return;
+    }
+    thumb.style.transform = `rotate(${rotationDeg}deg)`;
+  }
+
+  function normalizeRotationDeg(value = 0) {
+    const n = Number(value) || 0;
+    return ((n % 360) + 360) % 360;
+  }
+
+  function consumeOptimisticThumbRotationStep(path) {
+    const current = normalizeRotationDeg(optimisticThumbRotationByPath.get(path) ?? 0);
+    if (current === 0) {
+      optimisticThumbRotationByPath.delete(path);
+      return;
+    }
+    const next = normalizeRotationDeg(current - 90);
+    if (next === 0) {
+      optimisticThumbRotationByPath.delete(path);
+      return;
+    }
+    optimisticThumbRotationByPath.set(path, next);
   }
 
   function previewSrcFromRow(row) {
@@ -1059,6 +1104,7 @@ export function createTreatmentFilesPanel({
       thumb.classList.remove("fallback");
       thumb.innerHTML = "";
       thumb.appendChild(img);
+      applyThumbRotation(path, cardsByPath);
     };
 
     img.addEventListener("load", showLoadedImage, { once: true });
@@ -1402,10 +1448,17 @@ export function createTreatmentFilesPanel({
       loadMoreBtn.onclick = null;
     }
 
+    const treatmentImagePaths = imageFiles
+      .map((file) => normalizePath(file?.path ?? ""))
+      .filter((path) => path.length > 0);
+
     const cardsByPath = new Map();
     if (useListView) {
       for (const file of files) {
-        const row = createFileListRow(file, { scope: "treatment" });
+        const row = createFileListRow(file, {
+          scope: "treatment",
+          navigationPaths: treatmentImagePaths,
+        });
         listEl.appendChild(row);
         if (Boolean(file?.is_image ?? file?.isImage)) {
           const path = normalizePath(file?.path ?? "");
@@ -1415,7 +1468,10 @@ export function createTreatmentFilesPanel({
     } else {
       renderOtherFiles(otherFiles, { scope: "treatment" });
       for (const file of imageFiles) {
-        const card = createImageCard(file, { scope: "treatment" });
+        const card = createImageCard(file, {
+          scope: "treatment",
+          navigationPaths: treatmentImagePaths,
+        });
         const path = normalizePath(file?.path ?? "");
         if (path) cardsByPath.set(path, card);
         imagesGridEl.appendChild(card);
@@ -1440,7 +1496,7 @@ export function createTreatmentFilesPanel({
     const initial = needsLoad.slice(VISIBLE_FIRST_IMAGE_COUNT, INITIAL_IMAGE_PREVIEWS);
     const rest = needsLoad.slice(INITIAL_IMAGE_PREVIEWS);
 
-    const allImagePaths = imageFiles.map((f) => normalizePath(f?.path ?? "")).filter((p) => p.length > 0);
+    const allImagePaths = treatmentImagePaths;
     let existingCacheByPath = new Map();
     if (allImagePaths.length > 0) {
       setPreviewCacheCheckStatus();
