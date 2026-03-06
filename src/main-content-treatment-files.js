@@ -1424,6 +1424,9 @@ export function createTreatmentFilesPanel({
     const optimisticPaths = !append && Array.isArray(options?.optimisticPaths)
       ? options.optimisticPaths.map((path) => normalizePath(path)).filter((path) => path.length > 0)
       : [];
+    let optimisticRendered = false;
+    let optimisticImageCount = 0;
+    let optimisticOtherCount = 0;
     if (!append && optimisticPaths.length < 1) {
       setLoadingState(t);
     }
@@ -1442,6 +1445,9 @@ export function createTreatmentFilesPanel({
       });
       const optimisticImageFiles = optimisticFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage));
       const optimisticOtherFiles = optimisticFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage));
+      optimisticRendered = true;
+      optimisticImageCount = optimisticImageFiles.length;
+      optimisticOtherCount = optimisticOtherFiles.length;
 
       loadingEl.hidden = true;
       emptyEl.hidden = optimisticFiles.length > 0;
@@ -1538,6 +1544,14 @@ export function createTreatmentFilesPanel({
 
     const imageFiles = files.filter((f) => Boolean(f?.is_image ?? f?.isImage));
     const otherFiles = files.filter((f) => !Boolean(f?.is_image ?? f?.isImage));
+
+    if (files.length < 1 && optimisticRendered) {
+      // Keep optimistic import placeholders visible while file index catches up.
+      loadingEl.hidden = true;
+      emptyEl.hidden = true;
+      countsEl.textContent = `${optimisticImageCount} images, ${optimisticOtherCount} other files`;
+      return;
+    }
 
     loadingEl.hidden = true;
     emptyEl.hidden = files.length > 0;
