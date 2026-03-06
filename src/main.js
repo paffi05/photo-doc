@@ -4017,6 +4017,10 @@ void listen("import-wizard-completed", async (event) => {
     event?.payload?.importWizardDir ??
     "",
   ).trim();
+  const plannedPathsRaw = event?.payload?.planned_paths ?? event?.payload?.plannedPaths;
+  const plannedPaths = Array.isArray(plannedPathsRaw)
+    ? plannedPathsRaw.map((p) => String(p ?? "").trim()).filter(Boolean)
+    : [];
   if (!workspace || !patient) return;
   if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
 
@@ -4029,6 +4033,7 @@ void listen("import-wizard-completed", async (event) => {
       targetFolder,
       workspaceDir: workspace,
       patientFolder: patient,
+      plannedPaths,
     });
   } else {
     void mainContent.refreshTimelineForSelection();

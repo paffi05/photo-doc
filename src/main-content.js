@@ -723,7 +723,7 @@ export function initMainContent({
     }
   }
 
-  function trackNewImportJob({ jobId, targetFolder, workspaceDir, patientFolder }) {
+  function trackNewImportJob({ jobId, targetFolder, workspaceDir, patientFolder, plannedPaths = [] }) {
     const id = Number(jobId) || null;
     if (!id) return;
     if (importJobs.has(id)) return;
@@ -734,6 +734,9 @@ export function initMainContent({
       targetFolder: String(targetFolder ?? "").trim(),
       workspaceDir: String(workspaceDir ?? "").trim(),
       patientFolder: String(patientFolder ?? "").trim(),
+      plannedPaths: Array.isArray(plannedPaths)
+        ? plannedPaths.map((p) => String(p ?? "").trim()).filter(Boolean)
+        : [],
       capsule,
       progressValue: 1,
       shownAt: Date.now(),
@@ -1183,6 +1186,30 @@ export function initMainContent({
     return selectedTimelinePoint?.dataset?.folderName ?? "";
   }
 
+  function getActiveImportPlannedPaths({
+    workspaceDir = "",
+    patientFolder = "",
+    treatmentFolder = "",
+  } = {}) {
+    const w = String(workspaceDir ?? "").trim();
+    const p = String(patientFolder ?? "").trim();
+    const t = String(treatmentFolder ?? "").trim();
+    if (!w || !p || !t) return [];
+    const seen = new Set();
+    const out = [];
+    for (const job of importJobs.values()) {
+      if (job.done) continue;
+      if (job.workspaceDir !== w || job.patientFolder !== p || job.targetFolder !== t) continue;
+      for (const path of Array.isArray(job.plannedPaths) ? job.plannedPaths : []) {
+        const normalized = String(path ?? "").trim();
+        if (!normalized || seen.has(normalized)) continue;
+        seen.add(normalized);
+        out.push(normalized);
+      }
+    }
+    return out;
+  }
+
   function updateTreatmentFilesPanelForSelection() {
     const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
     const selectedFolder = getSelectedTimelineFolderName();
@@ -1201,6 +1228,12 @@ export function initMainContent({
       workspaceDir: context.workspaceDir,
       patientFolder: context.patientFolder,
       treatmentFolder: selectedFolder,
+    }, {
+      optimisticPaths: getActiveImportPlannedPaths({
+        workspaceDir: context.workspaceDir,
+        patientFolder: context.patientFolder,
+        treatmentFolder: selectedFolder,
+      }),
     });
   }
 
@@ -2071,6 +2104,9 @@ export function initMainContent({
           targetFolder: startedTargetFolder,
           workspaceDir: context.workspaceDir,
           patientFolder: context.patientFolder,
+          plannedPaths: Array.isArray(result?.planned_paths ?? result?.plannedPaths)
+            ? (result?.planned_paths ?? result?.plannedPaths)
+            : [],
         });
         setImportPanelVisible(false);
         if (startedTargetFolder) {
@@ -2199,6 +2235,7 @@ export function initMainContent({
       targetFolder,
       workspaceDir,
       patientFolder,
+      plannedPaths,
     } = {}) => {
       const normalizedWorkspace = String(workspaceDir ?? "").trim();
       const normalizedPatient = String(patientFolder ?? "").trim();
@@ -2213,6 +2250,7 @@ export function initMainContent({
         targetFolder: normalizedTarget,
         workspaceDir: normalizedWorkspace,
         patientFolder: normalizedPatient,
+        plannedPaths,
       });
       selectedTimelineKey = normalizedTarget;
       void (async () => {

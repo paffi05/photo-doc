@@ -1270,6 +1270,9 @@ drawSaveBtn?.addEventListener("click", () => {
         targetFolder: startedTargetFolder,
         jobId: startedJobId,
         importWizardDir: null,
+        plannedPaths: Array.isArray(result?.planned_paths ?? result?.plannedPaths)
+          ? (result?.planned_paths ?? result?.plannedPaths)
+          : [],
       }).catch(() => {});
       clearDrawCanvas();
       setSaveModeActive(false);

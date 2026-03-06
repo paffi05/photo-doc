@@ -532,6 +532,7 @@ struct StartImportResponse {
     job_id: u64,
     target_folder: String,
     created_new_folder: bool,
+    planned_paths: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -576,6 +577,7 @@ struct ImportWizardCompletedEvent {
     target_folder: String,
     job_id: Option<u64>,
     import_wizard_dir: Option<String>,
+    planned_paths: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Clone)]
@@ -985,12 +987,11 @@ fn parse_treatment_folder_components(name: &str) -> Option<(String, String)> {
     Some((date, treatment))
 }
 
-fn resolve_unique_target_path(dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
-    }
-
+fn resolve_unique_target_path_with_reserved(
+    dir: &Path,
+    file_name: &str,
+    reserved_file_names: &mut HashSet<String>,
+) -> PathBuf {
     let path = Path::new(file_name);
     let stem = path
         .file_stem()
@@ -999,18 +1000,21 @@ fn resolve_unique_target_path(dir: &Path, file_name: &str) -> PathBuf {
         .to_string();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let mut n: u32 = 1;
+    let mut n: u32 = 0;
     loop {
-        let name = if ext.is_empty() {
+        let name = if n == 0 {
+            file_name.to_string()
+        } else if ext.is_empty() {
             format!("{stem} ({n})")
         } else {
             format!("{stem} ({n}).{ext}")
         };
-        let p = dir.join(name);
-        if !p.exists() {
-            return p;
+        let is_available = !reserved_file_names.contains(&name) && !dir.join(&name).exists();
+        if is_available {
+            reserved_file_names.insert(name.clone());
+            return dir.join(name);
         }
-        n += 1;
+        n = n.saturating_add(1);
     }
 }
 
@@ -5460,7 +5464,15 @@ fn notify_import_wizard_completed(
     target_folder: String,
     job_id: Option<u64>,
     import_wizard_dir: Option<String>,
+    planned_paths: Option<Vec<String>>,
 ) -> Result<bool, String> {
+    let normalized_paths = planned_paths.map(|paths| {
+        paths
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+    });
     app_handle
         .emit(
             "import-wizard-completed",
@@ -5472,6 +5484,7 @@ fn notify_import_wizard_completed(
                 import_wizard_dir: import_wizard_dir
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
+                planned_paths: normalized_paths,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -6691,7 +6704,26 @@ fn start_import_files(
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>();
-    let target_dir_clone = target_dir.clone();
+    let mut reserved_target_names: HashSet<String> = HashSet::new();
+    let mut import_plan: Vec<(String, PathBuf)> = Vec::with_capacity(import_files.len());
+    for src in &import_files {
+        let src_path = PathBuf::from(src);
+        let file_name = src_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let dst_path = resolve_unique_target_path_with_reserved(
+            &target_dir,
+            &file_name,
+            &mut reserved_target_names,
+        );
+        import_plan.push((src.clone(), dst_path));
+    }
+    let planned_paths = import_plan
+        .iter()
+        .map(|(_, dst)| dst.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
     let workspace_root_for_delete_guard = workspace_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -6717,12 +6749,12 @@ fn start_import_files(
         PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 
-        let total_bytes: u64 = import_files
+        let total_bytes: u64 = import_plan
             .iter()
-            .filter_map(|p| fs::metadata(p).ok())
+            .filter_map(|(src, _)| fs::metadata(src).ok())
             .map(|m| m.len())
             .sum();
-        let total_count: u64 = import_files.len() as u64;
+        let total_count: u64 = import_plan.len() as u64;
         let mut copied_bytes: u64 = 0;
         let mut copied_count: u64 = 0;
         let mut pending_preview_paths: Vec<String> = Vec::new();
@@ -6755,14 +6787,8 @@ fn start_import_files(
 
         emit_progress(0.0, false, None);
 
-        for src in import_files {
+        for (src, dst_path) in import_plan {
             let src_path = PathBuf::from(&src);
-            let file_name = src_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file")
-                .to_string();
-            let dst_path = resolve_unique_target_path(&target_dir_clone, &file_name);
 
             match fs::copy(&src_path, &dst_path) {
                 Ok(written) => {
@@ -6852,6 +6878,7 @@ fn start_import_files(
         job_id,
         target_folder,
         created_new_folder,
+        planned_paths,
     })
 }
 

@@ -482,6 +482,9 @@ async function runImportDone() {
       targetFolder: String(result?.target_folder ?? result?.targetFolder ?? "").trim(),
       jobId,
       importWizardDir,
+      plannedPaths: Array.isArray(result?.planned_paths ?? result?.plannedPaths)
+        ? (result?.planned_paths ?? result?.plannedPaths)
+        : [],
     }).catch(() => {});
     await closeLivePreviewWindow();
     await invoke("close_import_wizard_helper_window").catch(async () => {
@@ -1138,4 +1141,3 @@ async function init() {
 
 window.addEventListener("beforeunload", cleanup);
 void init();
-

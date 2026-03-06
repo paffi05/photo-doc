@@ -38,6 +38,10 @@ function fileExtBadgeLabel(name = "", maxLen = 4) {
   return ext.length > maxLen ? "?" : ext;
 }
 
+function isPreviewImagePath(pathLike = "") {
+  return /\.(jpe?g|png)$/i.test(String(pathLike ?? "").trim());
+}
+
 function formatDateOnly(timestampMs = 0) {
   const ms = Number(timestampMs) || 0;
   if (ms <= 0) return "";
@@ -1417,8 +1421,93 @@ export function createTreatmentFilesPanel({
     activeContext = { workspaceDir: w, patientFolder: p, treatmentFolder: t };
     activeContextKey = contextKey;
     const requestId = ++activeRequestId;
-    if (!append) {
+    const optimisticPaths = !append && Array.isArray(options?.optimisticPaths)
+      ? options.optimisticPaths.map((path) => normalizePath(path)).filter((path) => path.length > 0)
+      : [];
+    if (!append && optimisticPaths.length < 1) {
       setLoadingState(t);
+    }
+    if (!append && optimisticPaths.length > 0) {
+      const optimisticFiles = optimisticPaths.map((path) => {
+        const nameParts = path.split(/[\\/]/);
+        const name = String(nameParts[nameParts.length - 1] ?? "").trim() || path;
+        return {
+          path,
+          name,
+          size: 0,
+          created_ms: 0,
+          modified_ms: 0,
+          is_image: isPreviewImagePath(path),
+        };
+      });
+      const optimisticImageFiles = optimisticFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage));
+      const optimisticOtherFiles = optimisticFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage));
+
+      loadingEl.hidden = true;
+      emptyEl.hidden = optimisticFiles.length > 0;
+      countsEl.textContent = `${optimisticImageFiles.length} images, ${optimisticOtherFiles.length} other files`;
+      const useListView = currentViewMode === "list";
+      listWrapEl.hidden = !useListView || optimisticFiles.length < 1;
+      imagesWrapEl.hidden = useListView || optimisticImageFiles.length < 1;
+      otherWrapEl.hidden = useListView || optimisticOtherFiles.length < 1;
+      listEl.innerHTML = "";
+      imagesGridEl.innerHTML = "";
+      otherListEl.innerHTML = "";
+      loadMoreBtn.hidden = true;
+      loadMoreBtn.disabled = false;
+      loadMoreBtn.onclick = null;
+
+      const optimisticImagePaths = optimisticImageFiles
+        .map((file) => normalizePath(file?.path ?? ""))
+        .filter((path) => path.length > 0);
+
+      const optimisticCardsByPath = new Map();
+      if (useListView) {
+        for (const file of optimisticFiles) {
+          const row = createFileListRow(file, {
+            scope: "treatment",
+            navigationPaths: optimisticImagePaths,
+          });
+          listEl.appendChild(row);
+          if (Boolean(file?.is_image ?? file?.isImage)) {
+            const path = normalizePath(file?.path ?? "");
+            if (path) optimisticCardsByPath.set(path, row);
+          }
+        }
+      } else {
+        renderOtherFiles(optimisticOtherFiles, { scope: "treatment" });
+        for (const file of optimisticImageFiles) {
+          const card = createImageCard(file, {
+            scope: "treatment",
+            navigationPaths: optimisticImagePaths,
+          });
+          const path = normalizePath(file?.path ?? "");
+          if (path) optimisticCardsByPath.set(path, card);
+          imagesGridEl.appendChild(card);
+        }
+      }
+      activeCardsByPath = optimisticCardsByPath;
+      activeImageFiles = optimisticImageFiles;
+      setPreviewLoadingProgress(0, optimisticImagePaths.length);
+      if (optimisticImagePaths.length > 0) {
+        void (async () => {
+          let existingCacheByPath = new Map();
+          try {
+            existingCacheByPath = await loadExistingCachedPreviewSrcMap(optimisticImagePaths);
+          } catch {
+            existingCacheByPath = new Map();
+          }
+          if (requestId !== activeRequestId) return;
+          for (const [path, src] of existingCacheByPath.entries()) {
+            setThumbImage(path, optimisticCardsByPath, src, {
+              requestId,
+              allowPathFallback: true,
+              previewQuality: "full",
+            });
+          }
+          setPreviewLoadingProgress(existingCacheByPath.size, optimisticImagePaths.length);
+        })();
+      }
     }
 
     let files = [];
