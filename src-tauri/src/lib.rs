@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Cursor;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -2272,6 +2273,65 @@ fn is_valid_cached_preview_file(path: &Path) -> bool {
         return false;
     };
     is_valid_cached_preview_bytes(&bytes)
+}
+
+fn resolve_import_wizard_cached_preview_path(
+    import_wizard_cache_dir: &Path,
+    source_path: &Path,
+) -> Option<PathBuf> {
+    if !import_wizard_cache_dir.exists() || !import_wizard_cache_dir.is_dir() {
+        return None;
+    }
+    if !is_supported_preview_image(source_path) {
+        return None;
+    }
+    let src_meta = fs::metadata(source_path).ok()?;
+    let src_size = src_meta.len();
+    let src_modified_ms = src_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let preview_path = resolve_existing_cache_file_path(
+        import_wizard_cache_dir,
+        source_path,
+        None,
+        src_size,
+        src_modified_ms,
+    );
+    if !preview_path.exists() || !is_valid_cached_preview_file(&preview_path) {
+        return None;
+    }
+    Some(preview_path)
+}
+
+fn copy_file_with_progress<F>(source_path: &Path, target_path: &Path, mut on_chunk: F) -> Result<u64, String>
+where
+    F: FnMut(u64),
+{
+    let mut source = File::open(source_path).map_err(|e| e.to_string())?;
+    let mut target = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target_path)
+        .map_err(|e| e.to_string())?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut written_total: u64 = 0;
+
+    loop {
+        let read_count = source.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read_count < 1 {
+            break;
+        }
+        target
+            .write_all(&buffer[..read_count])
+            .map_err(|e| e.to_string())?;
+        written_total = written_total.saturating_add(read_count as u64);
+        on_chunk(read_count as u64);
+    }
+    target.flush().map_err(|e| e.to_string())?;
+    Ok(written_total)
 }
 
 fn seed_active_preview_cache_from_import_wizard_cache(
@@ -6762,12 +6822,27 @@ fn start_import_files(
         let preview_handle = app_handle_clone.clone();
         let preview_workspace_dir = workspace_dir_for_preview_sync.clone();
         std::thread::spawn(move || {
+            let mut imported_preview_paths: Vec<String> = Vec::new();
+            let mut seen = HashSet::new();
             while let Ok(batch) = preview_rx.recv() {
                 if batch.is_empty() {
                     continue;
                 }
+                for path in &batch {
+                    if seen.insert(path.clone()) {
+                        imported_preview_paths.push(path.clone());
+                    }
+                }
                 // Do not create new previews during import. Import should remain I/O-priority.
                 if let Ok(rows) = resolve_cached_previews(&preview_handle, &batch, false, false) {
+                    emit_import_preview_ready_events(&preview_handle, &rows);
+                }
+            }
+            if !imported_preview_paths.is_empty() {
+                // Generate missing previews only after copy completes; placeholders stay visible until then.
+                if let Ok(rows) =
+                    resolve_cached_previews(&preview_handle, &imported_preview_paths, false, true)
+                {
                     emit_import_preview_ready_events(&preview_handle, &rows);
                 }
             }
@@ -6785,27 +6860,58 @@ fn start_import_files(
             let _ = app_handle_clone.emit("import-progress", payload);
         };
 
-        emit_progress(0.0, false, None);
+        emit_progress(1.0, false, None);
+        let mut last_progress_emit_ms = now_ms();
 
         for (src, dst_path) in import_plan {
             let src_path = PathBuf::from(&src);
+            if is_supported_preview_image(&src_path) {
+                if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
+                    let _ = fs::create_dir_all(cache_dir);
+                    let src_for_cache = src_path.to_string_lossy().to_string();
+                    let _ = resolve_cached_previews_in_cache_dir(
+                        &vec![src_for_cache],
+                        false,
+                        true,
+                        cache_dir,
+                        PREVIEW_CACHE_MAX_BYTES_FIXED,
+                        &preview_perf_mode,
+                        None,
+                        None,
+                    );
+                    if let Some(wizard_preview_path) =
+                        resolve_import_wizard_cached_preview_path(cache_dir, &src_path)
+                    {
+                        let _ = app_handle_clone.emit(
+                            "import-preview-ready",
+                            ImportPreviewReadyEvent {
+                                path: dst_path.to_string_lossy().to_string(),
+                                preview_path: wizard_preview_path.to_string_lossy().to_string(),
+                            },
+                        );
+                    }
+                }
+            }
 
-            match fs::copy(&src_path, &dst_path) {
-                Ok(written) => {
+            match copy_file_with_progress(&src_path, &dst_path, |chunk_written| {
+                copied_bytes = copied_bytes.saturating_add(chunk_written);
+                let now = now_ms();
+                if now.saturating_sub(last_progress_emit_ms) < 120 {
+                    return;
+                }
+                last_progress_emit_ms = now;
+                let percent = if total_bytes > 0 {
+                    (copied_bytes as f64 / total_bytes as f64) * 100.0
+                } else if total_count > 0 {
+                    (copied_count as f64 / total_count as f64) * 100.0
+                } else {
+                    100.0
+                };
+                emit_progress(percent.clamp(1.0, 99.9), false, None);
+            }) {
+                Ok(_written) => {
                     if is_supported_preview_image(&dst_path) {
                         if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
-                            let _ = fs::create_dir_all(cache_dir);
-                            let src_for_cache = src_path.to_string_lossy().to_string();
-                            let _ = resolve_cached_previews_in_cache_dir(
-                                &vec![src_for_cache],
-                                false,
-                                true,
-                                cache_dir,
-                                PREVIEW_CACHE_MAX_BYTES_FIXED,
-                                &preview_perf_mode,
-                                None,
-                                None,
-                            );
                             let _ = seed_active_preview_cache_from_import_wizard_cache(
                                 &app_handle_clone,
                                 cache_dir,
@@ -6827,7 +6933,6 @@ fn start_import_files(
                         }
                     }
 
-                    copied_bytes = copied_bytes.saturating_add(written);
                     copied_count = copied_count.saturating_add(1);
                     let percent = if total_bytes > 0 {
                         (copied_bytes as f64 / total_bytes as f64) * 100.0
