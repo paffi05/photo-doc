@@ -571,7 +571,12 @@ export function initMainContent({
     importLiveRefreshTimerId = setTimeout(() => {
       importLiveRefreshTimerId = null;
       importLiveRefreshPending = false;
-      void refreshTimeline();
+      void (async () => {
+        await refreshTimeline();
+        const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
+        if (!selectedPoint) return;
+        ensureTimelinePointVisible(selectedPoint);
+      })();
     }, 700);
   }
 
@@ -695,7 +700,17 @@ export function initMainContent({
       }
 
       if (!targetDot) {
-        for (const job of groupJobs) {
+        updateImportProgressCapsule(leadJob.capsule, combinedProgress);
+        if (leadJob.capsule.parentElement !== timelineTrack) {
+          timelineTrack?.appendChild(leadJob.capsule);
+        }
+        leadJob.capsule.hidden = false;
+        leadJob.capsule.classList.add("visible");
+        leadJob.capsule.classList.remove("on-selected-dot");
+        leadJob.capsule.style.left = "calc(100% - 26px)";
+        leadJob.capsule.style.top = "5px";
+        for (let i = 1; i < groupJobs.length; i += 1) {
+          const job = groupJobs[i];
           job.capsule.hidden = true;
           job.capsule.classList.remove("visible");
         }
@@ -723,7 +738,7 @@ export function initMainContent({
     }
   }
 
-  function trackNewImportJob({ jobId, targetFolder, workspaceDir, patientFolder, plannedPaths = [] }) {
+  function trackNewImportJob({ jobId, targetFolder, workspaceDir, patientFolder }) {
     const id = Number(jobId) || null;
     if (!id) return;
     if (importJobs.has(id)) return;
@@ -734,9 +749,6 @@ export function initMainContent({
       targetFolder: String(targetFolder ?? "").trim(),
       workspaceDir: String(workspaceDir ?? "").trim(),
       patientFolder: String(patientFolder ?? "").trim(),
-      plannedPaths: Array.isArray(plannedPaths)
-        ? plannedPaths.map((p) => String(p ?? "").trim()).filter(Boolean)
-        : [],
       capsule,
       progressValue: 1,
       shownAt: Date.now(),
@@ -753,8 +765,10 @@ export function initMainContent({
     }
 
     const buffered = bufferedImportProgressByJobId.get(id);
-    if (buffered) {
-      applyImportProgressEventForJob(job, buffered);
+    if (Array.isArray(buffered) && buffered.length > 0) {
+      for (const payload of buffered) {
+        applyImportProgressEventForJob(job, payload);
+      }
       bufferedImportProgressByJobId.delete(id);
     }
 
@@ -773,7 +787,9 @@ export function initMainContent({
 
     if (!done) {
       const selectedFolder = getSelectedTimelineFolderName().trim();
-      if (selectedFolder && selectedFolder === job.targetFolder) {
+      const targetPoint = Array.from(timelineTrack?.querySelectorAll(".main-timeline-point") ?? [])
+        .find((point) => String(point?.dataset?.timelineKey ?? "").trim() === job.targetFolder);
+      if ((selectedFolder && selectedFolder === job.targetFolder) || !targetPoint) {
         scheduleImportLiveRefresh();
       }
       return;
@@ -1186,30 +1202,6 @@ export function initMainContent({
     return selectedTimelinePoint?.dataset?.folderName ?? "";
   }
 
-  function getActiveImportPlannedPaths({
-    workspaceDir = "",
-    patientFolder = "",
-    treatmentFolder = "",
-  } = {}) {
-    const w = String(workspaceDir ?? "").trim();
-    const p = String(patientFolder ?? "").trim();
-    const t = String(treatmentFolder ?? "").trim();
-    if (!w || !p || !t) return [];
-    const seen = new Set();
-    const out = [];
-    for (const job of importJobs.values()) {
-      if (job.done) continue;
-      if (job.workspaceDir !== w || job.patientFolder !== p || job.targetFolder !== t) continue;
-      for (const path of Array.isArray(job.plannedPaths) ? job.plannedPaths : []) {
-        const normalized = String(path ?? "").trim();
-        if (!normalized || seen.has(normalized)) continue;
-        seen.add(normalized);
-        out.push(normalized);
-      }
-    }
-    return out;
-  }
-
   function updateTreatmentFilesPanelForSelection() {
     const context = typeof resolveImportContext === "function" ? resolveImportContext() : null;
     const selectedFolder = getSelectedTimelineFolderName();
@@ -1228,12 +1220,6 @@ export function initMainContent({
       workspaceDir: context.workspaceDir,
       patientFolder: context.patientFolder,
       treatmentFolder: selectedFolder,
-    }, {
-      optimisticPaths: getActiveImportPlannedPaths({
-        workspaceDir: context.workspaceDir,
-        patientFolder: context.patientFolder,
-        treatmentFolder: selectedFolder,
-      }),
     });
   }
 
@@ -1536,7 +1522,6 @@ export function initMainContent({
       const dateLabelEl = point.querySelector(".main-timeline-date");
       const treatmentLabelEl = point.querySelector(".main-timeline-treatment");
       attachTimelineFolderDragExportHandlers(point);
-      point.addEventListener("mouseenter", () => ensureTimelinePointVisible(point));
       const openTimelinePoint = () => {
         setSelectedTimelinePoint(point);
         if (!importPanel.hidden && importTreatmentName) {
@@ -1596,6 +1581,8 @@ export function initMainContent({
         timelinePrefixLine.style.width = `${Math.max(0, firstCenterInTimeline)}px`;
       }
       positionImportProgressCapsules();
+      const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
+      if (selectedPoint) ensureTimelinePointVisible(selectedPoint);
     });
     setTimelineVisible(true);
   }
@@ -2104,9 +2091,6 @@ export function initMainContent({
           targetFolder: startedTargetFolder,
           workspaceDir: context.workspaceDir,
           patientFolder: context.patientFolder,
-          plannedPaths: Array.isArray(result?.planned_paths ?? result?.plannedPaths)
-            ? (result?.planned_paths ?? result?.plannedPaths)
-            : [],
         });
         setImportPanelVisible(false);
         if (startedTargetFolder) {
@@ -2138,7 +2122,10 @@ export function initMainContent({
     const done = Boolean(payload?.done);
     const error = payload?.error ? String(payload.error) : "";
     if (!job) {
-      bufferedImportProgressByJobId.set(jobId, { percent, done, error });
+      const queue = bufferedImportProgressByJobId.get(jobId) ?? [];
+      queue.push({ percent, done, error });
+      if (queue.length > 120) queue.splice(0, queue.length - 120);
+      bufferedImportProgressByJobId.set(jobId, queue);
       return;
     }
     applyImportProgressEventForJob(job, { percent, done, error });
@@ -2235,7 +2222,8 @@ export function initMainContent({
       targetFolder,
       workspaceDir,
       patientFolder,
-      plannedPaths,
+      importedImageCount,
+      importedTotalCount,
     } = {}) => {
       const normalizedWorkspace = String(workspaceDir ?? "").trim();
       const normalizedPatient = String(patientFolder ?? "").trim();
@@ -2250,7 +2238,20 @@ export function initMainContent({
         targetFolder: normalizedTarget,
         workspaceDir: normalizedWorkspace,
         patientFolder: normalizedPatient,
-        plannedPaths,
+      });
+      if (typeof treatmentFilesPanel.setOptimisticImportPlaceholders === "function") {
+        treatmentFilesPanel.setOptimisticImportPlaceholders({
+          workspaceDir: normalizedWorkspace,
+          patientFolder: normalizedPatient,
+          treatmentFolder: normalizedTarget,
+          imageCount: Math.max(0, Number(importedImageCount) || 0),
+          totalCount: Math.max(0, Number(importedTotalCount) || 0),
+        });
+      }
+      void treatmentFilesPanel.setContext({
+        workspaceDir: normalizedWorkspace,
+        patientFolder: normalizedPatient,
+        treatmentFolder: normalizedTarget,
       });
       selectedTimelineKey = normalizedTarget;
       void (async () => {

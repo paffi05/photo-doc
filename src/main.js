@@ -123,17 +123,6 @@ function setDebugState(state) {
   debugBadge.textContent = `debug: (${state})`;
 }
 
-function normalizeWorkspacePathForCompare(pathLike = "") {
-  const raw = String(pathLike ?? "").trim();
-  if (!raw) return "";
-  let normalized = raw.replace(/\\/g, "/").replace(/\/+$/, "");
-  // Windows paths: compare case-insensitively for drive-letter paths.
-  if (/^[a-zA-Z]:\//.test(normalized)) {
-    normalized = normalized.toLowerCase();
-  }
-  return normalized;
-}
-
 function setStartupProcessStatus(message = "") {
   if (!startupProcessText) return;
   const text = String(message ?? "").trim();
@@ -3058,33 +3047,67 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   currentWorkspaceDir = workspaceDir;
   setWorkspacePathDisplay(workspaceDir);
   initialMainReadyInProgress = true;
+  const STARTUP_PROGRESS_WEIGHTS = {
+    indexing: 82,
+    dbCount: 4,
+    cacheUsage: 4,
+    previewMaintenance: 4,
+    cacheStatus: 3,
+    indexingStatus: 2,
+    finalize: 1,
+  };
+  const startupSetOverallProgress = (segment, localPercent = 0) => {
+    const pct = Math.max(0, Math.min(100, Number(localPercent) || 0));
+    const i = STARTUP_PROGRESS_WEIGHTS.indexing;
+    const d = STARTUP_PROGRESS_WEIGHTS.dbCount;
+    const c = STARTUP_PROGRESS_WEIGHTS.cacheUsage;
+    const p = STARTUP_PROGRESS_WEIGHTS.previewMaintenance;
+    const s = STARTUP_PROGRESS_WEIGHTS.cacheStatus;
+    const x = STARTUP_PROGRESS_WEIGHTS.indexingStatus;
+    const f = STARTUP_PROGRESS_WEIGHTS.finalize;
+    let overall = 0;
+    if (segment === "indexing") overall = (pct / 100) * i;
+    else if (segment === "dbCount") overall = i + (pct / 100) * d;
+    else if (segment === "cacheUsage") overall = i + d + (pct / 100) * c;
+    else if (segment === "previewMaintenance") overall = i + d + c + (pct / 100) * p;
+    else if (segment === "cacheStatus") overall = i + d + c + p + (pct / 100) * s;
+    else if (segment === "indexingStatus") overall = i + d + c + p + s + (pct / 100) * x;
+    else if (segment === "finalize") overall = i + d + c + p + s + x + (pct / 100) * f;
+    else overall = pct;
+    setStartupSpinnerPercent(overall);
+  };
   setStartupProcessStatus("Loading cache state...");
-  setStartupSpinnerPercent(0);
+  startupSetOverallProgress("indexing", 0);
   if (!skipLoadPatients) {
     await loadPatients(workspaceDir, {
       onStartupStage: (message) => setStartupProcessStatus(message),
-      onReindexProgress: (percent) => setStartupSpinnerPercent(percent),
+      onReindexProgress: (percent) => startupSetOverallProgress("indexing", percent),
     });
   } else {
-    setStartupSpinnerPercent(82);
+    startupSetOverallProgress("indexing", 100);
   }
   setStartupProcessStatus("Counting indexed images...");
-  setStartupSpinnerPercent(92);
+  startupSetOverallProgress("dbCount", 0);
   await refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir);
+  startupSetOverallProgress("dbCount", 100);
   setStartupProcessStatus("Loading cache usage...");
-  setStartupSpinnerPercent(95);
+  startupSetOverallProgress("cacheUsage", 0);
   const cacheStats = await refreshCacheUsageUi();
+  startupSetOverallProgress("cacheUsage", 100);
   setStartupProcessStatus("Preparing preview maintenance...");
-  setStartupSpinnerPercent(97);
+  startupSetOverallProgress("previewMaintenance", 0);
   await ensureBackgroundPreviewFill(cacheStats);
+  startupSetOverallProgress("previewMaintenance", 100);
   setStartupProcessStatus("Refreshing cache status...");
-  setStartupSpinnerPercent(98);
+  startupSetOverallProgress("cacheStatus", 0);
   await refreshLocalCacheCopyStatus();
+  startupSetOverallProgress("cacheStatus", 100);
   setStartupProcessStatus("Refreshing indexing status...");
-  setStartupSpinnerPercent(99);
+  startupSetOverallProgress("indexingStatus", 0);
   await refreshIndexingStatus();
+  startupSetOverallProgress("indexingStatus", 100);
   setStartupProcessStatus("Finalizing startup...");
-  setStartupSpinnerPercent(100);
+  startupSetOverallProgress("finalize", 100);
   appView.hidden = false;
   if (startupView) startupView.hidden = true;
   updateCacheReloadButtonState();
@@ -4022,30 +4045,22 @@ void listen("import-wizard-completed", async (event) => {
   const workspace = String(event?.payload?.workspace_dir ?? event?.payload?.workspaceDir ?? "").trim();
   const patient = String(event?.payload?.patient_folder ?? event?.payload?.patientFolder ?? "").trim();
   const targetFolder = String(event?.payload?.target_folder ?? event?.payload?.targetFolder ?? "").trim();
+  const importedImageCount = Math.max(
+    0,
+    Number(event?.payload?.imported_image_count ?? event?.payload?.importedImageCount ?? 0) || 0,
+  );
+  const importedTotalCount = Math.max(
+    importedImageCount,
+    Number(event?.payload?.imported_total_count ?? event?.payload?.importedTotalCount ?? 0) || 0,
+  );
   const jobId = Number(event?.payload?.job_id ?? event?.payload?.jobId ?? 0) || null;
   const wizardDir = String(
     event?.payload?.import_wizard_dir ??
     event?.payload?.importWizardDir ??
     "",
   ).trim();
-  const plannedPathsRaw = event?.payload?.planned_paths ?? event?.payload?.plannedPaths;
-  const plannedPaths = Array.isArray(plannedPathsRaw)
-    ? plannedPathsRaw.map((p) => String(p ?? "").trim()).filter(Boolean)
-    : [];
   if (!workspace || !patient) return;
-  const eventWorkspaceKey = normalizeWorkspacePathForCompare(workspace);
-  const currentWorkspaceKey = normalizeWorkspacePathForCompare(currentWorkspaceDir);
-  const workspaceMatches = Boolean(currentWorkspaceKey) && eventWorkspaceKey === currentWorkspaceKey;
-  const selectedPatientMatches = String(selectedPatient ?? "").trim() === patient;
-  if (!workspaceMatches && !selectedPatientMatches) return;
-
-  // Switch context first so timeline/import job refresh runs against the correct patient immediately.
-  selectedPatient = patient;
-  const cachedPatient = patientEntryCacheByFolder.get(patient);
-  selectedPatientId = String(cachedPatient?.patientId ?? "").trim();
-  const { lastName, firstName } = splitPatientName(patient);
-  mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
-  updateImportWizardButtonState();
+  if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
 
   if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
     if (wizardDir) {
@@ -4056,7 +4071,8 @@ void listen("import-wizard-completed", async (event) => {
       targetFolder,
       workspaceDir: workspace,
       patientFolder: patient,
-      plannedPaths,
+      importedImageCount,
+      importedTotalCount,
     });
   } else {
     void mainContent.refreshTimelineForSelection();
@@ -4064,14 +4080,15 @@ void listen("import-wizard-completed", async (event) => {
 
   // Keep event handling non-blocking so progress updates stay smooth during import.
   void (async () => {
+    selectedPatient = patient;
+    selectedPatientId = "";
     await searchPatients(patientSearchInput?.value ?? "");
     const selectedEntry = (lastRenderedPatientEntries ?? [])
       .map((entry) => normalizePatientEntry(entry))
       .find((entry) => entry.folderName === patient);
-    if (selectedEntry) {
-      selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
-      mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
-    }
+    selectedPatientId = String(selectedEntry?.patientId ?? "").trim();
+    const { lastName, firstName } = splitPatientName(patient);
+    mainContent.setSelectedPatientHeader({ lastName, firstName, patientId: selectedPatientId });
     updateImportWizardButtonState();
   })();
 });

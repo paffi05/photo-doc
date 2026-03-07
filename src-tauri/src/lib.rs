@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs;
-use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::Cursor;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -533,7 +532,6 @@ struct StartImportResponse {
     job_id: u64,
     target_folder: String,
     created_new_folder: bool,
-    planned_paths: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -578,7 +576,8 @@ struct ImportWizardCompletedEvent {
     target_folder: String,
     job_id: Option<u64>,
     import_wizard_dir: Option<String>,
-    planned_paths: Option<Vec<String>>,
+    imported_image_count: Option<u64>,
+    imported_total_count: Option<u64>,
 }
 
 #[derive(Serialize, Clone)]
@@ -988,11 +987,12 @@ fn parse_treatment_folder_components(name: &str) -> Option<(String, String)> {
     Some((date, treatment))
 }
 
-fn resolve_unique_target_path_with_reserved(
-    dir: &Path,
-    file_name: &str,
-    reserved_file_names: &mut HashSet<String>,
-) -> PathBuf {
+fn resolve_unique_target_path(dir: &Path, file_name: &str) -> PathBuf {
+    let candidate = dir.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
     let path = Path::new(file_name);
     let stem = path
         .file_stem()
@@ -1001,21 +1001,18 @@ fn resolve_unique_target_path_with_reserved(
         .to_string();
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-    let mut n: u32 = 0;
+    let mut n: u32 = 1;
     loop {
-        let name = if n == 0 {
-            file_name.to_string()
-        } else if ext.is_empty() {
+        let name = if ext.is_empty() {
             format!("{stem} ({n})")
         } else {
             format!("{stem} ({n}).{ext}")
         };
-        let is_available = !reserved_file_names.contains(&name) && !dir.join(&name).exists();
-        if is_available {
-            reserved_file_names.insert(name.clone());
-            return dir.join(name);
+        let p = dir.join(name);
+        if !p.exists() {
+            return p;
         }
-        n = n.saturating_add(1);
+        n += 1;
     }
 }
 
@@ -2275,65 +2272,6 @@ fn is_valid_cached_preview_file(path: &Path) -> bool {
     is_valid_cached_preview_bytes(&bytes)
 }
 
-fn resolve_import_wizard_cached_preview_path(
-    import_wizard_cache_dir: &Path,
-    source_path: &Path,
-) -> Option<PathBuf> {
-    if !import_wizard_cache_dir.exists() || !import_wizard_cache_dir.is_dir() {
-        return None;
-    }
-    if !is_supported_preview_image(source_path) {
-        return None;
-    }
-    let src_meta = fs::metadata(source_path).ok()?;
-    let src_size = src_meta.len();
-    let src_modified_ms = src_meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let preview_path = resolve_existing_cache_file_path(
-        import_wizard_cache_dir,
-        source_path,
-        None,
-        src_size,
-        src_modified_ms,
-    );
-    if !preview_path.exists() || !is_valid_cached_preview_file(&preview_path) {
-        return None;
-    }
-    Some(preview_path)
-}
-
-fn copy_file_with_progress<F>(source_path: &Path, target_path: &Path, mut on_chunk: F) -> Result<u64, String>
-where
-    F: FnMut(u64),
-{
-    let mut source = File::open(source_path).map_err(|e| e.to_string())?;
-    let mut target = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target_path)
-        .map_err(|e| e.to_string())?;
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    let mut written_total: u64 = 0;
-
-    loop {
-        let read_count = source.read(&mut buffer).map_err(|e| e.to_string())?;
-        if read_count < 1 {
-            break;
-        }
-        target
-            .write_all(&buffer[..read_count])
-            .map_err(|e| e.to_string())?;
-        written_total = written_total.saturating_add(read_count as u64);
-        on_chunk(read_count as u64);
-    }
-    target.flush().map_err(|e| e.to_string())?;
-    Ok(written_total)
-}
-
 fn seed_active_preview_cache_from_import_wizard_cache(
     app_handle: &tauri::AppHandle,
     import_wizard_cache_dir: &Path,
@@ -2819,10 +2757,8 @@ fn build_source_meta_map_for_paths(
             continue;
         }
         let path_buf = PathBuf::from(path);
-        let mut is_workspace_path = false;
         if let (Some(workspace), Some(db_stmt)) = (workspace_root.as_ref(), stmt.as_mut()) {
             if path_buf.starts_with(workspace) {
-                is_workspace_path = true;
                 if let Some((patient_folder, treatment_folder, file_name)) =
                     parse_workspace_file_index_key(workspace, &path_buf)
                 {
@@ -4111,19 +4047,13 @@ fn copy_file_to_destination(source_path: String, destination_dir: String) -> Res
 }
 
 #[tauri::command]
-async fn rotate_image_right_in_place(
-    app_handle: tauri::AppHandle,
-    path: String,
-    steps: Option<u8>,
-    op_id: Option<u64>,
-) -> Result<bool, String> {
+async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _rotate_guard = rotate_image_lock().lock().map_err(|e| e.to_string())?;
         let path = path.trim().to_string();
         if path.is_empty() {
             return Err("path is required".to_string());
         }
-        let steps = steps.unwrap_or(1).clamp(1, 3);
         let source = PathBuf::from(&path);
         if !source.exists() || !source.is_file() {
             return Err("source file does not exist".to_string());
@@ -4151,13 +4081,11 @@ async fn rotate_image_right_in_place(
             _ => return Err("unsupported image format".to_string()),
         };
 
-        let mut rotated = image::ImageReader::open(&source)
+        let decoded = image::ImageReader::open(&source)
             .map_err(|e| e.to_string())?
             .decode()
             .map_err(|e| e.to_string())?;
-        for _ in 0..steps {
-            rotated = rotated.rotate90();
-        }
+        let rotated = decoded.rotate90();
 
         let tmp_path = source.with_extension(format!("{}.rotating", ext));
         rotated
@@ -4249,16 +4177,6 @@ async fn rotate_image_right_in_place(
                     json!({
                         "path": path,
                         "preview_path": preview_path,
-                        "op_id": op_id,
-                    }),
-                );
-                let _ = app_handle.emit(
-                    "image-preview-rotation-committed",
-                    json!({
-                        "path": path,
-                        "preview_path": preview_path,
-                        "op_id": op_id,
-                        "rotation_delta_deg": (steps as i32) * 90,
                     }),
                 );
             }
@@ -4891,7 +4809,6 @@ fn emit_image_preview_rotated(
     app_handle: tauri::AppHandle,
     path: String,
     rotation_deg: i32,
-    op_id: Option<u64>,
 ) -> Result<bool, String> {
     let path = path.trim().to_string();
     if path.is_empty() {
@@ -4904,7 +4821,6 @@ fn emit_image_preview_rotated(
             json!({
                 "path": path,
                 "rotation_deg": normalized,
-                "op_id": op_id,
             }),
         )
         .map_err(|e| e.to_string())?;
@@ -5524,15 +5440,9 @@ fn notify_import_wizard_completed(
     target_folder: String,
     job_id: Option<u64>,
     import_wizard_dir: Option<String>,
-    planned_paths: Option<Vec<String>>,
+    imported_image_count: Option<u64>,
+    imported_total_count: Option<u64>,
 ) -> Result<bool, String> {
-    let normalized_paths = planned_paths.map(|paths| {
-        paths
-            .into_iter()
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect::<Vec<_>>()
-    });
     app_handle
         .emit(
             "import-wizard-completed",
@@ -5544,7 +5454,8 @@ fn notify_import_wizard_completed(
                 import_wizard_dir: import_wizard_dir
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty()),
-                planned_paths: normalized_paths,
+                imported_image_count,
+                imported_total_count,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -6764,26 +6675,7 @@ fn start_import_files(
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
         .collect::<Vec<_>>();
-    let mut reserved_target_names: HashSet<String> = HashSet::new();
-    let mut import_plan: Vec<(String, PathBuf)> = Vec::with_capacity(import_files.len());
-    for src in &import_files {
-        let src_path = PathBuf::from(src);
-        let file_name = src_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .to_string();
-        let dst_path = resolve_unique_target_path_with_reserved(
-            &target_dir,
-            &file_name,
-            &mut reserved_target_names,
-        );
-        import_plan.push((src.clone(), dst_path));
-    }
-    let planned_paths = import_plan
-        .iter()
-        .map(|(_, dst)| dst.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+    let target_dir_clone = target_dir.clone();
     let workspace_root_for_delete_guard = workspace_path.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -6809,45 +6701,27 @@ fn start_import_files(
         PREVIEW_FILL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
         LOCAL_CACHE_COPY_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
 
-        let total_bytes: u64 = import_plan
+        let total_bytes: u64 = import_files
             .iter()
-            .filter_map(|(src, _)| fs::metadata(src).ok())
+            .filter_map(|p| fs::metadata(p).ok())
             .map(|m| m.len())
             .sum();
-        let total_count: u64 = import_plan.len() as u64;
+        let total_count: u64 = import_files.len() as u64;
         let mut copied_bytes: u64 = 0;
         let mut copied_count: u64 = 0;
         let mut pending_preview_paths: Vec<String> = Vec::new();
         let (preview_tx, preview_rx) = std::sync::mpsc::channel::<Vec<String>>();
         let preview_handle = app_handle_clone.clone();
-        let preview_workspace_dir = workspace_dir_for_preview_sync.clone();
         std::thread::spawn(move || {
-            let mut imported_preview_paths: Vec<String> = Vec::new();
-            let mut seen = HashSet::new();
             while let Ok(batch) = preview_rx.recv() {
                 if batch.is_empty() {
                     continue;
-                }
-                for path in &batch {
-                    if seen.insert(path.clone()) {
-                        imported_preview_paths.push(path.clone());
-                    }
                 }
                 // Do not create new previews during import. Import should remain I/O-priority.
                 if let Ok(rows) = resolve_cached_previews(&preview_handle, &batch, false, false) {
                     emit_import_preview_ready_events(&preview_handle, &rows);
                 }
             }
-            if !imported_preview_paths.is_empty() {
-                // Generate missing previews only after copy completes; placeholders stay visible until then.
-                if let Ok(rows) =
-                    resolve_cached_previews(&preview_handle, &imported_preview_paths, false, true)
-                {
-                    emit_import_preview_ready_events(&preview_handle, &rows);
-                }
-            }
-            // Sync to workspace main cache only after preview generation completes.
-            sync_local_cache_copy_if_enabled(&preview_handle, &preview_workspace_dir);
         });
 
         let emit_progress = |percent: f64, done: bool, error: Option<String>| {
@@ -6860,64 +6734,46 @@ fn start_import_files(
             let _ = app_handle_clone.emit("import-progress", payload);
         };
 
-        emit_progress(1.0, false, None);
-        let mut last_progress_emit_ms = now_ms();
+        emit_progress(0.0, false, None);
 
-        for (src, dst_path) in import_plan {
+        for src in import_files {
             let src_path = PathBuf::from(&src);
-            if is_supported_preview_image(&src_path) {
-                if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
-                    let _ = fs::create_dir_all(cache_dir);
-                    let src_for_cache = src_path.to_string_lossy().to_string();
-                    let _ = resolve_cached_previews_in_cache_dir(
-                        &vec![src_for_cache],
-                        false,
-                        true,
-                        cache_dir,
-                        PREVIEW_CACHE_MAX_BYTES_FIXED,
-                        &preview_perf_mode,
-                        None,
-                        None,
-                    );
-                    if let Some(wizard_preview_path) =
-                        resolve_import_wizard_cached_preview_path(cache_dir, &src_path)
-                    {
-                        let _ = app_handle_clone.emit(
-                            "import-preview-ready",
-                            ImportPreviewReadyEvent {
-                                path: dst_path.to_string_lossy().to_string(),
-                                preview_path: wizard_preview_path.to_string_lossy().to_string(),
-                            },
-                        );
-                    }
-                }
-            }
+            let file_name = src_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+                .to_string();
+            let dst_path = resolve_unique_target_path(&target_dir_clone, &file_name);
 
-            match copy_file_with_progress(&src_path, &dst_path, |chunk_written| {
-                copied_bytes = copied_bytes.saturating_add(chunk_written);
-                let now = now_ms();
-                if now.saturating_sub(last_progress_emit_ms) < 120 {
-                    return;
-                }
-                last_progress_emit_ms = now;
-                let percent = if total_bytes > 0 {
-                    (copied_bytes as f64 / total_bytes as f64) * 100.0
-                } else if total_count > 0 {
-                    (copied_count as f64 / total_count as f64) * 100.0
-                } else {
-                    100.0
-                };
-                emit_progress(percent.clamp(1.0, 99.9), false, None);
-            }) {
-                Ok(_written) => {
+            match fs::copy(&src_path, &dst_path) {
+                Ok(written) => {
                     if is_supported_preview_image(&dst_path) {
                         if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
+                            let _ = fs::create_dir_all(cache_dir);
+                            let src_for_cache = src_path.to_string_lossy().to_string();
+                            let _ = resolve_cached_previews_in_cache_dir(
+                                &vec![src_for_cache],
+                                false,
+                                true,
+                                cache_dir,
+                                PREVIEW_CACHE_MAX_BYTES_FIXED,
+                                &preview_perf_mode,
+                                None,
+                                None,
+                            );
                             let _ = seed_active_preview_cache_from_import_wizard_cache(
                                 &app_handle_clone,
                                 cache_dir,
                                 &src_path,
                                 &dst_path,
                             );
+                            // If we already have a seeded preview in active cache, surface it immediately.
+                            let dst_for_emit = dst_path.to_string_lossy().to_string();
+                            if let Ok(rows) =
+                                resolve_cached_previews(&app_handle_clone, &vec![dst_for_emit], false, false)
+                            {
+                                emit_import_preview_ready_events(&app_handle_clone, &rows);
+                            }
                         }
                         pending_preview_paths.push(dst_path.to_string_lossy().to_string());
                         if pending_preview_paths.len() >= IMPORT_PREVIEW_MICROBATCH_SIZE {
@@ -6933,15 +6789,18 @@ fn start_import_files(
                         }
                     }
 
+                    copied_bytes = copied_bytes.saturating_add(written);
                     copied_count = copied_count.saturating_add(1);
-                    let percent = if total_bytes > 0 {
+                    let copy_percent = if total_bytes > 0 {
                         (copied_bytes as f64 / total_bytes as f64) * 100.0
                     } else if total_count > 0 {
                         (copied_count as f64 / total_count as f64) * 100.0
                     } else {
                         100.0
                     };
-                    emit_progress(percent.clamp(0.0, 100.0), false, None);
+                    // Reserve the tail for index update so UI progress does not appear stuck/jumpy.
+                    let overall_percent = (copy_percent.clamp(0.0, 100.0) * 0.9).clamp(0.0, 90.0);
+                    emit_progress(overall_percent, false, None);
                 }
                 Err(err) => {
                     emit_progress(100.0, true, Some(err.to_string()));
@@ -6957,6 +6816,7 @@ fn start_import_files(
         drop(preview_tx);
         let workspace_path = PathBuf::from(&workspace_dir_for_preview_sync);
         let patient_path = workspace_path.join(&patient_folder);
+        emit_progress(92.0, false, None);
         if patient_path.exists() && patient_path.is_dir() {
             let mut conn = match open_db(&app_handle_clone) {
                 Ok(v) => v,
@@ -6973,6 +6833,7 @@ fn start_import_files(
                     &patient_folder,
                     &patient_path,
                 );
+                emit_progress(98.0, false, None);
                 let _ = tx.commit();
             }
         }
@@ -6983,7 +6844,6 @@ fn start_import_files(
         job_id,
         target_folder,
         created_new_folder,
-        planned_paths,
     })
 }
 
@@ -7238,7 +7098,7 @@ fn delete_local_cache_copy_files(
 
 #[tauri::command]
 async fn delete_main_cache_files(
-    app_handle: tauri::AppHandle,
+    _app_handle: tauri::AppHandle,
     workspace_dir: String,
 ) -> Result<(), String> {
     if IMPORT_ACTIVE_COUNT.load(Ordering::Relaxed) > 0 || PREVIEW_FILL_RUNNING.load(Ordering::Relaxed) {

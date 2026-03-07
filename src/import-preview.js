@@ -62,6 +62,15 @@ let isDrawingLine = false;
 let lastDrawPoint = null;
 let hasDrawnLines = false;
 let lineSegments = [];
+const toolbarHiddenForMode = previewMode === "wizard";
+
+if (toolbarHiddenForMode && previewToolbar) {
+  previewToolbar.hidden = true;
+  previewToolbar.setAttribute("aria-hidden", "true");
+}
+if (toolbarHiddenForMode && previewRoot) {
+  previewRoot.classList.add("wizard-preview-mode");
+}
 let saveModeActive = false;
 let availableTreatmentFolders = [];
 let selectedExistingTreatmentFolder = "";
@@ -1158,6 +1167,14 @@ previewRoot?.addEventListener("click", (event) => {
   if (event.target.closest(".preview-nav")) return;
   if (event.target.closest(".preview-toolbar")) return;
   if (event.target.closest(".preview-loading")) return;
+  if (previewMode === "wizard") {
+    const rect = previewRoot?.getBoundingClientRect();
+    if (!rect) return;
+    const x = Number(event.clientX) - rect.left;
+    const goPrev = x < rect.width / 2;
+    void navigateByOffset(goPrev ? -1 : 1);
+    return;
+  }
   toggleControlsVisible();
 });
 
@@ -1340,7 +1357,7 @@ void listen(previewEventName, (event) => {
   setSaveDropdownOpen(false);
   if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
   if (path && !navigationPaths.includes(path)) {
-    navigationPaths.unshift(path);
+    navigationPaths.push(path);
   }
   if (!path) {
     updateNavigationButtons();
@@ -1376,7 +1393,7 @@ void (async () => {
     if (normalized) {
       loadRotationUiState();
       if (!navigationPaths.includes(normalized)) {
-        navigationPaths.unshift(normalized);
+        navigationPaths.push(normalized);
       }
       await setPreview(normalized);
     } else {

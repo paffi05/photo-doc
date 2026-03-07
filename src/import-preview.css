@@ -53,6 +53,12 @@ body{
   pointer-events: auto;
 }
 
+.preview-root.wizard-preview-mode .preview-toolbar{
+  display: none !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
 .preview-toolbar-btn{
   appearance: none;
   width: 36px;

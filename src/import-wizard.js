@@ -56,6 +56,18 @@ const pendingRows = [];
 const previewDataUrlByPath = new Map();
 const candidateRowsByPath = new Map();
 const thumbnailFetchInFlight = new Set();
+const thumbnailFetchQueue = [];
+let thumbnailFetchActiveCount = 0;
+const WIZARD_LIST_THUMB_MAX_CONCURRENCY = 2;
+const importListThumbByPath = new Map();
+let pendingRowsVersion = 0;
+let lastImportUiRenderKey = "";
+let importListRenderToken = 0;
+const WIZARD_LIST_RENDER_BATCH_SIZE = 80;
+const WIZARD_LIST_MAX_VISIBLE_ROWS = 320;
+const WIZARD_LIST_THUMB_REQUEST_LIMIT = 48;
+const WIZARD_POLL_SCAN_LIMIT = 120;
+const WIZARD_POLL_ACCEPT_LIMIT = 8;
 
 const FILE_DECODE_RETRY_MIN_MS = 250;
 const WATCH_FOLDER_POLL_MS = 400;
@@ -93,10 +105,16 @@ function wizardTrace(scope, message, extra = null) {
   }
 }
 
+function getPendingRowsChronological() {
+  // Keep display/navigation order aligned with detection order:
+  // pendingRows is newest-first (unshift), so reverse to oldest-first.
+  return pendingRows.slice().reverse();
+}
+
 function getPendingPreviewPaths() {
   const seen = new Set();
   const out = [];
-  for (const row of pendingRows) {
+  for (const row of getPendingRowsChronological()) {
     const path = String(row?.path ?? "").trim();
     if (!path || seen.has(path)) continue;
     seen.add(path);
@@ -129,20 +147,55 @@ function scheduleImportWizardCacheWarm(path) {
 function requestListThumbnail(path) {
   const safePath = String(path ?? "").trim();
   if (!safePath) return;
+  if (!importExpanded || importMode) return;
   if (previewDataUrlByPath.has(safePath)) return;
-  if (thumbnailFetchInFlight.has(safePath)) return;
-  thumbnailFetchInFlight.add(safePath);
-  window.setTimeout(() => {
-    void fetchPreviewForPath(safePath)
-      .then(() => {
-        if (previewDataUrlByPath.has(safePath)) {
-          renderImportUi();
-        }
-      })
-      .finally(() => {
-        thumbnailFetchInFlight.delete(safePath);
-      });
-  }, 0);
+  if (thumbnailFetchInFlight.has(safePath) || thumbnailFetchQueue.includes(safePath)) return;
+  thumbnailFetchQueue.push(safePath);
+  pumpListThumbnailQueue();
+}
+
+function markPendingRowsChanged() {
+  pendingRowsVersion += 1;
+}
+
+function updateImportListThumb(path) {
+  const safePath = String(path ?? "").trim();
+  if (!safePath || !importList) return;
+  const dataUrl = previewDataUrlByPath.get(safePath) || "";
+  if (!dataUrl) return;
+  const thumb = importListThumbByPath.get(safePath) ?? null;
+  if (!thumb) return;
+  const img = document.createElement("img");
+  img.src = dataUrl;
+  img.alt = "";
+  thumb.innerHTML = "";
+  thumb.appendChild(img);
+}
+
+function pumpListThumbnailQueue() {
+  if (!importExpanded || importMode) return;
+  while (thumbnailFetchActiveCount < WIZARD_LIST_THUMB_MAX_CONCURRENCY && thumbnailFetchQueue.length > 0) {
+    const safePath = String(thumbnailFetchQueue.shift() ?? "").trim();
+    if (!safePath) continue;
+    if (previewDataUrlByPath.has(safePath)) continue;
+    if (thumbnailFetchInFlight.has(safePath)) continue;
+    thumbnailFetchInFlight.add(safePath);
+    thumbnailFetchActiveCount += 1;
+    window.setTimeout(() => {
+      void fetchPreviewForPath(safePath)
+        .then(() => {
+          if (!importExpanded || importMode) return;
+          if (previewDataUrlByPath.has(safePath)) {
+            updateImportListThumb(safePath);
+          }
+        })
+        .finally(() => {
+          thumbnailFetchInFlight.delete(safePath);
+          thumbnailFetchActiveCount = Math.max(0, thumbnailFetchActiveCount - 1);
+          pumpListThumbnailQueue();
+        });
+    }, 0);
+  }
 }
 
 function renderImportUi() {
@@ -156,86 +209,122 @@ function renderImportUi() {
   importToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
   importPanel.classList.toggle("expanded", expanded);
   importPanel.classList.toggle("inactive", importMode);
+  const renderKey = `${importMode ? 1 : 0}|${importExpanded ? 1 : 0}|${importBusy ? 1 : 0}|${pendingRowsVersion}`;
+  if (renderKey === lastImportUiRenderKey) return;
+  lastImportUiRenderKey = renderKey;
 
-  if (!expanded || count < 1) return;
+  if (!expanded || count < 1) {
+    importListThumbByPath.clear();
+    thumbnailFetchQueue.length = 0;
+    importListRenderToken += 1;
+    return;
+  }
+  const rows = getPendingRowsChronological().slice(0, WIZARD_LIST_MAX_VISIBLE_ROWS);
+  const renderToken = ++importListRenderToken;
   importList.innerHTML = "";
-  const missingThumbPaths = [];
-  for (const row of pendingRows) {
-    const path = String(row?.path ?? "").trim();
-    const name = String(row?.name ?? "").trim() || path;
-    const li = document.createElement("li");
-    li.className = "wizard-import-item";
+  importListThumbByPath.clear();
+  let thumbsRequested = 0;
+  let index = 0;
+  const appendBatch = () => {
+    if (renderToken !== importListRenderToken) return;
+    const fragment = document.createDocumentFragment();
+    const end = Math.min(rows.length, index + WIZARD_LIST_RENDER_BATCH_SIZE);
+    while (index < end) {
+      const row = rows[index];
+      index += 1;
+      const path = String(row?.path ?? "").trim();
+      const name = String(row?.name ?? "").trim() || path;
+      const li = document.createElement("li");
+      li.className = "wizard-import-item";
+      if (path) li.dataset.path = path;
 
-    const thumb = document.createElement("span");
-    thumb.className = "wizard-import-thumb";
-    const dataUrl = previewDataUrlByPath.get(path) || "";
-    if (dataUrl) {
-      const img = document.createElement("img");
-      img.src = dataUrl;
-      img.alt = "";
-      thumb.appendChild(img);
-    } else if (path) {
-      missingThumbPaths.push(path);
-    }
-    li.appendChild(thumb);
+      const thumb = document.createElement("span");
+      thumb.className = "wizard-import-thumb";
+      if (path) importListThumbByPath.set(path, thumb);
+      const dataUrl = previewDataUrlByPath.get(path) || "";
+      if (dataUrl) {
+        const img = document.createElement("img");
+        img.src = dataUrl;
+        img.alt = "";
+        thumb.appendChild(img);
+      } else if (path) {
+        thumb.textContent = "IMG";
+        if (thumbsRequested < WIZARD_LIST_THUMB_REQUEST_LIMIT) {
+          thumbsRequested += 1;
+          requestListThumbnail(path);
+        }
+      }
+      li.appendChild(thumb);
 
-    const title = document.createElement("span");
-    title.className = "wizard-import-name";
-    title.textContent = name;
-    title.title = name;
-    li.appendChild(title);
-    li.addEventListener("click", () => {
-      if (!path) return;
-      void sendLivePreviewPath(path, getPendingPreviewPaths(), {
-        force: true,
-        userInitiated: true,
+      const title = document.createElement("span");
+      title.className = "wizard-import-name";
+      title.textContent = name;
+      title.title = name;
+      li.appendChild(title);
+      li.addEventListener("click", () => {
+        if (!path) return;
+        void sendLivePreviewPath(path, getPendingPreviewPaths(), {
+          force: true,
+          userInitiated: true,
+        });
       });
-    });
 
-    const removeBtn = document.createElement("button");
-    removeBtn.type = "button";
-    removeBtn.className = "wizard-import-remove";
-    removeBtn.setAttribute("aria-label", `Remove ${name}`);
-    removeBtn.textContent = "\u00D7";
-    removeBtn.disabled = importMode;
-    removeBtn.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      if (removeBtn.disabled) return;
-      removeBtn.disabled = true;
-      previewDataUrlByPath.delete(path);
-      const idx = pendingRows.findIndex((entry) => String(entry?.path ?? "").trim() === path);
-      if (idx >= 0) pendingRows.splice(idx, 1);
-      const importIdx = importModeFilePaths.findIndex((entry) => String(entry ?? "").trim() === path);
-      if (importIdx >= 0) importModeFilePaths.splice(importIdx, 1);
-      if (livePreviewPinnedPath === path) livePreviewPinnedPath = "";
-      if (lastLivePreviewPath === path) {
-        lastLivePreviewPath = "";
-        lastPreviewDispatchSignature = "";
-      }
-      renderImportUi();
-      updateActionButtonState();
-      window.setTimeout(() => {
-        void syncLivePreviewNavigation();
-      }, 0);
-      if (importWizardDir && path) {
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.className = "wizard-import-remove";
+      removeBtn.setAttribute("aria-label", `Remove ${name}`);
+      removeBtn.textContent = "\u00D7";
+      removeBtn.disabled = importMode;
+      removeBtn.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (removeBtn.disabled) return;
+        removeBtn.disabled = true;
+        previewDataUrlByPath.delete(path);
+        const idx = pendingRows.findIndex((entry) => String(entry?.path ?? "").trim() === path);
+        if (idx >= 0) {
+          pendingRows.splice(idx, 1);
+          markPendingRowsChanged();
+        }
+        const importIdx = importModeFilePaths.findIndex((entry) => String(entry ?? "").trim() === path);
+        if (importIdx >= 0) importModeFilePaths.splice(importIdx, 1);
+        if (livePreviewPinnedPath === path) livePreviewPinnedPath = "";
+        if (lastLivePreviewPath === path) {
+          lastLivePreviewPath = "";
+          lastPreviewDispatchSignature = "";
+        }
+        renderImportUi();
+        updateActionButtonState();
         window.setTimeout(() => {
-          void invoke("remove_import_wizard_cached_preview", {
-            folderDir: importWizardDir,
-            path,
-          }).catch((err) => {
-            console.error("remove_import_wizard_cached_preview failed:", err);
-          });
+          void syncLivePreviewNavigation();
         }, 0);
-      }
-    });
-    li.appendChild(removeBtn);
-
-    importList.appendChild(li);
-  }
-  for (const path of missingThumbPaths) {
-    requestListThumbnail(path);
-  }
+        if (importWizardDir && path) {
+          window.setTimeout(() => {
+            void invoke("remove_import_wizard_cached_preview", {
+              folderDir: importWizardDir,
+              path,
+            }).catch((err) => {
+              console.error("remove_import_wizard_cached_preview failed:", err);
+            });
+          }, 0);
+        }
+      });
+      li.appendChild(removeBtn);
+      fragment.appendChild(li);
+    }
+    importList.appendChild(fragment);
+    if (index < rows.length) {
+      requestAnimationFrame(appendBatch);
+      return;
+    }
+    if (pendingRows.length > WIZARD_LIST_MAX_VISIBLE_ROWS) {
+      const overflow = document.createElement("li");
+      overflow.className = "wizard-import-item";
+      overflow.textContent = `Showing latest ${WIZARD_LIST_MAX_VISIBLE_ROWS} of ${pendingRows.length}`;
+      importList.appendChild(overflow);
+    }
+  };
+  requestAnimationFrame(appendBatch);
 }
 
 function getTodayDateString() {
@@ -423,6 +512,8 @@ async function clearWizardPreviewCache() {
 
 async function enterImportMode() {
   importMode = true;
+  thumbnailFetchQueue.length = 0;
+  importListThumbByPath.clear();
   livePreviewBlockedByImport = true;
   livePreviewManuallyClosed = true;
   if (livePreviewToggle) {
@@ -464,6 +555,7 @@ async function runImportDone() {
   importBusy = true;
   updateActionButtonState();
   const filePaths = [...importModeFilePaths];
+  const importedImageCount = filePaths.filter((path) => /\.(jpe?g|png)$/i.test(String(path ?? "").trim())).length;
   try {
     const result = await invoke("start_import_files", {
       workspaceDir,
@@ -482,9 +574,8 @@ async function runImportDone() {
       targetFolder: String(result?.target_folder ?? result?.targetFolder ?? "").trim(),
       jobId,
       importWizardDir,
-      plannedPaths: Array.isArray(result?.planned_paths ?? result?.plannedPaths)
-        ? (result?.planned_paths ?? result?.plannedPaths)
-        : [],
+      importedImageCount,
+      importedTotalCount: filePaths.length,
     }).catch(() => {});
     await closeLivePreviewWindow();
     await invoke("close_import_wizard_helper_window").catch(async () => {
@@ -539,14 +630,19 @@ async function saveLivePreviewToggleSetting(enabled) {
 async function fetchPreviewForPath(path) {
   if (!path || previewDataUrlByPath.has(path)) return;
   try {
-    const dataUrl = String(
-      await invoke("get_import_wizard_quick_preview_data_url", { path })
-    ).trim();
+    const rows = await invoke("get_import_wizard_cached_previews", {
+      folderDir: importWizardDir,
+      paths: [path],
+      includeDataUrl: true,
+      generateIfMissing: true,
+    });
+    const row = Array.isArray(rows) ? rows[0] : null;
+    const dataUrl = String(row?.data_url ?? row?.dataUrl ?? "").trim();
     if (dataUrl) {
       previewDataUrlByPath.set(path, dataUrl);
     }
   } catch (err) {
-    console.error("get_import_wizard_quick_preview_data_url failed:", err);
+    console.error("get_import_wizard_cached_previews failed:", err);
   }
 }
 
@@ -576,12 +672,14 @@ async function pollWatchFolder() {
         const aMs = Number(a?.modified_ms ?? a?.modifiedMs ?? a?.created_ms ?? a?.createdMs ?? 0) || 0;
         const bMs = Number(b?.modified_ms ?? b?.modifiedMs ?? b?.created_ms ?? b?.createdMs ?? 0) || 0;
         return bMs - aMs;
-      });
+      })
+      .slice(0, WIZARD_POLL_SCAN_LIMIT);
     wizardTrace("poll", "list fetched", { totalRows: list.length });
     const now = Date.now();
     const seenCandidatePaths = new Set();
     const previousPendingCount = pendingRows.length;
     let latestAddedPath = "";
+    let acceptedThisPoll = 0;
     for (const row of list) {
       const path = String(row?.path ?? "").trim();
       const isImage = Boolean(row?.is_image ?? row?.isImage ?? false);
@@ -597,6 +695,8 @@ async function pollWatchFolder() {
       candidateRowsByPath.delete(path);
       knownPaths.add(path);
       pendingRows.unshift(row);
+      markPendingRowsChanged();
+      acceptedThisPoll += 1;
       if (!latestAddedPath) latestAddedPath = path;
       wizardTrace("detect", "candidate accepted", {
         path,
@@ -611,6 +711,9 @@ async function pollWatchFolder() {
             .then(() => fetchPreviewForPath(path))
             .then(renderImportUi);
         }, 50);
+      }
+      if (acceptedThisPoll >= WIZARD_POLL_ACCEPT_LIMIT) {
+        break;
       }
     }
     for (const path of candidateRowsByPath.keys()) {
@@ -908,7 +1011,7 @@ async function syncLivePreviewNavigation() {
   }
   const activePath = navPaths.includes(livePreviewPinnedPath)
     ? livePreviewPinnedPath
-    : navPaths[0];
+    : (navPaths.includes(lastLivePreviewPath) ? lastLivePreviewPath : navPaths[0]);
   if (!activePath) return;
   wizardTrace("preview", "sync navigation dispatch", {
     activePath,
@@ -1141,3 +1244,4 @@ async function init() {
 
 window.addEventListener("beforeunload", cleanup);
 void init();
+
