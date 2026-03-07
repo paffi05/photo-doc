@@ -344,9 +344,12 @@ body{
 
 .draw-canvas{
   position: absolute;
-  inset: 0;
+  left: 50%;
+  top: 50%;
   z-index: 1;
   pointer-events: none;
+  transform-origin: center center;
+  will-change: transform;
 }
 
 .preview-root.draw-mode .draw-canvas{

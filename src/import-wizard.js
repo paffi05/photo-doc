@@ -1,5 +1,5 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { invoke } from "@tauri-apps/api/core";
+import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { FULL_TRACE } from "./trace-config";
@@ -54,6 +54,7 @@ let existingTreatmentFolders = [];
 const knownPaths = new Set();
 const pendingRows = [];
 const previewDataUrlByPath = new Map();
+const previewSrcByPath = new Map();
 const candidateRowsByPath = new Map();
 const thumbnailFetchInFlight = new Set();
 const thumbnailFetchQueue = [];
@@ -161,15 +162,29 @@ function markPendingRowsChanged() {
 function updateImportListThumb(path) {
   const safePath = String(path ?? "").trim();
   if (!safePath || !importList) return;
+  const directSrc = previewSrcByPath.get(safePath) || "";
   const dataUrl = previewDataUrlByPath.get(safePath) || "";
-  if (!dataUrl) return;
+  const chosenSrc = directSrc || dataUrl;
+  if (!chosenSrc) return;
   const thumb = importListThumbByPath.get(safePath) ?? null;
   if (!thumb) return;
   const img = document.createElement("img");
-  img.src = dataUrl;
+  img.src = chosenSrc;
   img.alt = "";
   thumb.innerHTML = "";
   thumb.appendChild(img);
+}
+
+function rememberRowPreviewPath(row) {
+  const path = String(row?.path ?? "").trim();
+  const previewPath = String(row?.preview_path ?? row?.previewPath ?? "").trim();
+  if (!path || !previewPath) return;
+  try {
+    previewSrcByPath.set(path, convertFileSrc(previewPath));
+    updateImportListThumb(path);
+  } catch {
+    // ignore invalid path
+  }
 }
 
 function pumpListThumbnailQueue() {
@@ -185,7 +200,7 @@ function pumpListThumbnailQueue() {
       void fetchPreviewForPath(safePath)
         .then(() => {
           if (!importExpanded || importMode) return;
-          if (previewDataUrlByPath.has(safePath)) {
+          if (previewSrcByPath.has(safePath) || previewDataUrlByPath.has(safePath)) {
             updateImportListThumb(safePath);
           }
         })
@@ -232,6 +247,7 @@ function renderImportUi() {
     while (index < end) {
       const row = rows[index];
       index += 1;
+      rememberRowPreviewPath(row);
       const path = String(row?.path ?? "").trim();
       const name = String(row?.name ?? "").trim() || path;
       const li = document.createElement("li");
@@ -241,10 +257,12 @@ function renderImportUi() {
       const thumb = document.createElement("span");
       thumb.className = "wizard-import-thumb";
       if (path) importListThumbByPath.set(path, thumb);
+      const directSrc = previewSrcByPath.get(path) || "";
       const dataUrl = previewDataUrlByPath.get(path) || "";
-      if (dataUrl) {
+      const chosenSrc = directSrc || dataUrl;
+      if (chosenSrc) {
         const img = document.createElement("img");
-        img.src = dataUrl;
+        img.src = chosenSrc;
         img.alt = "";
         thumb.appendChild(img);
       } else if (path) {
@@ -280,7 +298,7 @@ function renderImportUi() {
         event.stopPropagation();
         if (removeBtn.disabled) return;
         removeBtn.disabled = true;
-        previewDataUrlByPath.delete(path);
+          previewDataUrlByPath.delete(path);
         const idx = pendingRows.findIndex((entry) => String(entry?.path ?? "").trim() === path);
         if (idx >= 0) {
           pendingRows.splice(idx, 1);
@@ -553,9 +571,12 @@ async function runImportDone() {
   if (!treatmentName || importModeFilePaths.length < 1 || importBusy) return;
 
   importBusy = true;
+  livePreviewBlockedByImport = true;
   updateActionButtonState();
   const filePaths = [...importModeFilePaths];
-  const importedImageCount = filePaths.filter((path) => /\.(jpe?g|png)$/i.test(String(path ?? "").trim())).length;
+  const importedImageCount = filePaths.filter((path) => (
+    /\.(avif|bmp|gif|heic|heif|jfif|jpe|jpeg|jpg|png|tif|tiff|webp)$/i.test(String(path ?? "").trim())
+  )).length;
   try {
     const result = await invoke("start_import_files", {
       workspaceDir,
@@ -568,7 +589,7 @@ async function runImportDone() {
       importWizardDir: importWizardDir || null,
     });
     const jobId = Number(result?.job_id ?? result?.jobId ?? 0) || null;
-    await invoke("notify_import_wizard_completed", {
+    void invoke("notify_import_wizard_completed", {
       workspaceDir,
       patientFolder,
       targetFolder: String(result?.target_folder ?? result?.targetFolder ?? "").trim(),
@@ -576,9 +597,10 @@ async function runImportDone() {
       importWizardDir,
       importedImageCount,
       importedTotalCount: filePaths.length,
+      selectTargetFolder: true,
     }).catch(() => {});
-    await closeLivePreviewWindow();
-    await invoke("close_import_wizard_helper_window").catch(async () => {
+    void closeLivePreviewWindow();
+    void invoke("close_import_wizard_helper_window").catch(async () => {
       const current = getCurrentWindow();
       try {
         await current.close();
@@ -586,6 +608,7 @@ async function runImportDone() {
         // ignore
       }
     });
+    return;
   } catch (err) {
     console.error("import wizard done failed:", err);
   } finally {
@@ -683,8 +706,12 @@ async function pollWatchFolder() {
     for (const row of list) {
       const path = String(row?.path ?? "").trim();
       const isImage = Boolean(row?.is_image ?? row?.isImage ?? false);
-      if (!path || !isImage || knownPaths.has(path)) continue;
-      if (pendingRows.some((entry) => String(entry?.path ?? "").trim() === path)) continue;
+      if (!path || !isImage) continue;
+      const existingPending = pendingRows.find((entry) => String(entry?.path ?? "").trim() === path) ?? null;
+      if (knownPaths.has(path) || existingPending) {
+        rememberRowPreviewPath(row);
+        continue;
+      }
       seenCandidatePaths.add(path);
       wizardTrace("detect", "candidate seen", { path, size: Number(row?.size ?? 0) || 0 });
       trackImportRowCandidate(row, now);
@@ -694,23 +721,25 @@ async function pollWatchFolder() {
       }
       candidateRowsByPath.delete(path);
       knownPaths.add(path);
+      rememberRowPreviewPath(row);
       pendingRows.unshift(row);
       markPendingRowsChanged();
+      scheduleImportWizardCacheWarm(path);
+      if (!previewDataUrlByPath.has(path)) requestListThumbnail(path);
       acceptedThisPoll += 1;
       if (!latestAddedPath) latestAddedPath = path;
       wizardTrace("detect", "candidate accepted", {
         path,
         pendingCount: pendingRows.length,
       });
-      scheduleImportWizardCacheWarm(path);
-      // Avoid heavy thumbnail generation directly on first-detect path.
-      // The full live preview window handles image loading; list thumbs can load lazily.
       if (importExpanded) {
         window.setTimeout(() => {
-          void invalidateCachedPreview(path)
-            .then(() => fetchPreviewForPath(path))
-            .then(renderImportUi);
-        }, 50);
+          void fetchPreviewForPath(path).then(renderImportUi);
+        }, 0);
+        window.setTimeout(() => {
+          if (previewDataUrlByPath.has(path)) return;
+          void fetchPreviewForPath(path).then(renderImportUi);
+        }, 120);
       }
       if (acceptedThisPoll >= WIZARD_POLL_ACCEPT_LIMIT) {
         break;

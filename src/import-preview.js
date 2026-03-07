@@ -30,6 +30,9 @@ const navNextBtn = document.getElementById("navNextBtn");
 let previewRequestToken = 0;
 let currentPreviewPath = "";
 let navigationPaths = [];
+let previewLoadInFlight = false;
+let queuedPreviewPath = "";
+let queuedPreviewNavPaths = null;
 let currentScale = 1;
 let rotationDeg = 0;
 let translateX = 0;
@@ -62,6 +65,8 @@ let isDrawingLine = false;
 let lastDrawPoint = null;
 let hasDrawnLines = false;
 let lineSegments = [];
+let drawCanvasRenderScale = 1;
+let currentStroke = null;
 const toolbarHiddenForMode = previewMode === "wizard";
 
 if (toolbarHiddenForMode && previewToolbar) {
@@ -196,9 +201,21 @@ function updatePanCursorState() {
 }
 
 function applyTransform() {
-  if (!previewImage) return;
-  previewImage.style.transform =
+  const transform =
     `translate(-50%, -50%) translate(${translateX}px, ${translateY}px) rotate(${rotationDeg}deg) scale(${currentScale})`;
+  if (previewImage) {
+    previewImage.style.transform = transform;
+  }
+  if (drawCanvas) {
+    drawCanvas.style.transform = transform;
+  }
+  const targetRenderScale = Math.min(8, Math.max(1, Math.max(1, window.devicePixelRatio || 1) * currentScale));
+  const scaleDrift = Math.abs(targetRenderScale - drawCanvasRenderScale);
+  if (drawCanvas && baseImageWidth > 0 && baseImageHeight > 0 && scaleDrift > 0.01) {
+    resizeDrawCanvas();
+  } else {
+    redrawDrawCanvas();
+  }
   updatePanCursorState();
 }
 
@@ -209,15 +226,16 @@ function drawColorToCss(color) {
 }
 
 function resizeDrawCanvas() {
-  if (!drawCanvas || !previewRoot) return;
-  const rect = previewRoot.getBoundingClientRect();
+  if (!drawCanvas) return;
   const dpr = Math.max(1, window.devicePixelRatio || 1);
-  const w = Math.max(1, Math.round(rect.width * dpr));
-  const h = Math.max(1, Math.round(rect.height * dpr));
+  drawCanvasRenderScale = Math.min(8, Math.max(dpr, dpr * currentScale));
+  const w = Math.max(1, Math.round(baseImageWidth * drawCanvasRenderScale));
+  const h = Math.max(1, Math.round(baseImageHeight * drawCanvasRenderScale));
   if (drawCanvas.width !== w) drawCanvas.width = w;
   if (drawCanvas.height !== h) drawCanvas.height = h;
-  drawCanvas.style.width = `${Math.round(rect.width)}px`;
-  drawCanvas.style.height = `${Math.round(rect.height)}px`;
+  drawCanvas.style.width = `${Math.round(baseImageWidth)}px`;
+  drawCanvas.style.height = `${Math.round(baseImageHeight)}px`;
+  redrawDrawCanvas();
 }
 
 function clearDrawCanvas() {
@@ -227,47 +245,106 @@ function clearDrawCanvas() {
   ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
   hasDrawnLines = false;
   lineSegments = [];
+  currentStroke = null;
   previewToolbar?.classList.remove("has-lines");
   setSaveModeActive(false);
 }
 
 function drawPointFromClient(clientX, clientY) {
-  if (!drawCanvas || !previewRoot) return null;
-  const rect = previewRoot.getBoundingClientRect();
-  if (rect.width <= 0 || rect.height <= 0) return null;
-  const sx = drawCanvas.width / rect.width;
-  const sy = drawCanvas.height / rect.height;
+  const point = getImagePointFromClient(clientX, clientY);
+  if (!point || !drawCanvas || baseImageWidth <= 0 || baseImageHeight <= 0) return null;
+  const { sx, sy } = getDrawScale();
   return {
-    x: (clientX - rect.left) * sx,
-    y: (clientY - rect.top) * sy,
+    x: point.x * sx,
+    y: point.y * sy,
   };
+}
+
+function getDrawScale() {
+  const fallback = Math.max(1, window.devicePixelRatio || 1);
+  const sx = baseImageWidth > 0 ? drawCanvas.width / baseImageWidth : drawCanvasRenderScale || fallback;
+  const sy = baseImageHeight > 0 ? drawCanvas.height / baseImageHeight : drawCanvasRenderScale || fallback;
+  return {
+    sx,
+    sy,
+  };
+}
+
+function getImagePointFromClient(clientX, clientY) {
+  if (!previewRoot || baseImageWidth <= 0 || baseImageHeight <= 0) return null;
+  const point = getPointInRoot(clientX, clientY);
+  if (!point) return null;
+  const { width: rootWidth, height: rootHeight } = getRootSize();
+  const centerX = (rootWidth / 2) + translateX;
+  const centerY = (rootHeight / 2) + translateY;
+  const scaledX = (point.x - centerX) / currentScale;
+  const scaledY = (point.y - centerY) / currentScale;
+  const angle = (-rotationDeg * Math.PI) / 180;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const localX = (scaledX * cos) - (scaledY * sin);
+  const localY = (scaledX * sin) + (scaledY * cos);
+  const x = localX + (baseImageWidth / 2);
+  const y = localY + (baseImageHeight / 2);
+  if (x < 0 || y < 0 || x > baseImageWidth || y > baseImageHeight) return null;
+  return { x, y };
+}
+
+function redrawDrawCanvas() {
+  if (!drawCanvas) return;
+  const ctx = drawCanvas.getContext("2d");
+  if (!ctx) return;
+  ctx.imageSmoothingEnabled = true;
+  ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
+  if (!Array.isArray(lineSegments) || lineSegments.length < 1) return;
+  const { sx, sy } = getDrawScale();
+  const baseStrokeWidth = Math.max(1.15, Math.min(2.1, 1.35 * Math.max(window.devicePixelRatio || 1, 1)));
+  for (const stroke of lineSegments) {
+    if (!stroke || !Array.isArray(stroke.points) || stroke.points.length < 1) continue;
+    const points = stroke.points;
+    ctx.strokeStyle = drawColorToCss(stroke.color);
+    ctx.lineWidth = baseStrokeWidth * Math.max(sx, sy);
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    if (points.length === 1) {
+      const p = points[0];
+      ctx.arc(p.x * sx, p.y * sy, ctx.lineWidth * 0.5, 0, Math.PI * 2);
+      ctx.fillStyle = drawColorToCss(stroke.color);
+      ctx.fill();
+      continue;
+    }
+    ctx.moveTo(points[0].x * sx, points[0].y * sy);
+    for (let i = 1; i < points.length - 1; i += 1) {
+      const current = points[i];
+      const next = points[i + 1];
+      const midX = ((current.x + next.x) / 2) * sx;
+      const midY = ((current.y + next.y) / 2) * sy;
+      ctx.quadraticCurveTo(current.x * sx, current.y * sy, midX, midY);
+    }
+    const penultimate = points[points.length - 2];
+    const last = points[points.length - 1];
+    ctx.quadraticCurveTo(penultimate.x * sx, penultimate.y * sy, last.x * sx, last.y * sy);
+    ctx.stroke();
+  }
 }
 
 function continueDrawingTo(clientX, clientY) {
   if (!drawCanvas || !isDrawingLine || !lastDrawPoint) return;
-  const next = drawPointFromClient(clientX, clientY);
+  const next = getImagePointFromClient(clientX, clientY);
   if (!next) return;
-  const ctx = drawCanvas.getContext("2d");
-  if (!ctx) return;
-  ctx.strokeStyle = drawColorToCss(selectedDrawColor);
-  ctx.lineWidth = Math.max(2, Math.round((window.devicePixelRatio || 1) * 2.2));
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.beginPath();
-  ctx.moveTo(lastDrawPoint.x, lastDrawPoint.y);
-  ctx.lineTo(next.x, next.y);
-  ctx.stroke();
-  lineSegments.push({
-    color: selectedDrawColor,
-    x1: lastDrawPoint.x,
-    y1: lastDrawPoint.y,
-    x2: next.x,
-    y2: next.y,
-  });
+  const minPointDistance = 0.7;
+  const dx = next.x - lastDrawPoint.x;
+  const dy = next.y - lastDrawPoint.y;
+  if (Math.hypot(dx, dy) < minPointDistance) return;
+  if (currentStroke && Array.isArray(currentStroke.points)) {
+    currentStroke.points.push(next);
+  }
   if (!hasDrawnLines) {
     hasDrawnLines = true;
     previewToolbar?.classList.add("has-lines");
   }
+  redrawDrawCanvas();
   lastDrawPoint = next;
 }
 
@@ -663,53 +740,14 @@ function currentDateYmd() {
 }
 
 async function exportAnnotatedTempFile() {
-  if (!drawCanvas || !currentPreviewPath) {
+  if (!currentPreviewPath) {
     throw new Error("missing preview state");
   }
-  const ext = String(currentPreviewPath.split(".").pop() ?? "").toLowerCase();
-  const mime = ext === "png" ? "image/png" : "image/jpeg";
-  const outExt = ext === "png" ? "png" : "jpg";
-  const loadBaseImage = (src) =>
-    new Promise((resolve, reject) => {
-      const img = new Image();
-      img.decoding = "async";
-      img.onload = () => resolve(img);
-      img.onerror = () => reject(new Error("base image load failed"));
-      img.src = src;
-    });
-  let baseImage = null;
-  try {
-    baseImage = await loadBaseImage(`${convertFileSrc(currentPreviewPath)}?t=${Date.now()}`);
-  } catch {
-    const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: currentPreviewPath });
-    baseImage = await loadBaseImage(String(dataUrl ?? ""));
-  }
-  const targetCanvas = document.createElement("canvas");
-  const w = Math.max(1, Number(baseImage?.naturalWidth) || 0);
-  const h = Math.max(1, Number(baseImage?.naturalHeight) || 0);
-  targetCanvas.width = w;
-  targetCanvas.height = h;
-  const ctx = targetCanvas.getContext("2d");
-  if (!ctx) throw new Error("2d context unavailable");
-  ctx.drawImage(baseImage, 0, 0, w, h);
-
-  const viewW = Math.max(1, drawCanvas.width);
-  const viewH = Math.max(1, drawCanvas.height);
-  for (const seg of lineSegments) {
-    ctx.strokeStyle = drawColorToCss(seg.color);
-    ctx.lineWidth = Math.max(2, Math.round((w / viewW) * 2.4));
-    ctx.lineCap = "round";
-    ctx.lineJoin = "round";
-    ctx.beginPath();
-    ctx.moveTo((seg.x1 / viewW) * w, (seg.y1 / viewH) * h);
-    ctx.lineTo((seg.x2 / viewW) * w, (seg.y2 / viewH) * h);
-    ctx.stroke();
-  }
-
-  const dataUrl = targetCanvas.toDataURL(mime, 0.95);
-  return await invoke("save_import_wizard_preview_data_url_to_temp", {
-    dataUrl,
-    fileExt: outExt,
+  return await invoke("export_annotated_image_to_temp", {
+    path: currentPreviewPath,
+    strokes: lineSegments,
+    previewWidth: Math.max(1, baseImageWidth),
+    previewHeight: Math.max(1, baseImageHeight),
   });
 }
 
@@ -775,6 +813,11 @@ function updateBaseImageSize() {
   baseImageHeight = Math.max(1, naturalHeight * safeRatio);
   previewImage.style.width = `${baseImageWidth}px`;
   previewImage.style.height = `${baseImageHeight}px`;
+  if (drawCanvas) {
+    drawCanvas.style.width = `${baseImageWidth}px`;
+    drawCanvas.style.height = `${baseImageHeight}px`;
+  }
+  resizeDrawCanvas();
 }
 
 function resetTransform() {
@@ -834,6 +877,7 @@ function loadImageWithVerification(src, requestToken) {
       if (done) return;
       done = true;
       cleanup();
+      previewImage.style.visibility = "visible";
       previewTrace("image", "img.onload", {
         requestToken,
         ms: Math.round(performance.now() - startedAt),
@@ -851,6 +895,7 @@ function loadImageWithVerification(src, requestToken) {
       if (done) return;
       done = true;
       cleanup();
+      previewImage.style.visibility = "hidden";
       previewTrace("image", "img.onerror", {
         requestToken,
         ms: Math.round(performance.now() - startedAt),
@@ -863,6 +908,8 @@ function loadImageWithVerification(src, requestToken) {
       requestToken,
       srcKind: String(src ?? "").startsWith("data:") ? "data-url" : "file-src",
     });
+    previewImage.style.visibility = "hidden";
+    previewImage.removeAttribute("src");
     previewImage.src = src;
   });
 }
@@ -897,70 +944,99 @@ async function setPreview(path) {
       totalMs: Math.round(performance.now() - startedAt),
     });
   } catch (err) {
-    previewTrace("setPreview", "original-path failed, fallback to data_url", {
+    previewTrace("setPreview", "original-path failed, fallback to src_path", {
       requestToken,
       path: normalized,
       err: String(err ?? ""),
     });
     if (requestToken !== previewRequestToken) return;
     try {
-      const dataInvokeStart = performance.now();
-      const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
-      previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
+      const srcInvokeStart = performance.now();
+      const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
+      previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
         requestToken,
         path: normalized,
-        ms: Math.round(performance.now() - dataInvokeStart),
-        length: String(dataUrl ?? "").length,
+        ms: Math.round(performance.now() - srcInvokeStart),
       });
       if (requestToken !== previewRequestToken) return;
-      const src = String(dataUrl ?? "").trim();
-      if (!src) return;
+      const safePath = String(resolvedPath ?? "").trim() || normalized;
+      const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
+      previewImage.decoding = "async";
       await loadImageWithVerification(src, requestToken);
       updateBaseImageSize();
       applyTransform();
-      previewTrace("setPreview", "completed via data_url fallback", {
+      previewTrace("setPreview", "completed via src_path fallback", {
         requestToken,
         path: normalized,
         totalMs: Math.round(performance.now() - startedAt),
       });
-    } catch (dataErr) {
-      previewTrace("setPreview", "data_url fallback failed, fallback to src_path", {
+    } catch (srcErr) {
+      previewTrace("setPreview", "src_path fallback failed, fallback to data_url", {
         requestToken,
         path: normalized,
-        err: String(dataErr ?? ""),
+        err: String(srcErr ?? ""),
       });
       if (requestToken !== previewRequestToken) return;
       try {
-        const srcInvokeStart = performance.now();
-        const resolvedPath = await invoke("get_import_wizard_preview_src_path", { path: normalized });
-        previewTrace("setPreview", "get_import_wizard_preview_src_path ok", {
+        const dataInvokeStart = performance.now();
+        const dataUrl = await invoke("get_import_wizard_preview_data_url", { path: normalized });
+        previewTrace("setPreview", "get_import_wizard_preview_data_url ok", {
           requestToken,
           path: normalized,
-          ms: Math.round(performance.now() - srcInvokeStart),
+          ms: Math.round(performance.now() - dataInvokeStart),
+          length: String(dataUrl ?? "").length,
         });
         if (requestToken !== previewRequestToken) return;
-        const safePath = String(resolvedPath ?? "").trim() || normalized;
-        const src = `${convertFileSrc(safePath)}?t=${Date.now()}`;
-        previewImage.decoding = "async";
+        const src = String(dataUrl ?? "").trim();
+        if (!src) return;
         await loadImageWithVerification(src, requestToken);
         updateBaseImageSize();
         applyTransform();
-        previewTrace("setPreview", "completed via src_path fallback", {
+        previewTrace("setPreview", "completed via data_url fallback", {
           requestToken,
           path: normalized,
           totalMs: Math.round(performance.now() - startedAt),
         });
       } catch (fallbackErr) {
-        previewTrace("setPreview", "src_path fallback failed", {
+        previewTrace("setPreview", "data_url fallback failed", {
           requestToken,
           path: normalized,
           err: String(fallbackErr ?? ""),
         });
-        console.error("import preview original load failed:", err, dataErr, fallbackErr);
+        console.error("import preview original load failed:", err, srcErr, fallbackErr);
       }
     }
   } finally {
     hideLoading(requestToken);
+  }
+}
+
+async function requestPreviewLoad(path, paths = null) {
+  const normalizedPath = normalizePath(path);
+  if (!normalizedPath) return;
+  const normalizedPaths = Array.isArray(paths)
+    ? paths.map((entry) => normalizePath(entry)).filter(Boolean)
+    : null;
+  queuedPreviewPath = normalizedPath;
+  queuedPreviewNavPaths = normalizedPaths;
+  if (previewLoadInFlight) return;
+  previewLoadInFlight = true;
+  try {
+    while (queuedPreviewPath) {
+      const nextPath = queuedPreviewPath;
+      const nextPaths = queuedPreviewNavPaths;
+      queuedPreviewPath = "";
+      queuedPreviewNavPaths = null;
+      if (Array.isArray(nextPaths)) {
+        setNavigationPaths(nextPaths);
+        if (nextPath && !navigationPaths.includes(nextPath)) {
+          navigationPaths.push(nextPath);
+        }
+      }
+      await setPreview(nextPath);
+    }
+  } finally {
+    previewLoadInFlight = false;
   }
 }
 
@@ -1167,14 +1243,6 @@ previewRoot?.addEventListener("click", (event) => {
   if (event.target.closest(".preview-nav")) return;
   if (event.target.closest(".preview-toolbar")) return;
   if (event.target.closest(".preview-loading")) return;
-  if (previewMode === "wizard") {
-    const rect = previewRoot?.getBoundingClientRect();
-    if (!rect) return;
-    const x = Number(event.clientX) - rect.left;
-    const goPrev = x < rect.width / 2;
-    void navigateByOffset(goPrev ? -1 : 1);
-    return;
-  }
   toggleControlsVisible();
 });
 
@@ -1262,13 +1330,46 @@ drawSaveBtn?.addEventListener("click", () => {
   if (!previewWorkspaceDir || !previewPatientFolder) return;
   const typed = String(drawSaveInput?.value ?? "").trim();
   if (!typed) return;
+  const existingMatch = availableTreatmentFolders.find(
+    (name) => name.toLowerCase() === typed.toLowerCase()
+  ) ?? "";
+  const optimisticTargetFolder = existingMatch || `${currentDateYmd()} ${typed}`;
+  const committedStrokes = lineSegments.map((stroke) => ({
+    color: stroke?.color ?? "white",
+    points: Array.isArray(stroke?.points)
+      ? stroke.points.map((point) => ({
+          x: Number(point?.x) || 0,
+          y: Number(point?.y) || 0,
+        }))
+      : [],
+  })).filter((stroke) => stroke.points.length > 0);
+  const previewWidth = Math.max(1, baseImageWidth);
+  const previewHeight = Math.max(1, baseImageHeight);
+  setSaveModeActive(false);
+  setMarkModeActive(false);
   drawSaveBtn.disabled = true;
+  if (drawSaveInput) drawSaveInput.disabled = true;
+  if (drawSaveDropdownBtn) drawSaveDropdownBtn.disabled = true;
+  void invoke("notify_import_wizard_completed", {
+    workspaceDir: previewWorkspaceDir,
+    patientFolder: previewPatientFolder,
+    targetFolder: optimisticTargetFolder,
+    jobId: null,
+    importWizardDir: null,
+    importedImageCount: 1,
+    importedTotalCount: 1,
+    selectTargetFolder: true,
+    plannedPaths: [],
+  }).catch(() => {});
   void (async () => {
     try {
-      const tempPath = await exportAnnotatedTempFile();
-      const existingMatch = availableTreatmentFolders.find(
-        (name) => name.toLowerCase() === typed.toLowerCase()
-      ) ?? "";
+      await new Promise((resolve) => requestAnimationFrame(resolve));
+      const tempPath = await invoke("export_annotated_image_to_temp", {
+        path: currentPreviewPath,
+        strokes: committedStrokes,
+        previewWidth,
+        previewHeight,
+      });
       const result = await invoke("start_import_files", {
         workspaceDir: previewWorkspaceDir,
         patientFolder: previewPatientFolder,
@@ -1290,13 +1391,16 @@ drawSaveBtn?.addEventListener("click", () => {
         plannedPaths: Array.isArray(result?.planned_paths ?? result?.plannedPaths)
           ? (result?.planned_paths ?? result?.plannedPaths)
           : [],
+        importedImageCount: 1,
+        importedTotalCount: 1,
+        selectTargetFolder: true,
       }).catch(() => {});
       clearDrawCanvas();
-      setSaveModeActive(false);
-      setMarkModeActive(false);
     } catch (err) {
       console.error("save drawn image import failed:", err);
     } finally {
+      if (drawSaveInput) drawSaveInput.disabled = false;
+      if (drawSaveDropdownBtn) drawSaveDropdownBtn.disabled = false;
       drawSaveBtn.disabled = false;
     }
   })();
@@ -1307,10 +1411,20 @@ drawCanvas?.addEventListener("pointerdown", (event) => {
   if (event.button !== undefined && event.button !== 0) return;
   event.preventDefault();
   resizeDrawCanvas();
-  const start = drawPointFromClient(event.clientX, event.clientY);
+  const start = getImagePointFromClient(event.clientX, event.clientY);
   if (!start) return;
   isDrawingLine = true;
   lastDrawPoint = start;
+  currentStroke = {
+    color: selectedDrawColor,
+    points: [start],
+  };
+  lineSegments.push(currentStroke);
+  if (!hasDrawnLines) {
+    hasDrawnLines = true;
+    previewToolbar?.classList.add("has-lines");
+  }
+  redrawDrawCanvas();
   drawCanvas.setPointerCapture?.(event.pointerId);
 });
 
@@ -1324,6 +1438,7 @@ function stopDrawing(pointerId = null) {
   if (!isDrawingLine) return;
   isDrawingLine = false;
   lastDrawPoint = null;
+  currentStroke = null;
   if (pointerId !== null) {
     drawCanvas?.releasePointerCapture?.(pointerId);
   }
@@ -1348,7 +1463,6 @@ void listen(previewEventName, (event) => {
     path,
     navCount: paths.length,
   });
-  setNavigationPaths(paths);
   previewWorkspaceDir = workspaceDir;
   previewPatientFolder = patientFolder;
   availableTreatmentFolders = [];
@@ -1356,14 +1470,12 @@ void listen(previewEventName, (event) => {
   if (drawSaveDropdownBtn) drawSaveDropdownBtn.hidden = true;
   setSaveDropdownOpen(false);
   if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
-  if (path && !navigationPaths.includes(path)) {
-    navigationPaths.push(path);
-  }
   if (!path) {
+    setNavigationPaths(paths);
     updateNavigationButtons();
     return;
   }
-  void setPreview(path);
+  void requestPreviewLoad(path, paths);
   void refreshAvailableTreatmentFolders();
 });
 
@@ -1392,10 +1504,7 @@ void (async () => {
     const normalized = normalizePath(path);
     if (normalized) {
       loadRotationUiState();
-      if (!navigationPaths.includes(normalized)) {
-        navigationPaths.push(normalized);
-      }
-      await setPreview(normalized);
+      await requestPreviewLoad(normalized, navigationPaths);
     } else {
       updateNavigationButtons();
     }

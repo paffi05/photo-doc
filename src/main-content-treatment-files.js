@@ -183,6 +183,7 @@ export function createTreatmentFilesPanel({
   let isBackgroundFillRunning = false;
   let currentViewMode = "tile";
   const runtimePreviewByPath = new Map();
+  const optimisticPreviewRevealedPaths = new Set();
   const cacheWarmupRequested = new Set();
   let activeCardsByPath = new Map();
   let activeImageFiles = [];
@@ -258,6 +259,7 @@ export function createTreatmentFilesPanel({
       src = "";
     }
     if (!src) return;
+    runtimePreviewByPath.set(path, { src, quality: "full" });
     if (activeCardsByPath.has(path)) {
       consumeOptimisticThumbRotationStep(path);
       setThumbImage(path, activeCardsByPath, src, {
@@ -268,7 +270,32 @@ export function createTreatmentFilesPanel({
       return;
     }
     if (!isPathInActiveTreatmentFolder(path)) return;
-    revealNextOptimisticPlaceholder(src);
+    if (optimisticPreviewRevealedPaths.has(path)) return;
+    const revealed = revealNextOptimisticPlaceholder(path, src);
+    if (revealed) {
+      optimisticPreviewRevealedPaths.add(path);
+      return;
+    }
+    if (appendRuntimeImportedImage(path, src)) return;
+  });
+  void listen("import-file-copied", (event) => {
+    const workspaceDir = String(event?.payload?.workspace_dir ?? event?.payload?.workspaceDir ?? "").trim();
+    const patientFolder = String(event?.payload?.patient_folder ?? event?.payload?.patientFolder ?? "").trim();
+    const targetFolder = String(event?.payload?.target_folder ?? event?.payload?.targetFolder ?? "").trim();
+    const path = normalizePath(event?.payload?.path ?? "");
+    const isImage = Boolean(event?.payload?.is_image ?? event?.payload?.isImage ?? false);
+    if (!path || !isImage) return;
+    if (!activeContext?.workspaceDir || !activeContext?.patientFolder || !activeContext?.treatmentFolder) return;
+    if (
+      workspaceDir !== String(activeContext.workspaceDir).trim() ||
+      patientFolder !== String(activeContext.patientFolder).trim() ||
+      targetFolder !== String(activeContext.treatmentFolder).trim()
+    ) {
+      return;
+    }
+    if (activeCardsByPath.has(path)) return;
+    if (bindNextOptimisticPlaceholderToPath(path)) return;
+    void appendRuntimeImportedImage(path, "");
   });
   void listen("image-preview-rotated", (event) => {
     const path = normalizePath(event?.payload?.path ?? "");
@@ -297,6 +324,7 @@ export function createTreatmentFilesPanel({
     activeLoadedFiles = [];
     activeFileOffset = 0;
     optimisticThumbRotationByPath.clear();
+    optimisticPreviewRevealedPaths.clear();
     activeOverviewKeywords = [];
     optimisticPlaceholderCards = [];
     panel.hidden = true;
@@ -350,6 +378,7 @@ export function createTreatmentFilesPanel({
     loadMoreBtn.disabled = false;
     loadMoreBtn.onclick = null;
     optimisticThumbRotationByPath.clear();
+    optimisticPreviewRevealedPaths.clear();
     activeOverviewKeywords = [];
     foldersOverviewGridEl.innerHTML = "";
     keywordsListEl.innerHTML = "";
@@ -374,10 +403,29 @@ export function createTreatmentFilesPanel({
   } = {}) {
     const key = getContextKey(workspaceDir, patientFolder, treatmentFolder);
     if (!workspaceDir || !patientFolder || !treatmentFolder || !key) return;
-    optimisticImportPlaceholdersByContext.set(key, {
+    const optimisticState = {
       imageCount: Math.max(0, Number(imageCount) || 0),
       totalCount: Math.max(0, Number(totalCount) || 0),
-    });
+    };
+    optimisticImportPlaceholdersByContext.set(key, optimisticState);
+    if (key !== activeContextKey || panel.hidden) return;
+    const useListView = currentViewMode === "list";
+    const placeholderCount = getRemainingOptimisticPlaceholderCount(optimisticState, activeLoadedFiles);
+    const changed = activeLoadedFiles.length < 1
+      ? renderOptimisticImportPlaceholders(placeholderCount)
+      : appendOptimisticImportPlaceholders(placeholderCount, useListView) > 0;
+    if (changed || optimisticPlaceholderCards.length > 0) {
+      syncActiveCountsUi();
+    }
+  }
+
+  function getRemainingOptimisticPlaceholderCount(optimistic = null, loadedFiles = []) {
+    if (!optimistic) return 0;
+    const optimisticImageCount = Math.max(0, Number(optimistic.imageCount) || 0);
+    const loadedImageCount = (Array.isArray(loadedFiles) ? loadedFiles : []).reduce((count, file) => (
+      count + (Boolean(file?.is_image ?? file?.isImage) ? 1 : 0)
+    ), 0);
+    return Math.max(0, optimisticImageCount - loadedImageCount);
   }
 
   function renderOptimisticImportPlaceholders(count = 0) {
@@ -392,6 +440,7 @@ export function createTreatmentFilesPanel({
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     optimisticPlaceholderCards = [];
+    optimisticPreviewRevealedPaths.clear();
     if (useListView) {
       for (let i = 0; i < safeCount; i += 1) {
         const row = document.createElement("button");
@@ -431,9 +480,10 @@ export function createTreatmentFilesPanel({
   function appendOptimisticImportPlaceholders(count = 0, useListView = false) {
     const safeCount = Math.max(0, Number(count) || 0);
     if (safeCount < 1) return 0;
-    if (optimisticPlaceholderCards.length > 0) return 0;
+    const missingCount = Math.max(0, safeCount - optimisticPlaceholderCards.length);
+    if (missingCount < 1) return 0;
     let appended = 0;
-    for (let i = 0; i < safeCount; i += 1) {
+    for (let i = 0; i < missingCount; i += 1) {
       if (useListView) {
         const row = document.createElement("button");
         row.type = "button";
@@ -448,7 +498,7 @@ export function createTreatmentFilesPanel({
             <span class="treatment-file-list-date">-</span>
           </span>
         `;
-        listEl.insertBefore(row, listEl.firstChild ?? null);
+        listEl.appendChild(row);
         optimisticPlaceholderCards.push(row);
       } else {
         const card = document.createElement("button");
@@ -460,7 +510,7 @@ export function createTreatmentFilesPanel({
           <span class="treatment-image-thumb fallback">IMG</span>
           <span class="treatment-image-name"></span>
         `;
-        imagesGridEl.insertBefore(card, imagesGridEl.firstChild ?? null);
+        imagesGridEl.appendChild(card);
         optimisticPlaceholderCards.push(card);
       }
       appended += 1;
@@ -481,15 +531,20 @@ export function createTreatmentFilesPanel({
     return path.replaceAll("\\", "/").startsWith(base);
   }
 
-  function revealNextOptimisticPlaceholder(src = "") {
-    if (!src || optimisticPlaceholderCards.length < 1) return;
-    const card = optimisticPlaceholderCards.find((entry) => {
+  function revealNextOptimisticPlaceholder(path = "", src = "") {
+    if (!path || !src || optimisticPlaceholderCards.length < 1) return false;
+    const card = optimisticPlaceholderCards.find((entry) => (
+      String(entry?.dataset?.optimisticImportPath ?? "").trim() === path
+    )) ?? optimisticPlaceholderCards.find((entry) => {
       const thumb = entry?.querySelector?.(".treatment-image-thumb");
-      return Boolean(thumb && !thumb.querySelector("img"));
+      if (!thumb || thumb.querySelector("img")) return false;
+      const boundPath = String(entry?.dataset?.optimisticImportPath ?? "").trim();
+      return !boundPath || boundPath === path;
     });
-    if (!card) return;
+    if (!card) return false;
+    card.dataset.optimisticImportPath = path;
     const thumb = card.querySelector(".treatment-image-thumb");
-    if (!thumb) return;
+    if (!thumb) return false;
     const img = document.createElement("img");
     img.className = "full-preview";
     img.alt = "";
@@ -506,6 +561,91 @@ export function createTreatmentFilesPanel({
       thumb.innerHTML = "";
       thumb.appendChild(img);
     }
+    return true;
+  }
+
+  function bindNextOptimisticPlaceholderToPath(path = "") {
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath || optimisticPlaceholderCards.length < 1) return false;
+    const existing = optimisticPlaceholderCards.find((entry) => (
+      String(entry?.dataset?.optimisticImportPath ?? "").trim() === normalizedPath
+    ));
+    if (existing) return true;
+    const placeholder = optimisticPlaceholderCards.find((entry) => {
+      const boundPath = String(entry?.dataset?.optimisticImportPath ?? "").trim();
+      return !boundPath;
+    });
+    if (!placeholder) return false;
+    placeholder.dataset.optimisticImportPath = normalizedPath;
+    const name = normalizedPath.split(/[\\/]/).pop() || normalizedPath;
+    const nameEl = placeholder.querySelector(".treatment-image-name, .treatment-file-list-name");
+    if (nameEl) nameEl.textContent = name;
+    return true;
+  }
+
+  function removeOneOptimisticPlaceholder() {
+    const placeholder = optimisticPlaceholderCards.shift() ?? null;
+    if (!placeholder) return false;
+    placeholder.remove();
+    return true;
+  }
+
+  function syncActiveCountsUi() {
+    const imageCount = activeLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
+    const otherCount = activeLoadedFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage)).length;
+    const importingCount = optimisticPlaceholderCards.length;
+    countsEl.textContent = importingCount > 0
+      ? `${imageCount} images (+${importingCount} importing), ${otherCount} other files`
+      : `${imageCount} images, ${otherCount} other files`;
+  }
+
+  function appendRuntimeImportedImage(path, src = "") {
+    const normalizedPath = normalizePath(path);
+    if (!normalizedPath || activeCardsByPath.has(normalizedPath) || !isPathInActiveTreatmentFolder(normalizedPath)) {
+      return false;
+    }
+    const name = normalizedPath.split(/[\\/]/).pop() || normalizedPath;
+    const file = {
+      path: normalizedPath,
+      name,
+      size: 0,
+      created_ms: Date.now(),
+      modified_ms: Date.now(),
+      is_image: true,
+    };
+    const navigationPaths = Array.from(new Set([
+      normalizedPath,
+      ...activeImageFiles.map((entry) => normalizePath(entry?.path ?? "")),
+    ].filter(Boolean)));
+    let card = null;
+    if (currentViewMode === "list") {
+      card = createFileListRow(file, {
+        scope: "treatment",
+        navigationPaths,
+      });
+      listEl.insertBefore(card, listEl.firstChild ?? null);
+      listWrapEl.hidden = false;
+    } else {
+      card = createImageCard(file, {
+        scope: "treatment",
+        navigationPaths,
+      });
+      imagesGridEl.insertBefore(card, imagesGridEl.firstChild ?? null);
+      imagesWrapEl.hidden = false;
+    }
+    activeCardsByPath.set(normalizedPath, card);
+    activeImageFiles = [file, ...activeImageFiles.filter((entry) => normalizePath(entry?.path ?? "") !== normalizedPath)];
+    activeLoadedFiles = [file, ...activeLoadedFiles.filter((entry) => normalizePath(entry?.path ?? "") !== normalizedPath)];
+    removeOneOptimisticPlaceholder();
+    if (src) {
+      setThumbImage(normalizedPath, activeCardsByPath, src, {
+        requestId: activeRequestId,
+        allowPathFallback: false,
+        previewQuality: "full",
+      });
+    }
+    syncActiveCountsUi();
+    return true;
   }
 
   function setPreviewLoadingProgress(completed = 0, total = 0) {
@@ -1564,7 +1704,7 @@ export function createTreatmentFilesPanel({
     if (!append && !keepExistingVisible) {
       setLoadingState(t);
       if (optimistic) {
-        const placeholderCount = Math.max(optimistic.imageCount, optimistic.totalCount);
+        const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, []);
         const didRender = renderOptimisticImportPlaceholders(placeholderCount);
         if (didRender) {
           countsEl.textContent = `${Math.max(0, Number(optimistic.imageCount) || 0)} images, importing...`;
@@ -1596,7 +1736,7 @@ export function createTreatmentFilesPanel({
         loadingEl.hidden = true;
         emptyEl.hidden = true;
         const useListView = currentViewMode === "list";
-        const placeholderCount = Math.max(optimistic.imageCount, optimistic.totalCount);
+        const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, activeLoadedFiles);
         const appended = appendOptimisticImportPlaceholders(placeholderCount, useListView);
         if (appended > 0) {
           const existingImageCount = activeLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
@@ -1618,7 +1758,7 @@ export function createTreatmentFilesPanel({
     if (keepExistingVisible && optimistic && previousLoadedFiles.length > 0) {
       loadingEl.hidden = true;
       emptyEl.hidden = true;
-      const placeholderCount = Math.max(optimistic.imageCount, optimistic.totalCount);
+      const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, previousLoadedFiles);
       const appended = appendOptimisticImportPlaceholders(placeholderCount, useListView);
       if (appended > 0) {
         const existingImageCount = previousLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
@@ -1641,7 +1781,7 @@ export function createTreatmentFilesPanel({
     if (keepExistingVisible && files.length < 1 && optimistic) {
       loadingEl.hidden = true;
       emptyEl.hidden = true;
-      const placeholderCount = Math.max(optimistic.imageCount, optimistic.totalCount);
+      const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, activeLoadedFiles);
       const appended = appendOptimisticImportPlaceholders(placeholderCount, useListView);
       if (appended > 0) {
         const existingImageCount = activeLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
@@ -1664,7 +1804,7 @@ export function createTreatmentFilesPanel({
 
     if (files.length < 1) {
       if (optimistic && !append) {
-        const placeholderCount = Math.max(optimistic.imageCount, optimistic.totalCount);
+        const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, []);
         const didRender = renderOptimisticImportPlaceholders(placeholderCount);
         if (didRender) {
           countsEl.textContent = `${Math.max(0, Number(optimistic.imageCount) || 0)} images, importing...`;
@@ -1716,12 +1856,11 @@ export function createTreatmentFilesPanel({
       }
     }
     if (optimistic) {
-      const placeholderCount = Math.max(optimistic.imageCount, optimistic.totalCount);
+      const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, files);
       const appended = appendOptimisticImportPlaceholders(placeholderCount, useListView);
       if (appended > 0) {
         countsEl.textContent = `${imageFiles.length} images (+${appended} importing), ${otherFiles.length} other files`;
       }
-      optimisticImportPlaceholdersByContext.delete(contextKey);
     }
     activeCardsByPath = cardsByPath;
     activeImageFiles = imageFiles;
@@ -1812,11 +1951,32 @@ export function createTreatmentFilesPanel({
     clear: clearPanel,
     setContext,
     setPatientOverview: setPatientOverviewContext,
+    isActiveTreatmentContext: ({ workspaceDir = "", patientFolder = "", treatmentFolder = "" } = {}) => (
+      getContextKey(workspaceDir, patientFolder, treatmentFolder) === activeContextKey &&
+      !panel.hidden
+    ),
+    clearOptimisticImportForContext: ({ workspaceDir = "", patientFolder = "", treatmentFolder = "" } = {}) => {
+      const key = getContextKey(workspaceDir, patientFolder, treatmentFolder);
+      if (!key) return;
+      optimisticImportPlaceholdersByContext.delete(key);
+      if (key !== activeContextKey) return;
+      optimisticPlaceholderCards.forEach((card) => card.remove());
+      optimisticPlaceholderCards = [];
+      optimisticPreviewRevealedPaths.clear();
+      syncActiveCountsUi();
+    },
+    hasActiveOptimisticImport: () => {
+      if (!activeContextKey) return false;
+      return optimisticImportPlaceholdersByContext.has(activeContextKey);
+    },
     invalidateRuntimePreviewCache: () => {
       runtimePreviewByPath.clear();
     },
     refreshActiveContext: async () => {
       if (!activeContext?.workspaceDir || !activeContext?.patientFolder) return;
+      if (activeContext?.treatmentFolder && optimisticImportPlaceholdersByContext.has(activeContextKey) && activeCardsByPath.size > 0) {
+        return;
+      }
       if (activeContext?.treatmentFolder) {
         await setContext(activeContext);
         return;

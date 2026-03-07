@@ -416,6 +416,7 @@ let indexingCountsWarmRetryTimerId = null;
 let indexingCountsWarmRetryWorkspace = "";
 let indexingProgressRunning = false;
 let indexingProgressMessage = "Up to date";
+let backgroundCrawlerRunning = false;
 let indexingCountsSuffix = "";
 let indexingCustomSuffix = "";
 let previewImagesCreatedActiveCount = 0;
@@ -487,7 +488,7 @@ let initialMainReadyInProgress = false;
 
 const DEBUG_PREF_KEY = "showFrontendDebug";
 const TIMELINE_NAMES_PREF_KEY = "alwaysShowTimelineNames";
-const DEFAULT_CACHE_SIZE_GB = 5;
+const DEFAULT_CACHE_SIZE_GB = 1;
 const DEFAULT_PREVIEW_PERFORMANCE_MODE = "auto";
 const INDEXING_STATUS_POLL_MS = 2500;
 const INDEXING_STATUS_POLL_SLOW_MS = 5000;
@@ -1230,7 +1231,10 @@ async function refreshIndexingStatus() {
   indexingStatusInFlight = true;
   try {
     const runningRaw = await invoke("get_preview_fill_status");
+    const crawlerRunningRaw = await invoke("get_workspace_change_crawl_running");
     const running = Boolean(runningRaw);
+    backgroundCrawlerRunning = Boolean(crawlerRunningRaw);
+    syncDbStatusWithCrawlerState();
     const importingActive = hasActiveImportJobs();
     const manualHoldActive = isCacheMaintenanceRunning;
     const progressText = previewFillProgressMessage.toLowerCase();
@@ -1639,6 +1643,18 @@ function setDbStatusIdle() {
   if (dbStatusSpinner) dbStatusSpinner.hidden = true;
   if (dbReloadBtn) dbReloadBtn.disabled = true;
   setDeleteDatabaseAvailability(Boolean(showFrontendDebugToggle?.checked));
+}
+
+function syncDbStatusWithCrawlerState() {
+  if (!currentWorkspaceDir) return;
+  if (backgroundCrawlerRunning) {
+    setDbStatusUpdating();
+    if (dbStatusTime) dbStatusTime.textContent = "background crawl";
+    return;
+  }
+  if (isDbUpdating) {
+    setDbStatusUpToDate(new Date());
+  }
 }
 
 function splitPatientName(folderName) {
@@ -2185,6 +2201,7 @@ async function confirmImportWizard() {
       treatmentName,
       filePaths,
       deleteOrigin: false,
+      importWizardDir,
     });
     await setImportWizardCompactMode(false);
   } catch (err) {
@@ -2796,6 +2813,7 @@ async function loadPatients(workspaceDir, options = {}) {
   const minStatusMs = options?.minStatusMs ?? 0;
   const lightweight = Boolean(options?.lightweight);
   const allowBlockingFallback = options?.allowBlockingFallback ?? true;
+  const allowCachedStartup = options?.allowCachedStartup ?? true;
   const onReindexProgress = typeof options?.onReindexProgress === "function"
     ? options.onReindexProgress
     : null;
@@ -2812,6 +2830,7 @@ async function loadPatients(workspaceDir, options = {}) {
   const loadDeadline = startedAt + WORKSPACE_LOAD_OVERALL_TIMEOUT_MS;
   let reindexFailed = false;
   let lastStartupStageText = "";
+  let usedCachedIndex = false;
 
   const setStartupStageIfChanged = (text) => {
     const next = String(text ?? "").trim();
@@ -2821,96 +2840,110 @@ async function loadPatients(workspaceDir, options = {}) {
   };
 
   try {
-    setStartupStageIfChanged("Starting workspace indexing...");
-    let startAccepted = await withTimeout(
-      invoke("start_workspace_reindex", { workspaceDir }),
-      WORKSPACE_REINDEX_START_TIMEOUT_MS,
-      "start_workspace_reindex",
-    ).catch(() => false);
-    if (!startAccepted) {
-      setStartupStageIfChanged("Retrying indexing worker startup...");
-    }
-    let indexedCount = 0;
-    while (true) {
-      if (Date.now() > loadDeadline) {
-        throw new Error("workspace loading exceeded fail-safe timeout");
+    const cachedPatientCount = allowCachedStartup
+      ? await withTimeout(
+        invoke("get_indexed_patient_count", { workspaceDir }),
+        4000,
+        "get_indexed_patient_count",
+      ).catch(() => 0)
+      : 0;
+    usedCachedIndex = Number(cachedPatientCount) > 0;
+
+    if (usedCachedIndex) {
+      setStartupStageIfChanged(`Loading cached index... (${Number(cachedPatientCount) || 0} patients)`);
+      if (onReindexProgress) onReindexProgress(100);
+    } else {
+      setStartupStageIfChanged("Starting workspace indexing...");
+      let startAccepted = await withTimeout(
+        invoke("start_workspace_reindex", { workspaceDir }),
+        WORKSPACE_REINDEX_START_TIMEOUT_MS,
+        "start_workspace_reindex",
+      ).catch(() => false);
+      if (!startAccepted) {
+        setStartupStageIfChanged("Retrying indexing worker startup...");
       }
-      const status = await withTimeout(
-        invoke("get_workspace_reindex_status"),
-        WORKSPACE_REINDEX_STATUS_TIMEOUT_MS,
-        "get_workspace_reindex_status",
-      ).catch(() => null);
-      if (!status) {
-        if (!startAccepted && allowBlockingFallback) {
+      let indexedCount = 0;
+      while (true) {
+        if (Date.now() > loadDeadline) {
+          throw new Error("workspace loading exceeded fail-safe timeout");
+        }
+        const status = await withTimeout(
+          invoke("get_workspace_reindex_status"),
+          WORKSPACE_REINDEX_STATUS_TIMEOUT_MS,
+          "get_workspace_reindex_status",
+        ).catch(() => null);
+        if (!status) {
+          if (!startAccepted && allowBlockingFallback) {
+            setStartupStageIfChanged("Running fallback indexing...");
+            indexedCount = await withTimeout(
+              invoke("reindex_patient_folders", { workspaceDir }),
+              WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
+              "reindex_patient_folders fallback",
+            );
+            if (onReindexProgress) onReindexProgress(100);
+            break;
+          }
+          await delay(180);
+          continue;
+        }
+        const statusWorkspaceDir = String(status?.workspace_dir ?? status?.workspaceDir ?? "").trim();
+        const running = Boolean(status?.running);
+        if (statusWorkspaceDir && statusWorkspaceDir !== workspaceDir) {
+          if (!running && !startAccepted) {
+            startAccepted = await withTimeout(
+              invoke("start_workspace_reindex", { workspaceDir }),
+              WORKSPACE_REINDEX_START_TIMEOUT_MS,
+              "retry start_workspace_reindex",
+            ).catch(() => false);
+          }
+          await delay(120);
+          continue;
+        }
+
+        const completed = Number(status?.completed ?? 0) || 0;
+        const total = Number(status?.total ?? 0) || 0;
+        const statusMessage = String(status?.message ?? "").trim();
+        const importingKeywords = /importing keywords/i.test(statusMessage);
+        if (running) {
+          if (importingKeywords) {
+            if (total > 0) {
+              setStartupStageIfChanged(`Importing keywords... (${completed}/${total})`);
+            } else {
+              setStartupStageIfChanged("Importing keywords...");
+            }
+          } else {
+            if (total > 0) {
+              setStartupStageIfChanged(`Indexing workspace... (${completed}/${total})`);
+            } else {
+              setStartupStageIfChanged("Updating database index...");
+            }
+          }
+        }
+        if (isDbUpdating && dbStatusText) {
+          dbStatusText.textContent = importingKeywords ? "importing keywords..." : "updating...";
+        }
+        if (!statusWorkspaceDir && !running && !startAccepted && allowBlockingFallback) {
           setStartupStageIfChanged("Running fallback indexing...");
-          indexedCount = await withTimeout(
-            invoke("reindex_patient_folders", { workspaceDir }),
-            WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
-            "reindex_patient_folders fallback",
-          );
+          indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
           if (onReindexProgress) onReindexProgress(100);
           break;
         }
-        await delay(180);
-        continue;
-      }
-      const statusWorkspaceDir = String(status?.workspace_dir ?? status?.workspaceDir ?? "").trim();
-      const running = Boolean(status?.running);
-      if (statusWorkspaceDir && statusWorkspaceDir !== workspaceDir) {
-        if (!running && !startAccepted) {
-          startAccepted = await withTimeout(
-            invoke("start_workspace_reindex", { workspaceDir }),
-            WORKSPACE_REINDEX_START_TIMEOUT_MS,
-            "retry start_workspace_reindex",
-          ).catch(() => false);
+        const rawPercent = total > 0 ? (completed / total) * 100 : (running ? 0 : 100);
+        if (onReindexProgress) onReindexProgress(rawPercent);
+
+        const errorMessage = String(status?.error ?? "").trim();
+        if (!running) {
+          if (errorMessage) {
+            throw new Error(errorMessage);
+          }
+          indexedCount = Number(status?.indexed_count ?? status?.indexedCount ?? completed) || 0;
+          break;
         }
         await delay(120);
-        continue;
       }
-
-      const completed = Number(status?.completed ?? 0) || 0;
-      const total = Number(status?.total ?? 0) || 0;
-      const statusMessage = String(status?.message ?? "").trim();
-      const importingKeywords = /importing keywords/i.test(statusMessage);
-      if (running) {
-        if (importingKeywords) {
-          if (total > 0) {
-            setStartupStageIfChanged(`Importing keywords... (${completed}/${total})`);
-          } else {
-            setStartupStageIfChanged("Importing keywords...");
-          }
-        } else {
-          if (total > 0) {
-            setStartupStageIfChanged(`Indexing workspace... (${completed}/${total})`);
-          } else {
-            setStartupStageIfChanged("Updating database index...");
-          }
-        }
-      }
-      if (isDbUpdating && dbStatusText) {
-        dbStatusText.textContent = importingKeywords ? "importing keywords..." : "updating...";
-      }
-      if (!statusWorkspaceDir && !running && !startAccepted && allowBlockingFallback) {
-        setStartupStageIfChanged("Running fallback indexing...");
-        indexedCount = await invoke("reindex_patient_folders", { workspaceDir });
-        if (onReindexProgress) onReindexProgress(100);
-        break;
-      }
-      const rawPercent = total > 0 ? (completed / total) * 100 : (running ? 0 : 100);
-      if (onReindexProgress) onReindexProgress(rawPercent);
-
-      const errorMessage = String(status?.error ?? "").trim();
-      if (!running) {
-        if (errorMessage) {
-          throw new Error(errorMessage);
-        }
-        indexedCount = Number(status?.indexed_count ?? status?.indexedCount ?? completed) || 0;
-        break;
-      }
-      await delay(120);
+      console.log(`[patients ${ts()}] indexed ${indexedCount} folders`);
+      setStartupStageIfChanged(`Indexing finished (${indexedCount} folders)`);
     }
-    console.log(`[patients ${ts()}] indexed ${indexedCount} folders`);
-    setStartupStageIfChanged(`Indexing finished (${indexedCount} folders)`);
   } catch (err) {
     console.error("reindex_patient_folders failed:", err);
     setStartupStageIfChanged("Indexing failed, using cached data...");
@@ -2931,7 +2964,15 @@ async function loadPatients(workspaceDir, options = {}) {
     if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
   } else {
     databaseDeleteLocked = false;
-    setDbStatusUpToDate(new Date());
+    if (usedCachedIndex) {
+      isDbUpdating = false;
+      if (dbStatusText) dbStatusText.textContent = "Up to date";
+      if (dbStatusTime) dbStatusTime.textContent = "cached index loaded";
+      if (dbStatusSpinner) dbStatusSpinner.hidden = true;
+      if (dbReloadBtn) dbReloadBtn.disabled = !currentWorkspaceDir;
+    } else {
+      setDbStatusUpToDate(new Date());
+    }
   }
 
   try {
@@ -3029,6 +3070,7 @@ function clearPatients() {
   setIndexingProgressUi({ running: false, message: "Up to date" });
   setIndexingDebugCountsUi(0, 0, { show: false });
   setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
+  backgroundCrawlerRunning = false;
   setDbStatusIdle();
 }
 
@@ -3047,33 +3089,27 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   currentWorkspaceDir = workspaceDir;
   setWorkspacePathDisplay(workspaceDir);
   initialMainReadyInProgress = true;
-  const STARTUP_PROGRESS_WEIGHTS = {
-    indexing: 82,
-    dbCount: 4,
-    cacheUsage: 4,
-    previewMaintenance: 4,
-    cacheStatus: 3,
-    indexingStatus: 2,
-    finalize: 1,
-  };
+  const STARTUP_PROGRESS_PHASES = [
+    "indexing",
+    "dbCount",
+    "cacheUsage",
+    "previewMaintenance",
+    "cacheStatus",
+    "indexingStatus",
+    "finalize",
+  ];
   const startupSetOverallProgress = (segment, localPercent = 0) => {
     const pct = Math.max(0, Math.min(100, Number(localPercent) || 0));
-    const i = STARTUP_PROGRESS_WEIGHTS.indexing;
-    const d = STARTUP_PROGRESS_WEIGHTS.dbCount;
-    const c = STARTUP_PROGRESS_WEIGHTS.cacheUsage;
-    const p = STARTUP_PROGRESS_WEIGHTS.previewMaintenance;
-    const s = STARTUP_PROGRESS_WEIGHTS.cacheStatus;
-    const x = STARTUP_PROGRESS_WEIGHTS.indexingStatus;
-    const f = STARTUP_PROGRESS_WEIGHTS.finalize;
-    let overall = 0;
-    if (segment === "indexing") overall = (pct / 100) * i;
-    else if (segment === "dbCount") overall = i + (pct / 100) * d;
-    else if (segment === "cacheUsage") overall = i + d + (pct / 100) * c;
-    else if (segment === "previewMaintenance") overall = i + d + c + (pct / 100) * p;
-    else if (segment === "cacheStatus") overall = i + d + c + p + (pct / 100) * s;
-    else if (segment === "indexingStatus") overall = i + d + c + p + s + (pct / 100) * x;
-    else if (segment === "finalize") overall = i + d + c + p + s + x + (pct / 100) * f;
-    else overall = pct;
+    let overall = pct;
+    if (segment === "indexing") {
+      overall = (pct / 100) * 95;
+    } else {
+      const phaseIndex = STARTUP_PROGRESS_PHASES.indexOf(segment);
+      const postIndexPhaseCount = STARTUP_PROGRESS_PHASES.length - 1;
+      if (phaseIndex >= 1 && postIndexPhaseCount > 0) {
+        overall = 95 + ((phaseIndex - 1) + (pct / 100)) * (5 / postIndexPhaseCount);
+      }
+    }
     setStartupSpinnerPercent(overall);
   };
   setStartupProcessStatus("Loading cache state...");
@@ -3121,6 +3157,7 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
     schedulePatientNameTruncationRefresh();
   });
   initialMainReadyInProgress = false;
+  void triggerWorkspaceChangeCrawl({ requireIdle: false });
   void refreshIndexingDebugCounts();
   requestAnimationFrame(sidebarLayout.updateTopButtonSpacing);
   console.log(
@@ -3389,10 +3426,14 @@ async function boot() {
       settings?.import_wizard_preview_window_state ??
       settings?.importWizardPreviewWindowState ??
       null;
-    const cacheSizeGb =
+    let cacheSizeGb =
       settings?.cache_size_gb ??
       settings?.cacheSizeGb ??
       DEFAULT_CACHE_SIZE_GB;
+    cacheSizeGb = clampCacheSizeGb(cacheSizeGb);
+    if (cacheSizeGb !== DEFAULT_CACHE_SIZE_GB) {
+      cacheSizeGb = await invoke("set_cache_size_gb", { cacheSizeGb: DEFAULT_CACHE_SIZE_GB });
+    }
     const keepLocalCopy = Boolean(
       settings?.keep_local_cache_copy ??
       settings?.keepLocalCacheCopy ??
@@ -4054,6 +4095,11 @@ void listen("import-wizard-completed", async (event) => {
     Number(event?.payload?.imported_total_count ?? event?.payload?.importedTotalCount ?? 0) || 0,
   );
   const jobId = Number(event?.payload?.job_id ?? event?.payload?.jobId ?? 0) || null;
+  const selectTargetFolder = Boolean(
+    event?.payload?.select_target_folder ??
+    event?.payload?.selectTargetFolder ??
+    false,
+  );
   const wizardDir = String(
     event?.payload?.import_wizard_dir ??
     event?.payload?.importWizardDir ??
@@ -4073,6 +4119,16 @@ void listen("import-wizard-completed", async (event) => {
       patientFolder: patient,
       importedImageCount,
       importedTotalCount,
+      selectTargetFolder,
+    });
+  } else if (targetFolder && typeof mainContent.showOptimisticImportPreview === "function") {
+    mainContent.showOptimisticImportPreview({
+      targetFolder,
+      workspaceDir: workspace,
+      patientFolder: patient,
+      importedImageCount,
+      importedTotalCount,
+      selectTargetFolder,
     });
   } else {
     void mainContent.refreshTimelineForSelection();

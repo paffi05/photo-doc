@@ -2690,7 +2690,7 @@ body{
 .startup-spinner-percent{
   position: absolute;
   inset: 0;
-  display: grid;
+  display: none;
   place-items: center;
   font-size: 0.88rem;
   font-weight: 600;

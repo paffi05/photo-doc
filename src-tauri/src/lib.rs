@@ -26,6 +26,18 @@ struct WindowState {
     maximized: bool,
 }
 
+#[derive(Deserialize, Clone)]
+struct AnnotatedStrokePoint {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Deserialize, Clone)]
+struct AnnotatedStroke {
+    color: String,
+    points: Vec<AnnotatedStrokePoint>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Settings {
@@ -443,6 +455,17 @@ struct ImportWizardFileRow {
     created_ms: u64,
     modified_ms: u64,
     is_image: bool,
+    preview_path: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+struct ImportFileCopiedEvent {
+    job_id: u64,
+    workspace_dir: String,
+    patient_folder: String,
+    target_folder: String,
+    path: String,
+    is_image: bool,
 }
 
 #[derive(Serialize)]
@@ -578,6 +601,7 @@ struct ImportWizardCompletedEvent {
     import_wizard_dir: Option<String>,
     imported_image_count: Option<u64>,
     imported_total_count: Option<u64>,
+    select_target_folder: Option<bool>,
 }
 
 #[derive(Serialize, Clone)]
@@ -649,7 +673,7 @@ const PREVIEW_DEBUG_COUNTS_CACHE_TTL_MS: u64 = 15_000;
 const PREVIEW_PERF_GENTLE: &str = "gentle";
 const PREVIEW_PERF_AUTO: &str = "auto";
 const PREVIEW_PERF_FAST: &str = "fast";
-const PREVIEW_CACHE_MAX_BYTES_FIXED: u64 = 10 * 1024 * 1024 * 1024;
+const DEFAULT_PREVIEW_CACHE_SIZE_GB: u64 = 1;
 const AUTO_LOCAL_CACHE_SYNC_INTERVAL_MS: u64 = 10 * 60 * 1000;
 
 fn normalize_preview_performance_mode(raw: &str) -> String {
@@ -1524,6 +1548,15 @@ fn get_active_preview_cache_dir(app_handle: &tauri::AppHandle) -> PathBuf {
         }
     }
     get_preview_cache_dir(app_handle)
+}
+
+fn get_preview_cache_max_bytes(app_handle: &tauri::AppHandle) -> u64 {
+    let settings = read_settings(app_handle).unwrap_or_default();
+    let size_gb = settings
+        .cache_size_gb
+        .map(|v| u64::from(v.clamp(1, 10)))
+        .unwrap_or(DEFAULT_PREVIEW_CACHE_SIZE_GB);
+    size_gb * 1024 * 1024 * 1024
 }
 
 fn get_local_cache_copy_dir(workspace: &Path) -> PathBuf {
@@ -2414,7 +2447,7 @@ fn run_preview_cache_cleanup(app_handle: &tauri::AppHandle) {
         return;
     };
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
+    let max_cache_bytes = get_preview_cache_max_bytes(app_handle);
     let mut index = load_preview_cache_index(&cache_dir);
     cleanup_preview_cache(&cache_dir, &mut index, max_cache_bytes);
     index.entries.retain(|_, entry| {
@@ -2547,7 +2580,7 @@ fn run_preview_cache_cleanup_for_workspace(app_handle: &tauri::AppHandle, worksp
         return;
     };
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
+    let max_cache_bytes = get_preview_cache_max_bytes(app_handle);
     cleanup_preview_cache_for_workspace_dir(app_handle, &cache_dir, workspace, max_cache_bytes);
 }
 
@@ -2613,6 +2646,56 @@ fn emit_import_preview_ready_events(
             ImportPreviewReadyEvent { path, preview_path },
         );
     }
+}
+
+fn emit_import_preview_ready_mapped(
+    app_handle: &tauri::AppHandle,
+    path: &Path,
+    preview_path: &Path,
+) {
+    if !preview_path.exists() || !preview_path.is_file() || !is_valid_cached_preview_file(preview_path) {
+        return;
+    }
+    let mapped = ensure_webview_accessible_preview_path(app_handle, preview_path);
+    let path_str = path.to_string_lossy().trim().to_string();
+    let preview_str = mapped.to_string_lossy().trim().to_string();
+    if path_str.is_empty() || preview_str.is_empty() {
+        return;
+    }
+    let _ = app_handle.emit(
+        "import-preview-ready",
+        ImportPreviewReadyEvent {
+            path: path_str,
+            preview_path: preview_str,
+        },
+    );
+}
+
+fn copy_file_with_progress<F>(
+    src_path: &Path,
+    dst_path: &Path,
+    mut on_chunk_copied: F,
+) -> Result<u64, String>
+where
+    F: FnMut(u64),
+{
+    let mut src = fs::File::open(src_path).map_err(|e| e.to_string())?;
+    let mut dst = fs::File::create(dst_path).map_err(|e| e.to_string())?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut written_total = 0_u64;
+
+    loop {
+        let read = src.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        dst.write_all(&buffer[..read]).map_err(|e| e.to_string())?;
+        written_total = written_total.saturating_add(read as u64);
+        on_chunk_copied(read as u64);
+    }
+
+    dst.flush().map_err(|e| e.to_string())?;
+    Ok(written_total)
 }
 
 fn schedule_local_preview_mirror_to_workspace_main(
@@ -2805,7 +2888,7 @@ fn resolve_cached_previews(
 ) -> Result<Vec<CachedImagePreviewRow>, String> {
     let settings = read_settings(app_handle).unwrap_or_default();
     let cache_dir = get_active_preview_cache_dir(app_handle);
-    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
+    let max_cache_bytes = get_preview_cache_max_bytes(&app_handle);
     let preview_perf_mode = normalize_preview_performance_mode(
         settings
             .preview_performance_mode
@@ -4610,7 +4693,10 @@ fn list_patient_root_image_paths(
 }
 
 #[tauri::command]
-fn list_import_wizard_files(folder_dir: String) -> Result<Vec<ImportWizardFileRow>, String> {
+fn list_import_wizard_files(
+    app_handle: tauri::AppHandle,
+    folder_dir: String,
+) -> Result<Vec<ImportWizardFileRow>, String> {
     let folder_dir = folder_dir.trim();
     if folder_dir.is_empty() {
         return Err("folder directory is required".to_string());
@@ -4651,7 +4737,26 @@ fn list_import_wizard_files(folder_dir: String) -> Result<Vec<ImportWizardFileRo
             created_ms,
             modified_ms,
             is_image: is_supported_preview_image(&path_buf),
+            preview_path: None,
         });
+    }
+
+    for row in &mut out {
+        if !row.is_image {
+            continue;
+        }
+        let source_path = PathBuf::from(&row.path);
+        let preview_path = resolve_existing_cache_file_path(
+            &folder.join(".preview-cache"),
+            &source_path,
+            None,
+            row.size,
+            row.modified_ms,
+        );
+        if preview_path.exists() && is_valid_cached_preview_file(&preview_path) {
+            let mapped = ensure_webview_accessible_preview_path(&app_handle, &preview_path);
+            row.preview_path = Some(mapped.to_string_lossy().to_string());
+        }
     }
 
     out.sort_by(|a, b| {
@@ -5207,6 +5312,163 @@ fn save_import_wizard_preview_data_url_to_temp(
     Ok(out_path.to_string_lossy().to_string())
 }
 
+fn annotated_stroke_color(color: &str) -> image::Rgba<u8> {
+    match color.trim().to_ascii_lowercase().as_str() {
+        "red" => image::Rgba([227, 52, 47, 255]),
+        "blue" => image::Rgba([37, 99, 235, 255]),
+        _ => image::Rgba([255, 255, 255, 255]),
+    }
+}
+
+fn blend_rgba_over(dst: &mut image::Rgba<u8>, src: image::Rgba<u8>, alpha: f32) {
+    let src_alpha = ((src[3] as f32 / 255.0) * alpha).clamp(0.0, 1.0);
+    if src_alpha <= 0.0 {
+        return;
+    }
+    let inv_alpha = 1.0 - src_alpha;
+    for i in 0..3 {
+        let out = (src[i] as f32 * src_alpha) + (dst[i] as f32 * inv_alpha);
+        dst[i] = out.clamp(0.0, 255.0).round() as u8;
+    }
+    dst[3] = 255;
+}
+
+fn stamp_circle(
+    image: &mut image::RgbaImage,
+    center_x: f32,
+    center_y: f32,
+    radius: f32,
+    color: image::Rgba<u8>,
+) {
+    if radius <= 0.0 {
+        return;
+    }
+    let min_x = ((center_x - radius - 1.0).floor() as i32).max(0);
+    let min_y = ((center_y - radius - 1.0).floor() as i32).max(0);
+    let max_x = ((center_x + radius + 1.0).ceil() as i32).min(image.width() as i32 - 1);
+    let max_y = ((center_y + radius + 1.0).ceil() as i32).min(image.height() as i32 - 1);
+    let aa = 1.0_f32;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let dx = (x as f32 + 0.5) - center_x;
+            let dy = (y as f32 + 0.5) - center_y;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let coverage = (radius + aa - dist).clamp(0.0, aa) / aa;
+            if coverage <= 0.0 {
+                continue;
+            }
+            let pixel = image.get_pixel_mut(x as u32, y as u32);
+            blend_rgba_over(pixel, color, coverage);
+        }
+    }
+}
+
+fn draw_annotated_stroke(
+    image: &mut image::RgbaImage,
+    stroke: &AnnotatedStroke,
+    scale_x: f32,
+    scale_y: f32,
+    stroke_width: f32,
+) {
+    if stroke.points.is_empty() {
+        return;
+    }
+    let color = annotated_stroke_color(&stroke.color);
+    let radius = (stroke_width * 0.5).max(0.6);
+    if stroke.points.len() == 1 {
+        let p = &stroke.points[0];
+        stamp_circle(image, p.x * scale_x, p.y * scale_y, radius, color);
+        return;
+    }
+    for pair in stroke.points.windows(2) {
+        let a = &pair[0];
+        let b = &pair[1];
+        let ax = a.x * scale_x;
+        let ay = a.y * scale_y;
+        let bx = b.x * scale_x;
+        let by = b.y * scale_y;
+        let dx = bx - ax;
+        let dy = by - ay;
+        let distance = (dx * dx + dy * dy).sqrt();
+        let steps = ((distance / 0.5).ceil() as usize).max(1);
+        for step in 0..=steps {
+            let t = step as f32 / steps as f32;
+            let x = ax + (dx * t);
+            let y = ay + (dy * t);
+            stamp_circle(image, x, y, radius, color);
+        }
+    }
+}
+
+#[tauri::command]
+async fn export_annotated_image_to_temp(
+    path: String,
+    strokes: Vec<AnnotatedStroke>,
+    preview_width: f32,
+    preview_height: f32,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = path.trim().to_string();
+        if path.is_empty() {
+            return Err("path is required".to_string());
+        }
+        if strokes.is_empty() {
+            return Err("strokes are required".to_string());
+        }
+        if preview_width <= 0.0 || preview_height <= 0.0 {
+            return Err("preview size is invalid".to_string());
+        }
+        let source = PathBuf::from(&path);
+        if !source.exists() || !source.is_file() {
+            return Err("source image does not exist".to_string());
+        }
+        if !is_supported_preview_image(&source) {
+            return Err("unsupported image format".to_string());
+        }
+
+        let ext = source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let format = match ext.as_str() {
+            "jpg" | "jpeg" => image::ImageFormat::Jpeg,
+            "png" => image::ImageFormat::Png,
+            _ => return Err("unsupported image format".to_string()),
+        };
+
+        let mut image = image::ImageReader::open(&source)
+            .map_err(|e| e.to_string())?
+            .decode()
+            .map_err(|e| e.to_string())?
+            .to_rgba8();
+        let width = image.width().max(1) as f32;
+        let height = image.height().max(1) as f32;
+        let scale_x = width / preview_width.max(1.0);
+        let scale_y = height / preview_height.max(1.0);
+        let stroke_width = (width / preview_width.max(1.0)) * 1.35;
+
+        for stroke in &strokes {
+            draw_annotated_stroke(&mut image, stroke, scale_x, scale_y, stroke_width);
+        }
+
+        let safe_ext = if ext == "png" { "png" } else { "jpg" };
+        let file_name = format!(
+            "photo-doc-draw-{}-{}.{}",
+            std::process::id(),
+            now_ms(),
+            safe_ext
+        );
+        let out_path = std::env::temp_dir().join(file_name);
+        image::DynamicImage::ImageRgba8(image)
+            .save_with_format(&out_path, format)
+            .map_err(|e| e.to_string())?;
+        Ok(out_path.to_string_lossy().to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn get_import_wizard_preview_src_path(
     app_handle: tauri::AppHandle,
@@ -5442,6 +5704,7 @@ fn notify_import_wizard_completed(
     import_wizard_dir: Option<String>,
     imported_image_count: Option<u64>,
     imported_total_count: Option<u64>,
+    select_target_folder: Option<bool>,
 ) -> Result<bool, String> {
     app_handle
         .emit(
@@ -5456,6 +5719,7 @@ fn notify_import_wizard_completed(
                     .filter(|s| !s.is_empty()),
                 imported_image_count,
                 imported_total_count,
+                select_target_folder,
             },
         )
         .map_err(|e| e.to_string())?;
@@ -6366,7 +6630,7 @@ async fn get_import_wizard_cached_previews(
     let include_data_url = include_data_url.unwrap_or(true);
     let generate_if_missing = generate_if_missing.unwrap_or(true);
     let settings = read_settings(&app_handle).unwrap_or_default();
-    let max_cache_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
+    let max_cache_bytes = get_preview_cache_max_bytes(&app_handle);
     let preview_perf_mode = normalize_preview_performance_mode(
         settings
             .preview_performance_mode
@@ -6659,17 +6923,6 @@ fn start_import_files(
                 .map(|dir| PathBuf::from(dir.trim()))
         })
         .map(|dir| dir.join(".preview-cache"));
-    let preview_perf_mode = read_settings(&app_handle)
-        .ok()
-        .map(|settings| {
-            normalize_preview_performance_mode(
-                settings
-                    .preview_performance_mode
-                    .as_deref()
-                    .unwrap_or(PREVIEW_PERF_AUTO),
-            )
-        })
-        .unwrap_or_else(|| PREVIEW_PERF_AUTO.to_string());
     let import_files = file_paths
         .into_iter()
         .map(|p| p.trim().to_string())
@@ -6677,6 +6930,9 @@ fn start_import_files(
         .collect::<Vec<_>>();
     let target_dir_clone = target_dir.clone();
     let workspace_root_for_delete_guard = workspace_path.clone();
+    let workspace_dir_clone = workspace_dir.clone();
+    let patient_folder_clone = patient_folder.clone();
+    let target_folder_for_emit = target_folder.clone();
 
     tauri::async_runtime::spawn_blocking(move || {
         struct ImportActiveGuard;
@@ -6710,6 +6966,26 @@ fn start_import_files(
         let mut copied_bytes: u64 = 0;
         let mut copied_count: u64 = 0;
         let mut pending_preview_paths: Vec<String> = Vec::new();
+        let mut reserved_target_paths: HashSet<PathBuf> = HashSet::new();
+        let mut import_tasks: Vec<(PathBuf, PathBuf, bool)> = Vec::with_capacity(import_files.len());
+        for src in &import_files {
+            let src_path = PathBuf::from(src);
+            let file_name = src_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("file")
+                .to_string();
+            let mut dst_path = resolve_unique_target_path(&target_dir_clone, &file_name);
+            while reserved_target_paths.contains(&dst_path) {
+                dst_path = resolve_unique_target_path(&target_dir_clone, &format!("copy_{file_name}"));
+            }
+            reserved_target_paths.insert(dst_path.clone());
+            import_tasks.push((
+                src_path.clone(),
+                dst_path,
+                is_supported_preview_image(&src_path),
+            ));
+        }
         let (preview_tx, preview_rx) = std::sync::mpsc::channel::<Vec<String>>();
         let preview_handle = app_handle_clone.clone();
         std::thread::spawn(move || {
@@ -6736,44 +7012,56 @@ fn start_import_files(
 
         emit_progress(0.0, false, None);
 
-        for src in import_files {
-            let src_path = PathBuf::from(&src);
-            let file_name = src_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("file")
-                .to_string();
-            let dst_path = resolve_unique_target_path(&target_dir_clone, &file_name);
+        if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
+            for (src_path, dst_path, is_image) in &import_tasks {
+                if !*is_image {
+                    continue;
+                }
+                let src_meta = match fs::metadata(src_path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                let src_size = src_meta.len();
+                let src_modified_ms = src_meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let src_preview_path = resolve_existing_cache_file_path(
+                    cache_dir,
+                    src_path,
+                    None,
+                    src_size,
+                    src_modified_ms,
+                );
+                emit_import_preview_ready_mapped(&app_handle_clone, dst_path, &src_preview_path);
+            }
+        }
 
-            match fs::copy(&src_path, &dst_path) {
-                Ok(written) => {
-                    if is_supported_preview_image(&dst_path) {
+        for (src_path, dst_path, is_image) in import_tasks {
+
+            match copy_file_with_progress(&src_path, &dst_path, |chunk_bytes| {
+                copied_bytes = copied_bytes.saturating_add(chunk_bytes);
+                let copy_percent = if total_bytes > 0 {
+                    (copied_bytes as f64 / total_bytes as f64) * 100.0
+                } else if total_count > 0 {
+                    (copied_count as f64 / total_count as f64) * 100.0
+                } else {
+                    100.0
+                };
+                let overall_percent = (copy_percent.clamp(0.0, 100.0) * 0.9).clamp(0.0, 90.0);
+                emit_progress(overall_percent, false, None);
+            }) {
+                Ok(_written) => {
+                    if is_image {
                         if let Some(cache_dir) = import_wizard_cache_dir.as_ref() {
-                            let _ = fs::create_dir_all(cache_dir);
-                            let src_for_cache = src_path.to_string_lossy().to_string();
-                            let _ = resolve_cached_previews_in_cache_dir(
-                                &vec![src_for_cache],
-                                false,
-                                true,
-                                cache_dir,
-                                PREVIEW_CACHE_MAX_BYTES_FIXED,
-                                &preview_perf_mode,
-                                None,
-                                None,
-                            );
                             let _ = seed_active_preview_cache_from_import_wizard_cache(
                                 &app_handle_clone,
                                 cache_dir,
                                 &src_path,
                                 &dst_path,
                             );
-                            // If we already have a seeded preview in active cache, surface it immediately.
-                            let dst_for_emit = dst_path.to_string_lossy().to_string();
-                            if let Ok(rows) =
-                                resolve_cached_previews(&app_handle_clone, &vec![dst_for_emit], false, false)
-                            {
-                                emit_import_preview_ready_events(&app_handle_clone, &rows);
-                            }
                         }
                         pending_preview_paths.push(dst_path.to_string_lossy().to_string());
                         if pending_preview_paths.len() >= IMPORT_PREVIEW_MICROBATCH_SIZE {
@@ -6782,6 +7070,18 @@ fn start_import_files(
                         }
                     }
 
+                    let _ = app_handle_clone.emit(
+                        "import-file-copied",
+                        ImportFileCopiedEvent {
+                            job_id,
+                            workspace_dir: workspace_dir_clone.clone(),
+                            patient_folder: patient_folder_clone.clone(),
+                            target_folder: target_folder_for_emit.clone(),
+                            path: dst_path.to_string_lossy().to_string(),
+                            is_image: is_supported_preview_image(&dst_path),
+                        },
+                    );
+
                     if delete_origin {
                         // Safety guard: never delete originals that are inside workspace.
                         if !path_is_inside_dir(&src_path, &workspace_root_for_delete_guard) {
@@ -6789,7 +7089,6 @@ fn start_import_files(
                         }
                     }
 
-                    copied_bytes = copied_bytes.saturating_add(written);
                     copied_count = copied_count.saturating_add(1);
                     let copy_percent = if total_bytes > 0 {
                         (copied_bytes as f64 / total_bytes as f64) * 100.0
@@ -6854,11 +7153,16 @@ fn load_settings(app_handle: tauri::AppHandle) -> Result<Settings, String> {
 
 #[tauri::command]
 fn set_cache_size_gb(app_handle: tauri::AppHandle, cache_size_gb: u8) -> Result<u8, String> {
-    let _ = cache_size_gb;
+    let normalized = cache_size_gb.clamp(1, 10);
     let mut settings = read_settings(&app_handle)?;
-    settings.cache_size_gb = Some(10);
+    settings.cache_size_gb = Some(normalized);
     write_settings(&app_handle, &settings)?;
-    Ok(10)
+    Ok(normalized)
+}
+
+#[tauri::command]
+fn get_workspace_change_crawl_running() -> bool {
+    WORKSPACE_CHANGE_CRAWL_RUNNING.load(Ordering::Relaxed)
 }
 
 #[tauri::command]
@@ -7138,7 +7442,7 @@ async fn delete_main_cache_files(
 
 #[tauri::command]
 fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
-    let max_bytes = PREVIEW_CACHE_MAX_BYTES_FIXED;
+    let max_bytes = get_preview_cache_max_bytes(&app_handle);
     let cache_dir = get_active_preview_cache_dir(&app_handle);
     let used_bytes = if let Ok(_guard) = preview_cache_lock().try_lock() {
         let mut index = load_preview_cache_index(&cache_dir);
@@ -7312,6 +7616,26 @@ fn get_db_image_count(
         return Ok(0);
     }
     query_db_image_count(&app_handle, &workspace_key)
+}
+
+#[tauri::command]
+fn get_indexed_patient_count(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+) -> Result<u64, String> {
+    let workspace_key = workspace_dir.trim().to_string();
+    if workspace_key.is_empty() {
+        return Ok(0);
+    }
+    let conn = open_db(&app_handle)?;
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM patient_index WHERE workspace_dir = ?1",
+            params![workspace_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0);
+    Ok(count.max(0) as u64)
 }
 
 fn compute_preview_debug_counts(
@@ -7635,6 +7959,7 @@ pub fn run() {
             get_import_wizard_preview_data_url,
             get_import_wizard_quick_preview_data_url,
             save_import_wizard_preview_data_url_to_temp,
+            export_annotated_image_to_temp,
             get_import_wizard_preview_src_path,
             preview_trace_client,
             emit_image_preview_rotated,
@@ -7693,13 +8018,15 @@ pub fn run() {
             run_system_update,
             check_system_update,
             get_db_image_count,
+            get_indexed_patient_count,
             get_preview_debug_counts,
             cleanup_preview_cache_for_workspace,
             get_preview_fill_status,
             stop_all_cache_tasks,
             stop_background_preview_fill,
             start_background_preview_fill,
-            load_settings
+            load_settings,
+            get_workspace_change_crawl_running
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
