@@ -51,6 +51,7 @@ struct Settings {
     keep_local_cache_copy: Option<bool>,
     preview_performance_mode: Option<String>,
     background_preview_creation: Option<bool>,
+    language: Option<String>,
 }
 
 fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
@@ -69,6 +70,7 @@ fn read_settings(app_handle: &tauri::AppHandle) -> Result<Settings, String> {
     if !path.exists() {
         let mut settings = Settings::default();
         settings.preview_performance_mode = Some(PREVIEW_PERF_AUTO.to_string());
+        settings.language = Some("en".to_string());
         return Ok(settings);
     }
 
@@ -81,6 +83,12 @@ fn read_settings(app_handle: &tauri::AppHandle) -> Result<Settings, String> {
             .unwrap_or(PREVIEW_PERF_AUTO),
     );
     settings.preview_performance_mode = Some(normalized_mode);
+    let normalized_language = match settings.language.as_deref().unwrap_or("en").trim().to_lowercase().as_str() {
+        "de" => "de",
+        "fr" => "fr",
+        _ => "en",
+    };
+    settings.language = Some(normalized_language.to_string());
     Ok(settings)
 }
 
@@ -4159,7 +4167,12 @@ fn copy_file_to_destination(source_path: String, destination_dir: String) -> Res
 }
 
 #[tauri::command]
-async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String) -> Result<bool, String> {
+async fn rotate_image_right_in_place(
+    app_handle: tauri::AppHandle,
+    path: String,
+    steps: Option<u8>,
+    _op_id: Option<u64>,
+) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let _rotate_guard = rotate_image_lock().lock().map_err(|e| e.to_string())?;
         let path = path.trim().to_string();
@@ -4197,7 +4210,13 @@ async fn rotate_image_right_in_place(app_handle: tauri::AppHandle, path: String)
             .map_err(|e| e.to_string())?
             .decode()
             .map_err(|e| e.to_string())?;
-        let rotated = decoded.rotate90();
+        let normalized_steps = (steps.unwrap_or(1) % 4) as u32;
+        let rotated = match normalized_steps {
+            0 => decoded,
+            1 => decoded.rotate90(),
+            2 => decoded.rotate180(),
+            _ => decoded.rotate270(),
+        };
 
         let tmp_path = source.with_extension(format!("{}.rotating", ext));
         rotated
@@ -7608,6 +7627,19 @@ async fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<Preview
 }
 
 #[tauri::command]
+fn set_language(app_handle: tauri::AppHandle, language: String) -> Result<String, String> {
+    let normalized = match language.trim().to_lowercase().as_str() {
+        "de" => "de",
+        "fr" => "fr",
+        _ => "en",
+    };
+    let mut settings = read_settings(&app_handle)?;
+    settings.language = Some(normalized.to_string());
+    write_settings(&app_handle, &settings)?;
+    Ok(normalized.to_string())
+}
+
+#[tauri::command]
 async fn get_active_preview_cache_image_count(app_handle: tauri::AppHandle) -> Result<u64, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let cache_dir = get_active_preview_cache_dir(&app_handle);
@@ -8066,6 +8098,13 @@ pub fn run() {
                 tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) | tauri::WindowEvent::CloseRequested { .. } => {
                     if window.label() == "main" {
                         let _ = persist_main_window_state(&window.app_handle(), window);
+                        if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                            for label in ["image_preview", "import_wizard_preview", "import_wizard_helper"] {
+                                if let Some(child) = window.app_handle().get_webview_window(label) {
+                                    let _ = child.close();
+                                }
+                            }
+                        }
                     } else if window.label() == "import_wizard_preview" {
                         let _ = persist_import_wizard_preview_window_state(&window.app_handle(), window);
                         if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
@@ -8154,6 +8193,7 @@ pub fn run() {
             set_cache_size_gb,
             set_preview_performance_mode,
             set_background_preview_creation,
+            set_language,
             set_keep_local_cache_copy,
             get_local_cache_copy_status,
             sync_local_cache_copy,

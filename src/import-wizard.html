@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-i18n-document-title="import_wizard_title">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -26,6 +26,7 @@
                 class="wizard-treatment-input"
                 type="text"
                 placeholder="Treatment"
+                data-i18n-placeholder="wizard.treatment_placeholder"
                 autocomplete="off"
               />
               <button
@@ -33,6 +34,7 @@
                 class="wizard-treatment-dropdown-btn"
                 type="button"
                 aria-label="Show existing treatment folders"
+                data-i18n-aria-label="wizard.show_existing_folders"
                 aria-expanded="false"
               >
                 <svg class="wizard-treatment-dropdown-arrow" viewBox="0 0 20 20" fill="none" aria-hidden="true">
@@ -56,7 +58,7 @@
             <input type="checkbox" id="wizardLivePreviewToggle" />
             <span class="toggle-slider" aria-hidden="true"></span>
           </span>
-          <span class="wizard-live-label">Live Preview</span>
+          <span class="wizard-live-label" data-i18n="wizard.live_preview">Live Preview</span>
         </label>
         <svg width="200" height="200" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" id="doctor-svg">
           <path d="M60,150 L140,150 L130,120 Q100,110 70,120 Z" fill="#ffffff" stroke="#cbd5e1" stroke-width="1" />
@@ -90,11 +92,11 @@
         </svg>
       </div>
       <div class="wizard-close-confirm" id="wizardCloseConfirm" hidden>
-        <div class="wizard-close-confirm-title">Are you sure?</div>
-        <div class="wizard-close-confirm-text">Selected Files will not be imported</div>
+        <div class="wizard-close-confirm-title" data-i18n="wizard.are_you_sure">Are you sure?</div>
+        <div class="wizard-close-confirm-text" data-i18n="wizard.selected_files_not_imported">Selected Files will not be imported</div>
         <div class="wizard-close-confirm-actions">
-          <button id="wizardDiscardBtn" class="wizard-close-confirm-btn discard" type="button">Discard</button>
-          <button id="wizardConfirmBtn" class="wizard-close-confirm-btn confirm" type="button">Confirm</button>
+          <button id="wizardDiscardBtn" class="wizard-close-confirm-btn discard" type="button" data-i18n="wizard.discard">Discard</button>
+          <button id="wizardConfirmBtn" class="wizard-close-confirm-btn confirm" type="button" data-i18n="wizard.confirm">Confirm</button>
         </div>
       </div>
     </div>

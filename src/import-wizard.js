@@ -3,6 +3,7 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { FULL_TRACE } from "./trace-config";
+import { applyTranslations, initLanguageFromSettings, onLanguageChanged, t } from "./i18n";
 
 const params = new URLSearchParams(window.location.search);
 const workspaceDir = String(params.get("workspaceDir") ?? "").trim();
@@ -219,7 +220,7 @@ function renderImportUi() {
   if (filesCountBg) filesCountBg.textContent = String(count);
   importPanel.hidden = count < 1;
   importToggle.disabled = importMode;
-  importCountText.textContent = `${count} Files`;
+  importCountText.textContent = t("wizard.files_count", { count });
   const expanded = !importMode && importExpanded && count > 0;
   importToggle.setAttribute("aria-expanded", expanded ? "true" : "false");
   importPanel.classList.toggle("expanded", expanded);
@@ -266,7 +267,7 @@ function renderImportUi() {
         img.alt = "";
         thumb.appendChild(img);
       } else if (path) {
-        thumb.textContent = "IMG";
+        thumb.textContent = t("wizard.img");
         if (thumbsRequested < WIZARD_LIST_THUMB_REQUEST_LIMIT) {
           thumbsRequested += 1;
           requestListThumbnail(path);
@@ -290,7 +291,7 @@ function renderImportUi() {
       const removeBtn = document.createElement("button");
       removeBtn.type = "button";
       removeBtn.className = "wizard-import-remove";
-      removeBtn.setAttribute("aria-label", `Remove ${name}`);
+      removeBtn.setAttribute("aria-label", t("wizard.remove_file", { name }));
       removeBtn.textContent = "\u00D7";
       removeBtn.disabled = importMode;
       removeBtn.addEventListener("click", (event) => {
@@ -338,7 +339,7 @@ function renderImportUi() {
     if (pendingRows.length > WIZARD_LIST_MAX_VISIBLE_ROWS) {
       const overflow = document.createElement("li");
       overflow.className = "wizard-import-item";
-      overflow.textContent = `Showing latest ${WIZARD_LIST_MAX_VISIBLE_ROWS} of ${pendingRows.length}`;
+      overflow.textContent = t("wizard.showing_latest", { visible: WIZARD_LIST_MAX_VISIBLE_ROWS, total: pendingRows.length });
       importList.appendChild(overflow);
     }
   };
@@ -458,14 +459,14 @@ function updateActionButtonState() {
   }
   if (!actionBtn) return;
   if (!importMode) {
-    actionBtn.textContent = "Import";
+    actionBtn.textContent = t("wizard.import");
     actionBtn.disabled = !hasFiles || importBusy;
     if (treatmentPicker) treatmentPicker.hidden = true;
     setTreatmentDropdownOpen(false);
     return;
   }
   if (treatmentPicker) treatmentPicker.hidden = false;
-  actionBtn.textContent = "Done";
+  actionBtn.textContent = t("wizard.done");
   const hasTreatment = Boolean(String(treatmentInput?.value ?? "").trim());
   actionBtn.disabled = !hasTreatment || !hasFiles || importBusy;
 }
@@ -1140,6 +1141,13 @@ function cleanup() {
 }
 
 async function init() {
+  await initLanguageFromSettings();
+  applyTranslations(document);
+  onLanguageChanged(() => {
+    applyTranslations(document);
+    renderImportUi();
+    updateActionButtonState();
+  });
   initDoctorAnimation();
   await loadLivePreviewToggleSetting();
   await ensureWatchFolderPreviewCache();

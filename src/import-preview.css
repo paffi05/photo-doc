@@ -124,6 +124,33 @@ body{
   pointer-events: auto;
 }
 
+.draw-color-popover{
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 12;
+}
+
+.draw-color-popover[hidden]{
+  display: none !important;
+}
+
+.draw-custom-color-input{
+  width: 1px;
+  height: 1px;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  display: block;
+  opacity: 0;
+  pointer-events: none;
+}
+
 .draw-clear-btn{
   width: 0;
   height: 36px;
@@ -300,25 +327,45 @@ body{
 }
 
 .draw-color-dot{
+  appearance: none;
+  -webkit-appearance: none;
+  display: inline-block;
+  position: relative;
   width: 20px;
   height: 20px;
   border-radius: 999px;
-  border: 1px solid rgba(0,0,0,0.2);
+  border: 0;
   padding: 0;
   cursor: pointer;
   background: #ffffff;
+  box-sizing: border-box;
 }
 
-.draw-color-dot[data-color="red"]{
-  background: #e3342f;
+.draw-color-dot::after{
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border: 2px solid transparent;
+  border-radius: 999px;
+  pointer-events: none;
 }
 
-.draw-color-dot[data-color="blue"]{
-  background: #2563eb;
+.draw-color-dot::before{
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  border: 1px solid var(--draw-dot-border-color, rgba(0,0,0,0.2));
+  pointer-events: none;
 }
 
 .draw-color-dot.active{
-  box-shadow: 0 0 0 3px #2563eb;
+  outline: none;
+  box-shadow: none;
+}
+
+.draw-color-dot.active::after{
+  border-color: #2563eb;
 }
 
 .preview-root.can-pan{
@@ -354,7 +401,7 @@ body{
 
 .preview-root.draw-mode .draw-canvas{
   pointer-events: auto;
-  cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M15.7 4.9L19.1 8.3L9.1 18.3L5 19.3L6 15.2L15.7 4.9Z' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M13.8 6.8L17.2 10.2' fill='none' stroke='%23000' stroke-width='2' stroke-linecap='round'/%3E%3C/svg%3E") 4 20, crosshair;
+  cursor: var(--draw-cursor, crosshair) 4 20, crosshair;
 }
 
 .preview-loading{

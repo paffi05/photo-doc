@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-i18n-document-title="app_title">
   <head>
     <meta charset="UTF-8" />
     <link rel="stylesheet" href="styles.css" />
@@ -16,11 +16,11 @@
         </svg>
         <span class="startup-spinner-percent" id="startupSpinnerPercent">0%</span>
       </div>
-      <p class="startup-subtitle">Getting Ready...</p>
+      <p class="startup-subtitle" data-i18n="startup.subtitle">Getting Ready...</p>
       <p class="startup-process" id="startupProcessText">Starting application...</p>
       <p class="startup-update-notice" id="startupUpdateNotice" hidden>
         <span class="startup-update-dot" aria-hidden="true"></span>
-        <span>New Updates available</span>
+        <span data-i18n="startup.updates_available">New Updates available</span>
       </p>
     </div>
 
@@ -34,6 +34,98 @@
     <!-- ONBOARDING (shown when workspace not set) -->
     <div id="onboardingView" class="onboarding-root" hidden>
       <div class="container" id="onboardingCard">
+        <div class="onboarding-language-step" id="onboardingLanguageStep">
+          <div class="onboarding-language-hero" aria-hidden="true">
+            <svg width="300" height="220" viewBox="0 0 300 220" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <filter id="languageBubbleShadow" x="-20%" y="-20%" width="140%" height="140%">
+                  <feGaussianBlur in="SourceAlpha" stdDeviation="3" />
+                  <feOffset dx="0" dy="4" result="offsetblur" />
+                  <feComponentTransfer>
+                    <feFuncA type="linear" slope="0.1" />
+                  </feComponentTransfer>
+                  <feMerge>
+                    <feMergeNode />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
+              </defs>
+
+              <g>
+                <animateTransform attributeName="transform" type="translate" values="0,0; 0,-10; 0,0" dur="4s" repeatCount="indefinite" />
+
+                <path
+                  d="M50,20 H250 A20,20 0 0 1 270,40 V100 A20,20 0 0 1 250,120 H110 L80,150 V120 H50 A20,20 0 0 1 30,100 V40 A20,20 0 0 1 50,20 Z"
+                  fill="#F5FBFF"
+                  stroke="#03A9F4"
+                  stroke-width="1.5"
+                  filter="url(#languageBubbleShadow)"
+                />
+
+                <g font-family="Arial, sans-serif" font-size="24" fill="#0277BD" text-anchor="middle">
+                  <text x="150" y="80" display="inline">
+                    <tspan opacity="0">H<animate attributeName="opacity" values="0;1" dur="0.1s" begin="0.1s; 10s" fill="freeze" /></tspan>
+                    <tspan opacity="0">e<animate attributeName="opacity" values="0;1" dur="0.1s" begin="0.2s; 10.1s" fill="freeze" /></tspan>
+                    <tspan opacity="0">l<animate attributeName="opacity" values="0;1" dur="0.1s" begin="0.3s; 10.2s" fill="freeze" /></tspan>
+                    <tspan opacity="0">l<animate attributeName="opacity" values="0;1" dur="0.1s" begin="0.4s; 10.3s" fill="freeze" /></tspan>
+                    <tspan opacity="0">o<animate attributeName="opacity" values="0;1" dur="0.1s" begin="0.5s; 10.4s" fill="freeze" /></tspan>
+                    <animate attributeName="display" values="inline;none;none;none;none" dur="10s" repeatCount="indefinite" />
+                  </text>
+
+                  <text x="150" y="80" display="none">
+                    <tspan opacity="0">H<animate attributeName="opacity" values="0;1" dur="0.1s" begin="2.1s; 12.1s" fill="freeze" /></tspan>
+                    <tspan opacity="0">a<animate attributeName="opacity" values="0;1" dur="0.1s" begin="2.2s; 12.2s" fill="freeze" /></tspan>
+                    <tspan opacity="0">l<animate attributeName="opacity" values="0;1" dur="0.1s" begin="2.3s; 12.3s" fill="freeze" /></tspan>
+                    <tspan opacity="0">l<animate attributeName="opacity" values="0;1" dur="0.1s" begin="2.4s; 12.4s" fill="freeze" /></tspan>
+                    <tspan opacity="0">o<animate attributeName="opacity" values="0;1" dur="0.1s" begin="2.5s; 12.5s" fill="freeze" /></tspan>
+                    <animate attributeName="display" values="none;inline;none;none;none" dur="10s" repeatCount="indefinite" />
+                  </text>
+
+                  <text x="150" y="80" display="none">
+                    <tspan opacity="0">S<animate attributeName="opacity" values="0;1" dur="0.1s" begin="4.1s; 14.1s" fill="freeze" /></tspan>
+                    <tspan opacity="0">a<animate attributeName="opacity" values="0;1" dur="0.1s" begin="4.2s; 14.2s" fill="freeze" /></tspan>
+                    <tspan opacity="0">l<animate attributeName="opacity" values="0;1" dur="0.1s" begin="4.3s; 14.3s" fill="freeze" /></tspan>
+                    <tspan opacity="0">u<animate attributeName="opacity" values="0;1" dur="0.1s" begin="4.4s; 14.4s" fill="freeze" /></tspan>
+                    <tspan opacity="0">t<animate attributeName="opacity" values="0;1" dur="0.1s" begin="4.5s; 14.5s" fill="freeze" /></tspan>
+                    <animate attributeName="display" values="none;none;inline;none;none" dur="10s" repeatCount="indefinite" />
+                  </text>
+
+                  <text x="150" y="80" display="none">
+                    <tspan opacity="0">C<animate attributeName="opacity" values="0;1" dur="0.1s" begin="6.1s; 16.1s" fill="freeze" /></tspan>
+                    <tspan opacity="0">i<animate attributeName="opacity" values="0;1" dur="0.1s" begin="6.2s; 16.2s" fill="freeze" /></tspan>
+                    <tspan opacity="0">a<animate attributeName="opacity" values="0;1" dur="0.1s" begin="6.3s; 16.3s" fill="freeze" /></tspan>
+                    <tspan opacity="0">o<animate attributeName="opacity" values="0;1" dur="0.1s" begin="6.4s; 16.4s" fill="freeze" /></tspan>
+                    <animate attributeName="display" values="none;none;none;inline;none" dur="10s" repeatCount="indefinite" />
+                  </text>
+
+                  <text x="150" y="80" display="none">
+                    <tspan opacity="0">你<animate attributeName="opacity" values="0;1" dur="0.2s" begin="8.1s; 18.1s" fill="freeze" /></tspan>
+                    <tspan opacity="0">好<animate attributeName="opacity" values="0;1" dur="0.2s" begin="8.4s; 18.4s" fill="freeze" /></tspan>
+                    <animate attributeName="display" values="none;none;none;none;inline" dur="10s" repeatCount="indefinite" />
+                  </text>
+                </g>
+              </g>
+            </svg>
+          </div>
+          <div class="onboarding-language-title" id="onboardingLanguageTitle">Select language</div>
+          <p class="onboarding-language-subtitle" id="onboardingLanguageSubtitle" hidden>Select your language</p>
+          <div class="onboarding-language-options" id="onboardingLanguageOptions">
+            <div class="onboarding-language-item">
+              <button type="button" class="onboarding-language-option flag-usa active" id="onboardingIntroLanguageEn" data-language="en" aria-pressed="true"></button>
+              <div class="onboarding-language-code" id="onboardingLanguageCodeEn">ENG</div>
+            </div>
+            <div class="onboarding-language-item">
+              <button type="button" class="onboarding-language-option flag-de active-off" id="onboardingIntroLanguageDe" data-language="de" aria-pressed="false"></button>
+              <div class="onboarding-language-code" id="onboardingLanguageCodeDe">GER</div>
+            </div>
+            <div class="onboarding-language-item">
+              <button type="button" class="onboarding-language-option flag-fr active-off" id="onboardingIntroLanguageFr" data-language="fr" aria-pressed="false"></button>
+              <div class="onboarding-language-code" id="onboardingLanguageCodeFr">FR</div>
+            </div>
+          </div>
+          <button class="btn onboarding-next-btn" id="onboardingNextBtn">Next</button>
+        </div>
+        <div class="onboarding-folder-step" id="onboardingFolderStep" hidden>
         <div class="folder-wrapper" id="pickWorkspaceIcon">
           <div id="folderIconContainer">
             <!-- Original Folder SVG -->
@@ -53,6 +145,7 @@
         <p id="onboardingSubtitle">Please select the folder where your patient folders are stored.</p>
 
         <button class="btn" id="pickWorkspaceBtn">Browse Folders</button>
+        </div>
       </div>
     </div>
 
@@ -61,7 +154,7 @@
       <div class="main-layout">
         <aside class="patient-sidebar">
           <div class="patient-sidebar-top">
-            <div class="patient-sidebar-header">Patients</div>
+            <div class="patient-sidebar-header" data-i18n="patients.title">Patients</div>
             <div class="patient-sidebar-actions">
               <button class="icon-btn patient-warning-btn" id="invalidPatientFoldersBtn" aria-label="Invalid patient folder names detected" title="Invalid patient folder names detected" hidden>
                 <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -70,7 +163,7 @@
                   <circle cx="12" cy="16.7" r="0.9" fill="#000000"/>
                 </svg>
               </button>
-              <button class="icon-btn patient-add-btn" id="addPatientBtn" aria-label="Add patient">
+              <button class="icon-btn patient-add-btn" id="addPatientBtn" aria-label="Add patient" data-i18n-aria-label="patients.add_patient">
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
                   <path class="plus-v" d="M12 5v14" stroke-linecap="round"/>
                   <path class="plus-h" d="M5 12h14" stroke-linecap="round"/>
@@ -83,11 +176,11 @@
             <ul class="invalid-patient-folders-list" id="invalidPatientFoldersList"></ul>
           </div>
           <div class="patient-add-form" id="addPatientForm" hidden>
-            <input id="newPatientLastName" class="patient-add-input" type="text" placeholder="Last name" autocomplete="off" />
-            <input id="newPatientFirstName" class="patient-add-input" type="text" placeholder="First name" autocomplete="off" />
+            <input id="newPatientLastName" class="patient-add-input" type="text" placeholder="Last name" autocomplete="off" data-i18n-placeholder="patients.last_name" />
+            <input id="newPatientFirstName" class="patient-add-input" type="text" placeholder="First name" autocomplete="off" data-i18n-placeholder="patients.first_name" />
             <div class="patient-add-id-row">
-              <input id="newPatientId" class="patient-add-input" type="text" placeholder="ID" autocomplete="off" />
-              <button class="icon-btn patient-add-confirm-btn" id="confirmAddPatientBtn" aria-label="Create patient" disabled>
+              <input id="newPatientId" class="patient-add-input" type="text" placeholder="ID" autocomplete="off" data-i18n-placeholder="patients.id" />
+              <button class="icon-btn patient-add-confirm-btn" id="confirmAddPatientBtn" aria-label="Create patient" data-i18n-aria-label="patients.create_patient" disabled>
                 <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" aria-hidden="true">
                   <path d="M6 12.5L10 16.5L18 8.5" stroke-linecap="round" stroke-linejoin="round"/>
                 </svg>
@@ -99,6 +192,7 @@
             class="patient-search-input"
             type="search"
             placeholder="Search patients..."
+            data-i18n-placeholder="patients.search_placeholder"
             autocomplete="off"
           />
           <div class="patient-list-wrap">
@@ -108,19 +202,19 @@
         <section class="main-canvas"></section>
       </div>
 
-      <button class="icon-btn import-wizard-btn" id="openImportWizard" aria-label="Open import wizard" title="Import wizard" hidden>
+      <button class="icon-btn import-wizard-btn" id="openImportWizard" aria-label="Open import wizard" title="Import wizard" hidden data-i18n-aria-label="settings.import_wizard" data-i18n-title="settings.import_wizard">
         <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path class="camera-body" d="M5.2 7.6H8.4L9.8 5.8H14.2L15.6 7.6H18.8C19.7 7.6 20.4 8.3 20.4 9.2V17.6C20.4 18.5 19.7 19.2 18.8 19.2H5.2C4.3 19.2 3.6 18.5 3.6 17.6V9.2C3.6 8.3 4.3 7.6 5.2 7.6Z" fill="currentColor"/>
           <circle class="camera-focus-ring" cx="12" cy="13.4" r="3.25" fill="none" stroke-width="1.8"/>
         </svg>
       </button>
-      <button class="icon-btn import-wizard-done-btn" id="closeImportWizard" aria-label="Close import wizard" title="Done" hidden>
+      <button class="icon-btn import-wizard-done-btn" id="closeImportWizard" aria-label="Close import wizard" title="Done" hidden data-i18n-title="wizard.done">
         <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
           <path d="M6 12.5L10 16.5L18 8.5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
       </button>
 
-      <button class="icon-btn gear-btn" id="openSettings" aria-label="Open settings">
+      <button class="icon-btn gear-btn" id="openSettings" aria-label="Open settings" data-i18n-aria-label="settings.title">
         <svg xmlns="http://www.w3.org/2000/svg" class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
           <circle cx="12" cy="12" r="3"/>
@@ -131,12 +225,12 @@
         <div class="import-wizard-top">
           <label class="import-wizard-live-toggle" for="importWizardLivePreviewToggle">
             <input type="checkbox" id="importWizardLivePreviewToggle" />
-            <span>Live Preview</span>
+            <span data-i18n="wizard.live_preview">Live Preview</span>
           </label>
         </div>
         <div class="import-wizard-body">
           <div class="import-wizard-patient" id="importWizardPatientLabel">No patient selected</div>
-          <div class="import-wizard-list-title">Import list</div>
+          <div class="import-wizard-list-title" data-i18n="wizard.import_list">Import list</div>
           <ul class="import-wizard-list" id="importWizardList"></ul>
           <div class="import-wizard-empty" id="importWizardEmpty">Waiting for new files...</div>
         </div>
@@ -146,9 +240,10 @@
             id="importWizardTreatmentTitle"
             type="text"
             placeholder="Treatment title"
+            data-i18n-placeholder="wizard.treatment_title"
             autocomplete="off"
           />
-          <button class="icon-btn import-wizard-confirm-btn" id="importWizardConfirmBtn" aria-label="Confirm import">
+          <button class="icon-btn import-wizard-confirm-btn" id="importWizardConfirmBtn" aria-label="Confirm import" data-i18n-aria-label="wizard.confirm_import">
             <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M6 12.5L10 16.5L18 8.5" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
@@ -160,20 +255,20 @@
 
       <aside class="settings" id="settingsPanel" aria-hidden="true">
         <div class="settings-header">
-          <button class="icon-btn close-btn" id="closeSettings" aria-label="Close settings">
+          <button class="icon-btn close-btn" id="closeSettings" aria-label="Close settings" data-i18n-aria-label="settings.title">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M18 6 6 18M6 6l12 12"/>
             </svg>
           </button>
-          <div class="settings-header-title">Settings</div>
+          <div class="settings-header-title" data-i18n="settings.title">Settings</div>
         </div>
 
         <div class="settings-body">
           <div class="settings-section">
-            <div class="settings-category">SYSTEM</div>
+            <div class="settings-category" data-i18n="settings.system">SYSTEM</div>
             <div class="settings-row system-update-row">
-              <div class="settings-value">Search for Updates</div>
-              <button class="folder-change-btn db-reload-btn system-update-btn" id="systemUpdateBtn" type="button" aria-label="Search for updates" title="Search for updates">
+              <div class="settings-value" data-i18n="settings.search_updates">Search for Updates</div>
+              <button class="folder-change-btn db-reload-btn system-update-btn" id="systemUpdateBtn" type="button" aria-label="Search for updates" title="Search for updates" data-i18n-aria-label="settings.search_updates" data-i18n-title="settings.search_updates">
                 <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                   <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -211,16 +306,16 @@
                 title="Install update"
                 hidden
               >
-                Update
-              </button>
+                  <span data-i18n="settings.update">Update</span>
+                </button>
             </div>
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">WORKSPACE</div>
+            <div class="settings-category" data-i18n="settings.workspace">WORKSPACE</div>
             <div class="settings-row workspace-path-row">
               <button class="settings-value workspace-path-link" id="workspacePath" type="button">(not set)</button>
-              <button class="folder-change-btn" id="changeWorkspaceBtn" aria-label="Change workspace">
+              <button class="folder-change-btn" id="changeWorkspaceBtn" aria-label="Change workspace" data-i18n-aria-label="settings.change_workspace">
                 <svg class="folder-change-icon" width="22" height="22" viewBox="0 0 100 100" fill="none" aria-hidden="true">
                   <path d="M10 30C10 26.6863 12.6863 24 16 24H35L42 32H84C87.3137 32 90 34.6863 90 38V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V30Z" fill="var(--folder-back)"/>
                   <path d="M10 40C10 36.6863 12.6863 34 16 34H84C87.3137 34 90 36.6863 90 40V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V40Z" fill="var(--folder-front)"/>
@@ -230,13 +325,27 @@
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">APPEARANCE</div>
+            <div class="settings-category" data-i18n="settings.appearance">APPEARANCE</div>
             <div class="settings-row">
-              <div class="settings-value">Always show Folder Names in Timeline</div>
+              <div class="settings-value" data-i18n="settings.always_show_timeline_names">Always show Folder Names in Timeline</div>
               <label class="toggle-switch" for="alwaysShowTimelineNames">
                 <input type="checkbox" id="alwaysShowTimelineNames" />
                 <span class="toggle-slider" aria-hidden="true"></span>
               </label>
+            </div>
+            <div class="settings-row language-row">
+              <div class="settings-value" data-i18n="settings.language">Language</div>
+              <div class="language-picker" id="languagePicker" role="group" aria-label="Language">
+                <button type="button" class="language-option active" id="languageOptionEn" data-language="en" aria-pressed="true" title="English">
+                  <span class="language-code" id="settingsLanguageCodeEn">ENG</span>
+                </button>
+                <button type="button" class="language-option" id="languageOptionDe" data-language="de" aria-pressed="false" title="Deutsch">
+                  <span class="language-code" id="settingsLanguageCodeDe">GER</span>
+                </button>
+                <button type="button" class="language-option" id="languageOptionFr" data-language="fr" aria-pressed="false" title="Francais">
+                  <span class="language-code" id="settingsLanguageCodeFr">FR</span>
+                </button>
+              </div>
             </div>
           </div>
 
@@ -261,11 +370,11 @@
                 </button>
               </div>
               <div class="settings-row preview-created-row">
-                <div class="settings-value preview-created-label">Preview Images created</div>
+                  <div class="settings-value preview-created-label" data-i18n="settings.preview_images_created">Preview Images created</div>
                 <div class="processing-speed-value preview-created-count" id="previewImagesCreatedCount">(0/0)</div>
               </div>
               <div class="settings-row processing-speed-row">
-                <div class="settings-value">Processing Speed</div>
+                  <div class="settings-value" data-i18n="settings.processing_speed">Processing Speed</div>
                 <div class="processing-speed-control">
                   <input
                     type="range"
@@ -281,8 +390,8 @@
               </div>
               <div class="indexing-progress-row">
                 <span class="indexing-progress-spinner" id="indexingProgressSpinner" hidden aria-hidden="true"></span>
-                <span class="indexing-progress-text" id="indexingProgressText">Up to date</span>
-                <button class="folder-change-btn db-reload-btn cache-reload-btn" id="cacheReloadBtn" aria-label="Update cache">
+                  <span class="indexing-progress-text" id="indexingProgressText">Up to date</span>
+                  <button class="folder-change-btn db-reload-btn cache-reload-btn" id="cacheReloadBtn" aria-label="Update cache" data-i18n-aria-label="settings.update_cache">
                   <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                     <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                     <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -290,14 +399,14 @@
                 </button>
               </div>
               <div class="settings-row background-preview-row">
-                <div class="settings-value">Background Preview Creation</div>
+                  <div class="settings-value" data-i18n="settings.background_preview_creation">Background Preview Creation</div>
                 <label class="toggle-switch" for="backgroundPreviewCreationToggle">
                   <input type="checkbox" id="backgroundPreviewCreationToggle" />
                   <span class="toggle-slider" aria-hidden="true"></span>
                 </label>
               </div>
               <div class="settings-row local-cache-copy-row">
-                <div class="settings-value">Keep local Cache Copy</div>
+                  <div class="settings-value" data-i18n="settings.keep_local_cache_copy">Keep local Cache Copy</div>
                 <label class="toggle-switch" for="keepLocalCacheCopy">
                   <input type="checkbox" id="keepLocalCacheCopy" />
                   <span class="toggle-slider" aria-hidden="true"></span>
@@ -312,6 +421,8 @@
                     id="openLocalCacheCopyFolderBtn"
                     aria-label="Open local cache copy folder"
                     title="Open local cache copy folder"
+                    data-i18n-aria-label="settings.open_local_cache_copy_folder"
+                    data-i18n-title="settings.open_local_cache_copy_folder"
                   >
                     &gt;
                   </button>
@@ -336,16 +447,16 @@
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">DATABASE</div>
+            <div class="settings-category" data-i18n="settings.database">DATABASE</div>
             <div class="settings-row">
               <div class="settings-value database-status-wrap">
                 <div class="database-status-line">
                   <span class="db-status-spinner" id="dbStatusSpinner" hidden aria-hidden="true"></span>
-                  <span id="dbStatusText">Up to date</span>
+                  <span id="dbStatusText" data-i18n="settings.up_to_date">Up to date</span>
                 </div>
-                <div class="database-status-time" id="dbStatusTime">Never Updated</div>
+                <div class="database-status-time" id="dbStatusTime" data-i18n="settings.never_updated">Never Updated</div>
               </div>
-              <button class="folder-change-btn db-reload-btn" id="dbReloadBtn" aria-label="Update database">
+              <button class="folder-change-btn db-reload-btn" id="dbReloadBtn" aria-label="Update database" data-i18n-aria-label="settings.update_database">
                 <svg class="db-reload-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <path d="M21 12a9 9 0 1 1-2.64-6.36" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                   <path d="M21 3v6h-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
@@ -353,8 +464,8 @@
               </button>
             </div>
             <div class="settings-row delete-action-row debug-delete-row inactive" id="deleteDatabaseRow" hidden>
-              <div class="settings-value" id="deleteDatabaseLabel">Delete Database</div>
-              <button class="folder-change-btn delete-folder-btn" id="deleteDatabaseBtn" aria-label="delete database" disabled>
+              <div class="settings-value" id="deleteDatabaseLabel" data-i18n="settings.delete_database">Delete Database</div>
+              <button class="folder-change-btn delete-folder-btn" id="deleteDatabaseBtn" aria-label="delete database" data-i18n-aria-label="settings.delete_database" disabled>
                 <svg class="delete-folder-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
                   <path d="M7 7L17 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
                   <path d="M17 7L7 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
@@ -364,10 +475,10 @@
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">IMPORT WIZARD</div>
+            <div class="settings-category" data-i18n="settings.import_wizard">IMPORT WIZARD</div>
             <div class="settings-row workspace-path-row">
-              <button class="settings-value workspace-path-link no-path" id="importWizardPath" type="button">No folder selected</button>
-              <button class="folder-change-btn" id="changeImportWizardBtn" aria-label="Change import wizard folder">
+              <button class="settings-value workspace-path-link no-path" id="importWizardPath" type="button" data-i18n="settings.import_wizard_folder_none">No folder selected</button>
+              <button class="folder-change-btn" id="changeImportWizardBtn" aria-label="Change import wizard folder" data-i18n-aria-label="settings.change_import_wizard_folder" data-i18n-title="settings.change_import_wizard_folder">
                 <svg class="folder-change-icon" width="22" height="22" viewBox="0 0 100 100" fill="none" aria-hidden="true">
                   <path d="M10 30C10 26.6863 12.6863 24 16 24H35L42 32H84C87.3137 32 90 34.6863 90 38V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V30Z" fill="var(--folder-back)"/>
                   <path d="M10 40C10 36.6863 12.6863 34 16 34H84C87.3137 34 90 36.6863 90 40V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V40Z" fill="var(--folder-front)"/>
@@ -377,9 +488,9 @@
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">DEBUG</div>
+            <div class="settings-category" data-i18n="settings.debug">DEBUG</div>
             <div class="settings-row">
-              <div class="settings-value">Show debug in Frontend</div>
+              <div class="settings-value" data-i18n="settings.show_frontend_debug">Show debug in Frontend</div>
               <label class="toggle-switch" for="showFrontendDebug">
                 <input type="checkbox" id="showFrontendDebug" />
                 <span class="toggle-slider" aria-hidden="true"></span>
@@ -397,16 +508,16 @@
           </div>
 
           <div class="settings-section">
-            <div class="settings-category">ABOUT</div>
+            <div class="settings-category" data-i18n="settings.about">ABOUT</div>
             <div class="settings-row about-row">
               <div class="settings-value about-section-text">
-                <div class="about-copy-main">
+                <div class="about-copy-main" data-i18n="settings.about_copy_main">
                   Built to simplify clinical image organization, automate structured folder systems, and keep medical documentation clean and consistent.
                 </div>
                 <div class="about-person-row">
                   <img class="about-avatar" src="./about-clemens.jpg" alt="Dr. Clemens Paffenholz" />
                   <div class="about-person-lines">
-                    <div class="about-copy-meta">Designed and developed by</div>
+                    <div class="about-copy-meta" data-i18n="settings.about_designed_by">Designed and developed by</div>
                     <div class="about-copy-author">Dr. Clemens Paffenholz</div>
                     <div class="about-copy-location">Augsburg (GER), 2026</div>
                   </div>

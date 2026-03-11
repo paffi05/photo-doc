@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { FULL_TRACE } from "./trace-config";
+import { applyTranslations, initLanguageFromSettings, onLanguageChanged, t } from "./i18n";
 
 const params = new URLSearchParams(window.location.search);
 const previewMode = params.get("mode") === "image" ? "image" : "wizard";
@@ -17,6 +18,8 @@ const previewLoading = document.getElementById("previewLoading");
 const previewToolbar = document.getElementById("previewToolbar");
 const markBtn = document.getElementById("markBtn");
 const drawColorPicker = document.getElementById("drawColorPicker");
+const drawColorPopover = document.getElementById("drawColorPopover");
+const drawCustomColorInput = document.getElementById("drawCustomColorInput");
 const clearDrawBtn = document.getElementById("clearDrawBtn");
 const drawSaveWrap = document.getElementById("drawSaveWrap");
 const drawSaveInput = document.getElementById("drawSaveInput");
@@ -40,6 +43,7 @@ let translateY = 0;
 let controlsVisible = false;
 let markModeActive = false;
 let selectedDrawColor = "white";
+let activeCustomColorDot = null;
 const pendingRotationStepsByPath = new Map();
 const optimisticRotationOverrideDegByPath = new Map();
 const inflightRotationStepsByPath = new Map();
@@ -84,6 +88,7 @@ let previewWorkspaceDir = "";
 let previewPatientFolder = "";
 let folderRefreshRequestId = 0;
 const ROTATION_UI_STATE_STORAGE_KEY = "mpm.imagePreviewRotationUiState.v1";
+const DRAW_COLOR_PALETTE_STORAGE_KEY = "mpm.imagePreviewDrawPalette.v1";
 const PREVIEW_TRACE_FORWARD_TO_RUST = FULL_TRACE;
 
 function previewTrace(scope, message, extra = null) {
@@ -220,9 +225,97 @@ function applyTransform() {
 }
 
 function drawColorToCss(color) {
+  const normalized = String(color ?? "").trim();
+  if (/^#([0-9a-f]{6}|[0-9a-f]{3})$/i.test(normalized)) return normalized;
   if (color === "red") return "#e3342f";
   if (color === "blue") return "#2563eb";
   return "#ffffff";
+}
+
+function normalizeHexColor(value, fallback = "#ffffff") {
+  const raw = String(value ?? "").trim();
+  if (/^#[0-9a-f]{6}$/i.test(raw)) return raw.toLowerCase();
+  if (/^#[0-9a-f]{3}$/i.test(raw)) {
+    return `#${raw[1]}${raw[1]}${raw[2]}${raw[2]}${raw[3]}${raw[3]}`.toLowerCase();
+  }
+  return fallback;
+}
+
+function buildDrawCursorValue(colorValue) {
+  const strokeColor = normalizeHexColor(colorValue, "#000000").replace("#", "%23");
+  const svg =
+    `%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E` +
+    `%3Cpath d='M15.7 4.9L19.1 8.3L9.1 18.3L5 19.3L6 15.2L15.7 4.9Z' fill='none' stroke='${strokeColor}' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E` +
+    `%3Cpath d='M13.8 6.8L17.2 10.2' fill='none' stroke='${strokeColor}' stroke-width='2' stroke-linecap='round'/%3E` +
+    `%3C/svg%3E`;
+  return `url("data:image/svg+xml,${svg}")`;
+}
+
+function updateDrawCursor(colorValue = selectedDrawColor) {
+  previewRoot?.style.setProperty("--draw-cursor", buildDrawCursorValue(colorValue));
+}
+
+function getDotColorValue(dot) {
+  if (!(dot instanceof HTMLElement)) return "#ffffff";
+  return normalizeHexColor(dot.dataset.drawColorValue || drawColorToCss(dot.dataset.color), "#ffffff");
+}
+
+function applyDotColorStyles(dot, colorValue) {
+  if (!(dot instanceof HTMLElement)) return;
+  const normalized = normalizeHexColor(colorValue, "#ffffff");
+  dot.dataset.drawColorValue = normalized;
+  dot.style.backgroundColor = normalized;
+  const isLight = normalized === "#ffffff";
+  dot.style.setProperty("--draw-dot-border-color", isLight ? "rgba(0,0,0,0.2)" : "rgba(255,255,255,0.28)");
+}
+
+function saveDrawPalette() {
+  try {
+    const palette = {};
+    for (const dot of Array.from(drawColorPicker?.querySelectorAll(".draw-color-dot") ?? [])) {
+      const key = String(dot?.dataset?.color ?? "").trim();
+      if (!key) continue;
+      palette[key] = getDotColorValue(dot);
+    }
+    localStorage.setItem(DRAW_COLOR_PALETTE_STORAGE_KEY, JSON.stringify(palette));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function loadStoredDrawPalette() {
+  try {
+    const raw = localStorage.getItem(DRAW_COLOR_PALETTE_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function applyInitialDrawPalette() {
+  const storedPalette = loadStoredDrawPalette();
+  for (const dot of Array.from(drawColorPicker?.querySelectorAll(".draw-color-dot") ?? [])) {
+    const key = String(dot?.dataset?.color ?? "").trim();
+    const fallback = drawColorToCss(key);
+    const nextColor = storedPalette && typeof storedPalette[key] === "string"
+      ? storedPalette[key]
+      : fallback;
+    applyDotColorStyles(dot, nextColor);
+  }
+}
+
+function setDrawColorPopoverOpen(open, anchorDot = activeCustomColorDot) {
+  if (!drawColorPopover) return;
+  const shouldOpen = Boolean(open && anchorDot instanceof HTMLElement && previewToolbar);
+  drawColorPopover.hidden = !shouldOpen;
+  if (!shouldOpen) return;
+  const toolbarRect = previewToolbar.getBoundingClientRect();
+  const dotRect = anchorDot.getBoundingClientRect();
+  const popoverWidth = drawColorPopover.offsetWidth || 44;
+  const left = (dotRect.left - toolbarRect.left) + (dotRect.width / 2) - (popoverWidth / 2);
+  drawColorPopover.style.left = `${Math.max(0, left)}px`;
 }
 
 function resizeDrawCanvas() {
@@ -360,9 +453,6 @@ function persistRotationUiState() {
       pendingSteps: Object.fromEntries(
         Array.from(pendingRotationStepsByPath.entries()).map(([k, v]) => [k, normalizeRotationSteps(v)])
       ),
-      optimisticDeg: Object.fromEntries(
-        Array.from(optimisticRotationOverrideDegByPath.entries()).map(([k, v]) => [k, normalizeRotationDeg(v)])
-      ),
     };
     localStorage.setItem(ROTATION_UI_STATE_STORAGE_KEY, JSON.stringify(payload));
   } catch {
@@ -393,22 +483,18 @@ function pruneStaleRotationUiState() {
 
 function loadRotationUiState() {
   try {
+    pendingRotationStepsByPath.clear();
+    optimisticRotationOverrideDegByPath.clear();
     const raw = localStorage.getItem(ROTATION_UI_STATE_STORAGE_KEY);
     if (!raw) return;
     const parsed = JSON.parse(raw);
     const pending = parsed?.pendingSteps && typeof parsed.pendingSteps === "object" ? parsed.pendingSteps : {};
-    const optimistic = parsed?.optimisticDeg && typeof parsed.optimisticDeg === "object" ? parsed.optimisticDeg : {};
     for (const [path, value] of Object.entries(pending)) {
       const key = normalizePath(path);
       const steps = normalizeRotationSteps(value);
       if (!key || steps === 0) continue;
       pendingRotationStepsByPath.set(key, steps);
-    }
-    for (const [path, value] of Object.entries(optimistic)) {
-      const key = normalizePath(path);
-      const deg = normalizeRotationDeg(value);
-      if (!key || deg === 0) continue;
-      optimisticRotationOverrideDegByPath.set(key, deg);
+      optimisticRotationOverrideDegByPath.set(key, normalizeRotationDeg(steps * 90));
     }
     pruneStaleRotationUiState();
     persistRotationUiState();
@@ -548,15 +634,6 @@ function schedulePendingRotationSave(path) {
   persistRotationUiState();
 }
 
-function scheduleAllPendingRotationSaves() {
-  for (const [rawPath, rawSteps] of pendingRotationStepsByPath.entries()) {
-    const path = normalizePath(rawPath);
-    const steps = normalizeRotationSteps(rawSteps ?? 0);
-    if (!path || steps === 0) continue;
-    schedulePendingRotationSave(path);
-  }
-}
-
 function setControlsVisible(visible) {
   controlsVisible = Boolean(visible);
   previewRoot?.classList.toggle("controls-visible", controlsVisible);
@@ -572,10 +649,10 @@ function setMarkModeActive(active) {
   markBtn?.classList.toggle("active", markModeActive);
   markBtn?.setAttribute("aria-pressed", markModeActive ? "true" : "false");
   previewRoot?.classList.toggle("draw-mode", markModeActive);
+  previewToolbar?.classList.toggle("has-lines", markModeActive && hasDrawnLines);
   if (!markModeActive) {
     isDrawingLine = false;
     lastDrawPoint = null;
-    previewToolbar?.classList.remove("has-lines");
     setSaveModeActive(false);
   }
 }
@@ -584,7 +661,7 @@ function setSaveModeActive(active) {
   saveModeActive = Boolean(active);
   previewToolbar?.classList.toggle("save-mode", saveModeActive);
   if (drawSaveBtn) {
-    drawSaveBtn.textContent = saveModeActive ? "Done" : "Save";
+    drawSaveBtn.textContent = saveModeActive ? t("preview.done") : t("preview.save");
   }
   if (!saveModeActive) {
     setSaveDropdownOpen(false);
@@ -752,11 +829,12 @@ async function exportAnnotatedTempFile() {
 }
 
 function setSelectedDrawColor(color) {
-  const next = ["white", "red", "blue"].includes(String(color)) ? String(color) : "white";
+  const next = normalizeHexColor(color, "#ffffff");
   selectedDrawColor = next;
+  updateDrawCursor(next);
   const dots = Array.from(drawColorPicker?.querySelectorAll(".draw-color-dot") ?? []);
   for (const dot of dots) {
-    const isActive = String(dot?.dataset?.color ?? "") === selectedDrawColor;
+    const isActive = getDotColorValue(dot) === selectedDrawColor;
     dot.classList.toggle("active", isActive);
     dot.setAttribute("aria-pressed", isActive ? "true" : "false");
   }
@@ -1084,6 +1162,7 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
+
 previewRoot?.addEventListener("wheel", (event) => {
   if (markModeActive) return;
   event.preventDefault();
@@ -1237,6 +1316,20 @@ window.addEventListener("pointerdown", (event) => {
   setSaveDropdownOpen(false);
 });
 
+window.addEventListener("pointerdown", (event) => {
+  if (drawColorPopover?.hidden !== false) return;
+  const target = event.target;
+  if (!(target instanceof Node)) {
+    setDrawColorPopoverOpen(false, null);
+    activeCustomColorDot = null;
+    return;
+  }
+  if (drawColorPopover.contains(target)) return;
+  if (activeCustomColorDot?.contains?.(target)) return;
+  setDrawColorPopoverOpen(false, null);
+  activeCustomColorDot = null;
+});
+
 previewRoot?.addEventListener("click", (event) => {
   if (!(event.target instanceof Element)) return;
   if (event.target.closest(".draw-canvas")) return;
@@ -1271,7 +1364,43 @@ markBtn?.addEventListener("click", () => {
 drawColorPicker?.addEventListener("click", (event) => {
   const dot = event.target instanceof Element ? event.target.closest(".draw-color-dot") : null;
   if (!dot) return;
-  setSelectedDrawColor(dot.dataset.color ?? "white");
+  setSelectedDrawColor(getDotColorValue(dot));
+});
+
+drawColorPicker?.addEventListener("dblclick", (event) => {
+  const dot = event.target instanceof Element ? event.target.closest(".draw-color-dot") : null;
+  if (!dot || !drawCustomColorInput) return;
+  event.preventDefault();
+  activeCustomColorDot = dot;
+  drawCustomColorInput.value = getDotColorValue(dot);
+  setDrawColorPopoverOpen(true, dot);
+  requestAnimationFrame(() => {
+    drawCustomColorInput.focus();
+    if (typeof drawCustomColorInput.showPicker === "function") {
+      drawCustomColorInput.showPicker();
+    } else {
+      drawCustomColorInput.click();
+    }
+  });
+});
+
+drawCustomColorInput?.addEventListener("input", (event) => {
+  const nextColor = normalizeHexColor(event.target?.value, "#ffffff");
+  if (!activeCustomColorDot) return;
+  applyDotColorStyles(activeCustomColorDot, nextColor);
+  saveDrawPalette();
+  setSelectedDrawColor(nextColor);
+});
+
+drawCustomColorInput?.addEventListener("change", (event) => {
+  const nextColor = normalizeHexColor(event.target?.value, "#ffffff");
+  if (activeCustomColorDot) {
+    applyDotColorStyles(activeCustomColorDot, nextColor);
+    saveDrawPalette();
+    setSelectedDrawColor(nextColor);
+  }
+  setDrawColorPopoverOpen(false, null);
+  activeCustomColorDot = null;
 });
 
 clearDrawBtn?.addEventListener("click", () => {
@@ -1463,7 +1592,6 @@ drawCanvas?.addEventListener("pointercancel", (event) => {
 
 void listen(previewEventName, (event) => {
   loadRotationUiState();
-  scheduleAllPendingRotationSaves();
   const path = normalizePath(event?.payload?.path);
   const paths = Array.isArray(event?.payload?.paths) ? event.payload.paths : [];
   const workspaceDir = normalizePath(event?.payload?.workspaceDir ?? "");
@@ -1490,10 +1618,22 @@ void listen(previewEventName, (event) => {
 
 void (async () => {
   try {
+    await initLanguageFromSettings();
+    applyTranslations(document);
+    document.title = previewMode === "image" ? t("image_preview_title") : t("import_live_preview_title");
+    previewImage?.setAttribute("alt", t("preview.live_preview_alt"));
+    onLanguageChanged(() => {
+      applyTranslations(document);
+      document.title = previewMode === "image" ? t("image_preview_title") : t("import_live_preview_title");
+      previewImage?.setAttribute("alt", t("preview.live_preview_alt"));
+      if (drawSaveBtn) {
+        drawSaveBtn.textContent = saveModeActive ? t("preview.done") : t("preview.save");
+      }
+    });
     loadRotationUiState();
-    scheduleAllPendingRotationSaves();
     resizeDrawCanvas();
-    setSelectedDrawColor("white");
+    applyInitialDrawPalette();
+    setSelectedDrawColor(drawColorToCss("white"));
     setControlsVisible(false);
     const navStart = performance.now();
     const navPaths = await invoke(getCurrentPathsCommand);

@@ -7,6 +7,7 @@ import { createMainHeaderTimeline } from "./main-content-header";
 import { createImportPanel } from "./main-content-import";
 import { createTreatmentFilesPanel } from "./main-content-treatment-files";
 import { FULL_TRACE } from "./trace-config";
+import { onLanguageChanged, t } from "./i18n";
 
 function previewTrace(scope, message, extra = null) {
   const ts = new Date().toISOString();
@@ -33,7 +34,7 @@ async function ensureImagePreviewWindow(existingWindowRef) {
   const byLabel = await WebviewWindow.getByLabel("image_preview");
   if (byLabel) return byLabel;
   const created = new WebviewWindow("image_preview", {
-    title: "Image Preview",
+    title: t("image_preview_title"),
     width: 980,
     height: 740,
     minWidth: 520,
@@ -106,7 +107,7 @@ export function initMainContent({
   dropOverlay.innerHTML = `
     <div class="main-drop-overlay-frame" aria-hidden="true">
       <div class="main-drop-overlay-plus">+</div>
-      <div class="main-drop-overlay-text">Drop files for import</div>
+      <div class="main-drop-overlay-text">${t("import_main.drop_files")}</div>
     </div>
   `;
   mainCanvas.appendChild(dropOverlay);
@@ -287,6 +288,24 @@ export function initMainContent({
       }
     },
   });
+  onLanguageChanged(() => {
+    if (dropOverlay) {
+      const label = dropOverlay.querySelector(".main-drop-overlay-text");
+      if (label) label.textContent = t("import_main.drop_files");
+    }
+    const emptyLabel = emptyState?.querySelector(".main-empty-label");
+    if (emptyLabel) emptyLabel.textContent = t("patients.no_patient_selected");
+    if (patientIdInput) {
+      patientIdInput.placeholder = t("patients.add_id");
+    }
+    if (patientIdLine?.classList.contains("missing-id")) {
+      patientIdLine.textContent = t("patients.add_id");
+    } else if (patientIdLine && !String(patientIdLine.textContent ?? "").trim()) {
+      patientIdLine.textContent = t("patients.add_id");
+    }
+    updateImportFilesUi();
+    updateImportSelectionUi();
+  });
 
   const emptyState = document.createElement("div");
   emptyState.className = "main-empty-state";
@@ -326,7 +345,7 @@ export function initMainContent({
         <text x="155" y="45" font-size="10" class="z z3">z</text>
       </g>
     </svg>
-      <div class="main-empty-label">No patient selected</div>
+      <div class="main-empty-label">${t("patients.no_patient_selected")}</div>
     </div>
   `;
   mainCanvas.appendChild(emptyState);
@@ -466,7 +485,7 @@ export function initMainContent({
   }
 
   function showMissingPatientIdPrompt() {
-    patientIdLine.textContent = "Add ID...";
+    patientIdLine.textContent = t("patients.add_id");
     patientIdLine.classList.add("missing-id");
     patientIdLine.hidden = false;
     resetPatientIdInputState();
@@ -1273,7 +1292,10 @@ export function initMainContent({
   function updateImportFilesUi() {
     const count = lastDroppedPaths.length;
     if (importFilesCountText) {
-      importFilesCountText.textContent = `${count} ${count === 1 ? "File" : "Files"}`;
+      importFilesCountText.textContent = t("import_main.files_count", {
+        count,
+        label: count === 1 ? t("import_main.file_singular") : t("import_main.file_plural"),
+      });
     }
     if (importFilesList) {
       importFilesList.innerHTML = "";
@@ -1547,7 +1569,7 @@ export function initMainContent({
       return;
     }
     importExistingFolderLabel.classList.remove("selected");
-    importExistingFolderText.textContent = "Select an existing folder";
+    importExistingFolderText.textContent = t("import_main.select_existing_folder");
     if (importExistingFolderIcon) importExistingFolderIcon.hidden = true;
   }
 

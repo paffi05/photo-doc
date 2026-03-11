@@ -1,3 +1,5 @@
+import { t } from "./i18n";
+
 export function createMainHeaderTimeline(mainCanvas) {
   const header = document.createElement("div");
   header.className = "main-content-header";
@@ -39,7 +41,7 @@ export function createMainHeaderTimeline(mainCanvas) {
   patientIdInput.className = "main-selected-id-input";
   patientIdInput.type = "text";
   patientIdInput.inputMode = "numeric";
-  patientIdInput.placeholder = "Add ID...";
+  patientIdInput.placeholder = t("patients.add_id");
   patientIdInput.hidden = true;
   patientLabel.appendChild(patientIdInput);
 

@@ -1,3 +1,5 @@
+import { t } from "./i18n";
+
 export function createImportPanel(contentScrollLayer) {
   const importPanel = document.createElement("div");
   importPanel.className = "main-import-panel";
@@ -10,7 +12,7 @@ export function createImportPanel(contentScrollLayer) {
             <path d="M6 4L14 12" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
             <path d="M14 12L6 20" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" />
           </svg>
-          <span id="importFilesCountText">0 Files</span>
+          <span id="importFilesCountText">${t("import_main.files_count", { count: 0, label: t("import_main.file_plural") })}</span>
         </button>
         <div class="main-import-files-list-shell">
           <div id="importFilesScrollUp" class="main-import-files-overflow-indicator up" aria-hidden="true">
@@ -37,31 +39,31 @@ export function createImportPanel(contentScrollLayer) {
               <path d="M10 40C10 36.6863 12.6863 34 16 34H84C87.3137 34 90 36.6863 90 40V74C90 77.3137 87.3137 80 84 80H16C12.6863 80 10 77.3137 10 74V40Z" fill="var(--folder-front)"/>
             </svg>
           </span>
-          <span id="importExistingFolderText">Select an existing folder</span>
+          <span id="importExistingFolderText">${t("import_main.select_existing_folder")}</span>
         </div>
         <div class="main-import-or-divider" aria-hidden="true">
           <span class="main-import-or-line"></span>
-          <span class="main-import-or-text">OR</span>
+          <span class="main-import-or-text">${t("import_main.or")}</span>
           <span class="main-import-or-line"></span>
         </div>
       </div>
 
       <div class="main-import-section">
-        <label class="main-import-label" for="importTreatmentName">Folder Name</label>
-        <input id="importTreatmentName" class="main-import-input" type="text" placeholder="e.g. follow-up" />
+        <label class="main-import-label" for="importTreatmentName">${t("import_main.folder_name")}</label>
+        <input id="importTreatmentName" class="main-import-input" type="text" placeholder="${t("import_main.folder_name_placeholder")}" />
 
-        <label class="main-import-label" for="importDate">Date</label>
+        <label class="main-import-label" for="importDate">${t("import_main.date")}</label>
         <input id="importDate" class="main-import-input" type="date" />
       </div>
 
       <label class="main-import-checkbox">
         <input id="importDeleteOrigin" type="checkbox" />
-        <span>Delete imported files from origin after successful import</span>
+        <span>${t("import_main.delete_origin")}</span>
       </label>
 
       <div class="main-import-actions">
-        <button id="importCancelBtn" class="main-import-btn main-import-btn-secondary" type="button">Cancel</button>
-        <button id="importStartBtn" class="main-import-btn main-import-btn-primary" type="button">Import</button>
+        <button id="importCancelBtn" class="main-import-btn main-import-btn-secondary" type="button">${t("import_main.cancel")}</button>
+        <button id="importStartBtn" class="main-import-btn main-import-btn-primary" type="button">${t("import_main.import")}</button>
       </div>
     </div>
   `;

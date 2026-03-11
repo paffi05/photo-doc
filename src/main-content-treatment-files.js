@@ -1,6 +1,7 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import { onLanguageChanged, t } from "./i18n";
 
 const VISIBLE_FIRST_IMAGE_COUNT = 10;
 const VISIBLE_FIRST_PREVIEW_CONCURRENCY = 6;
@@ -95,21 +96,21 @@ export function createTreatmentFilesPanel({
   panel.innerHTML = `
     <div class="treatment-files-header">
       <div class="treatment-files-header-main">
-        <div class="treatment-files-title">Treatment Files</div>
+        <div class="treatment-files-title">${t("treatment_files.title")}</div>
         <div class="treatment-files-folder"></div>
         <div class="treatment-files-counts"></div>
         <div class="treatment-previews-progress" hidden>
           <span class="treatment-previews-spinner" aria-hidden="true"></span>
-          <span class="treatment-previews-progress-text">Loading Previews... (0/0)</span>
+          <span class="treatment-previews-progress-text">${t("treatment_files.loading_previews", { done: 0, total: 0 })}</span>
         </div>
       </div>
-      <div class="treatment-files-view-toggle" role="group" aria-label="Treatment files view mode">
+      <div class="treatment-files-view-toggle" role="group" aria-label="${t("treatment_files.treatment_files_view_mode")}">
         <button
           type="button"
           class="treatment-files-view-btn"
           data-view-mode="list"
-          aria-label="List view"
-          title="List view"
+          aria-label="${t("treatment_files.list_view")}"
+          title="${t("treatment_files.list_view")}"
         >
           <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
             <path d="M4 5.2H16" />
@@ -121,8 +122,8 @@ export function createTreatmentFilesPanel({
           type="button"
           class="treatment-files-view-btn"
           data-view-mode="tile"
-          aria-label="Tile view"
-          title="Tile view"
+          aria-label="${t("treatment_files.tile_view")}"
+          title="${t("treatment_files.tile_view")}"
         >
           <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
             <rect x="3.6" y="3.6" width="5.8" height="5.8" rx="1.1" />
@@ -131,28 +132,28 @@ export function createTreatmentFilesPanel({
         </button>
       </div>
     </div>
-    <div class="treatment-files-loading" hidden>Loading files...</div>
-    <div class="treatment-files-empty" hidden>No files in this treatment folder.</div>
+    <div class="treatment-files-loading" hidden>${t("treatment_files.loading_files")}</div>
+    <div class="treatment-files-empty" hidden>${t("treatment_files.empty")}</div>
     <div class="treatment-keywords-wrap" hidden>
-      <div class="treatment-files-section-title">Keywords</div>
+      <div class="treatment-files-section-title">${t("treatment_files.keywords")}</div>
       <div class="treatment-keywords-list"></div>
     </div>
     <div class="treatment-folders-overview-wrap" hidden>
-      <div class="treatment-files-section-title">Folders</div>
+      <div class="treatment-files-section-title">${t("treatment_files.folders")}</div>
       <div class="treatment-folders-overview-grid"></div>
     </div>
     <div class="treatment-files-list-wrap" hidden>
       <div class="treatment-files-list"></div>
     </div>
     <div class="treatment-files-images-wrap" hidden>
-      <div class="treatment-files-section-title">Images</div>
+      <div class="treatment-files-section-title">${t("treatment_files.images")}</div>
       <div class="treatment-files-images-grid"></div>
     </div>
     <div class="treatment-files-other-wrap" hidden>
-      <div class="treatment-files-section-title">Other Files</div>
+      <div class="treatment-files-section-title">${t("treatment_files.other_files")}</div>
       <div class="treatment-files-other-list"></div>
     </div>
-    <button type="button" class="small-btn treatment-files-load-more" hidden>Load more</button>
+    <button type="button" class="small-btn treatment-files-load-more" hidden>${t("treatment_files.load_more")}</button>
   `;
   container.appendChild(panel);
 
@@ -195,6 +196,19 @@ export function createTreatmentFilesPanel({
   const optimisticImportPlaceholdersByContext = new Map();
   let optimisticPlaceholderCards = [];
 
+  function formatCounts(imageCount = 0, otherCount = 0, importingCount = 0) {
+    return importingCount > 0
+      ? t("treatment_files.images_plus_importing", {
+        images: imageCount,
+        importing: importingCount,
+        other: otherCount,
+      })
+      : t("treatment_files.images_only", {
+        images: imageCount,
+        other: otherCount,
+      });
+  }
+
   const VIEW_MODE_STORAGE_KEY = "mpm.treatmentFilesViewMode";
   const normalizeViewMode = (value) => (value === "list" ? "list" : "tile");
   function loadStoredViewMode() {
@@ -230,6 +244,27 @@ export function createTreatmentFilesPanel({
     }
   }
   applyViewModeUi(loadStoredViewMode());
+  onLanguageChanged(() => {
+    titleEl.textContent = panel.hidden ? t("treatment_files.title") : titleEl.textContent;
+    loadingEl.textContent = t("treatment_files.loading_files");
+    emptyEl.textContent = t("treatment_files.empty");
+    loadMoreBtn.textContent = t("treatment_files.load_more");
+    keywordsWrapEl?.querySelector(".treatment-files-section-title")?.replaceChildren(t("treatment_files.keywords"));
+    foldersOverviewWrapEl?.querySelector(".treatment-files-section-title")?.replaceChildren(t("treatment_files.folders"));
+    imagesWrapEl?.querySelector(".treatment-files-section-title")?.replaceChildren(t("treatment_files.images"));
+    otherWrapEl?.querySelector(".treatment-files-section-title")?.replaceChildren(t("treatment_files.other_files"));
+    viewToggleEl?.setAttribute("aria-label", t("treatment_files.treatment_files_view_mode"));
+    const [listBtn, tileBtn] = viewBtns;
+    listBtn?.setAttribute("aria-label", t("treatment_files.list_view"));
+    listBtn?.setAttribute("title", t("treatment_files.list_view"));
+    tileBtn?.setAttribute("aria-label", t("treatment_files.tile_view"));
+    tileBtn?.setAttribute("title", t("treatment_files.tile_view"));
+    if (activeContext?.workspaceDir && activeContext?.patientFolder && activeContext?.treatmentFolder) {
+      void setContext(activeContext);
+    } else {
+      clearPanel();
+    }
+  });
   viewToggleEl?.addEventListener("click", (event) => {
     const btn = event.target?.closest?.(".treatment-files-view-btn");
     if (!btn) return;
@@ -261,7 +296,7 @@ export function createTreatmentFilesPanel({
     if (!src) return;
     runtimePreviewByPath.set(path, { src, quality: "full" });
     if (activeCardsByPath.has(path)) {
-      consumeOptimisticThumbRotationStep(path);
+      clearOptimisticThumbRotation(path);
       setThumbImage(path, activeCardsByPath, src, {
         requestId: activeRequestId,
         allowPathFallback: true,
@@ -328,11 +363,11 @@ export function createTreatmentFilesPanel({
     activeOverviewKeywords = [];
     optimisticPlaceholderCards = [];
     panel.hidden = true;
-    titleEl.textContent = "Treatment Files";
+    titleEl.textContent = t("treatment_files.title");
     folderEl.textContent = "";
     countsEl.textContent = "";
     if (previewsProgressEl) previewsProgressEl.hidden = true;
-    if (previewsProgressTextEl) previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
+    if (previewsProgressTextEl) previewsProgressTextEl.textContent = t("treatment_files.loading_previews", { done: 0, total: 0 });
     previewLoadingStatus = { running: false, completed: 0, total: 0 };
     if (typeof onPreviewLoadingStatusChange === "function") {
       onPreviewLoadingStatusChange(previewLoadingStatus);
@@ -361,7 +396,7 @@ export function createTreatmentFilesPanel({
     folderEl.textContent = date;
     countsEl.textContent = "";
     if (previewsProgressEl) previewsProgressEl.hidden = true;
-    if (previewsProgressTextEl) previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
+    if (previewsProgressTextEl) previewsProgressTextEl.textContent = t("treatment_files.loading_previews", { done: 0, total: 0 });
     previewLoadingStatus = { running: false, completed: 0, total: 0 };
     if (typeof onPreviewLoadingStatusChange === "function") {
       onPreviewLoadingStatusChange(previewLoadingStatus);
@@ -595,8 +630,8 @@ export function createTreatmentFilesPanel({
     const otherCount = activeLoadedFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage)).length;
     const importingCount = optimisticPlaceholderCards.length;
     countsEl.textContent = importingCount > 0
-      ? `${imageCount} images (+${importingCount} importing), ${otherCount} other files`
-      : `${imageCount} images, ${otherCount} other files`;
+      ? formatCounts(imageCount, otherCount, importingCount)
+      : formatCounts(imageCount, otherCount, 0);
   }
 
   function appendRuntimeImportedImage(path, src = "") {
@@ -655,7 +690,7 @@ export function createTreatmentFilesPanel({
     previewsProgressEl.classList.remove("checking-cache");
     if (safeTotal < 1) {
       previewsProgressEl.hidden = true;
-      previewsProgressTextEl.textContent = "Loading Previews... (0/0)";
+      previewsProgressTextEl.textContent = t("treatment_files.loading_previews", { done: 0, total: 0 });
       previewLoadingStatus = { running: false, completed: 0, total: 0 };
       if (typeof onPreviewLoadingStatusChange === "function") {
         onPreviewLoadingStatusChange(previewLoadingStatus);
@@ -1104,12 +1139,12 @@ export function createTreatmentFilesPanel({
     const addKeywordBtn = document.createElement("button");
     addKeywordBtn.type = "button";
     addKeywordBtn.className = "treatment-keyword-add";
-    addKeywordBtn.textContent = "Add Keywords...";
+    addKeywordBtn.textContent = `${t("treatment_files.keywords")}...`;
     addKeywordBtn.addEventListener("click", () => {
       const input = document.createElement("input");
       input.type = "text";
       input.className = "treatment-keyword-input";
-      input.placeholder = "Add Keywords...";
+      input.placeholder = `${t("treatment_files.keywords")}...`;
       let closed = false;
       const closeInput = () => {
         if (closed) return;
@@ -1316,18 +1351,8 @@ export function createTreatmentFilesPanel({
     return ((n % 360) + 360) % 360;
   }
 
-  function consumeOptimisticThumbRotationStep(path) {
-    const current = normalizeRotationDeg(optimisticThumbRotationByPath.get(path) ?? 0);
-    if (current === 0) {
-      optimisticThumbRotationByPath.delete(path);
-      return;
-    }
-    const next = normalizeRotationDeg(current - 90);
-    if (next === 0) {
-      optimisticThumbRotationByPath.delete(path);
-      return;
-    }
-    optimisticThumbRotationByPath.set(path, next);
+  function clearOptimisticThumbRotation(path) {
+    optimisticThumbRotationByPath.delete(path);
   }
 
   function previewSrcFromRow(row) {
@@ -1707,7 +1732,9 @@ export function createTreatmentFilesPanel({
         const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, []);
         const didRender = renderOptimisticImportPlaceholders(placeholderCount);
         if (didRender) {
-          countsEl.textContent = `${Math.max(0, Number(optimistic.imageCount) || 0)} images, importing...`;
+          countsEl.textContent = t("treatment_files.images_importing", {
+            images: Math.max(0, Number(optimistic.imageCount) || 0),
+          });
         }
       }
     }
@@ -1741,13 +1768,13 @@ export function createTreatmentFilesPanel({
         if (appended > 0) {
           const existingImageCount = activeLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
           const existingOtherCount = activeLoadedFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage)).length;
-          countsEl.textContent = `${existingImageCount} images (+${appended} importing), ${existingOtherCount} other files`;
+          countsEl.textContent = formatCounts(existingImageCount, existingOtherCount, appended);
         }
         return;
       }
       loadingEl.hidden = true;
       emptyEl.hidden = false;
-      emptyEl.textContent = "Could not load files.";
+      emptyEl.textContent = t("treatment_files.could_not_load");
       return;
     }
 
@@ -1763,7 +1790,7 @@ export function createTreatmentFilesPanel({
       if (appended > 0) {
         const existingImageCount = previousLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
         const existingOtherCount = previousLoadedFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage)).length;
-        countsEl.textContent = `${existingImageCount} images (+${appended} importing), ${existingOtherCount} other files`;
+        countsEl.textContent = formatCounts(existingImageCount, existingOtherCount, appended);
       }
       loadMoreBtn.hidden = !hasMore;
       loadMoreBtn.disabled = false;
@@ -1786,14 +1813,14 @@ export function createTreatmentFilesPanel({
       if (appended > 0) {
         const existingImageCount = activeLoadedFiles.filter((f) => Boolean(f?.is_image ?? f?.isImage)).length;
         const existingOtherCount = activeLoadedFiles.filter((f) => !Boolean(f?.is_image ?? f?.isImage)).length;
-        countsEl.textContent = `${existingImageCount} images (+${appended} importing), ${existingOtherCount} other files`;
+        countsEl.textContent = formatCounts(existingImageCount, existingOtherCount, appended);
       }
       return;
     }
 
     loadingEl.hidden = true;
     emptyEl.hidden = files.length > 0;
-    countsEl.textContent = `${imageFiles.length} images, ${otherFiles.length} other files`;
+    countsEl.textContent = formatCounts(imageFiles.length, otherFiles.length, 0);
     listWrapEl.hidden = !useListView || files.length < 1;
     imagesWrapEl.hidden = useListView || imageFiles.length < 1;
     otherWrapEl.hidden = useListView || otherFiles.length < 1;
@@ -1807,7 +1834,9 @@ export function createTreatmentFilesPanel({
         const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, []);
         const didRender = renderOptimisticImportPlaceholders(placeholderCount);
         if (didRender) {
-          countsEl.textContent = `${Math.max(0, Number(optimistic.imageCount) || 0)} images, importing...`;
+          countsEl.textContent = t("treatment_files.images_importing", {
+            images: Math.max(0, Number(optimistic.imageCount) || 0),
+          });
           return;
         }
       }
@@ -1859,7 +1888,7 @@ export function createTreatmentFilesPanel({
       const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, files);
       const appended = appendOptimisticImportPlaceholders(placeholderCount, useListView);
       if (appended > 0) {
-        countsEl.textContent = `${imageFiles.length} images (+${appended} importing), ${otherFiles.length} other files`;
+        countsEl.textContent = formatCounts(imageFiles.length, otherFiles.length, appended);
       }
     }
     activeCardsByPath = cardsByPath;
