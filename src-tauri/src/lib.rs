@@ -558,6 +558,12 @@ struct StartImportResponse {
 }
 
 #[derive(Serialize)]
+struct PrepareImportTargetResponse {
+    target_folder: String,
+    created_new_folder: bool,
+}
+
+#[derive(Serialize)]
 struct ImportWizardImageValidationRow {
     ready: bool,
     decodable: bool,
@@ -1928,7 +1934,7 @@ fn local_cache_copy_status_row(
         total: runtime.total,
         last_sync_ms: runtime.last_sync_ms,
         local_cache_exists: preview_cache_dir_path(app_handle).exists(),
-        local_cache_file_count: walk_cache_files(&preview_cache_dir_path(app_handle)).len() as u64,
+        local_cache_file_count: runtime.total.max(runtime.completed),
     }
 }
 
@@ -2264,6 +2270,29 @@ fn compute_preview_cache_image_count(cache_dir: &Path) -> u64 {
     let mut count = 0_u64;
     for path in walk_cache_files(cache_dir) {
         if !is_cache_preview_jpeg(&path) {
+            continue;
+        }
+        let is_non_empty_file = fs::metadata(&path)
+            .map(|meta| meta.is_file() && meta.len() > 0)
+            .unwrap_or(false);
+        if is_non_empty_file {
+            count = count.saturating_add(1);
+        }
+    }
+    count
+}
+
+fn compute_active_preview_cache_image_count_fast(cache_dir: &Path) -> u64 {
+    let mut count = 0_u64;
+    let Ok(entries) = fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() || !is_cache_preview_jpeg(&path) {
             continue;
         }
         let is_non_empty_file = fs::metadata(&path)
@@ -6831,6 +6860,83 @@ async fn prefetch_treatment_folder_previews(
 }
 
 #[tauri::command]
+fn prepare_import_target_folder(
+    app_handle: tauri::AppHandle,
+    workspace_dir: String,
+    patient_folder: String,
+    existing_folder: Option<String>,
+    date: Option<String>,
+    treatment_name: Option<String>,
+) -> Result<PrepareImportTargetResponse, String> {
+    let workspace_dir = workspace_dir.trim().to_string();
+    let patient_folder = patient_folder.trim().to_string();
+    if workspace_dir.is_empty() || patient_folder.is_empty() {
+        return Err("workspace and patient folder are required".to_string());
+    }
+
+    let workspace_path = PathBuf::from(&workspace_dir);
+    if !workspace_path.exists() || !workspace_path.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+    let patient_path = workspace_path.join(&patient_folder);
+    if !patient_path.exists() || !patient_path.is_dir() {
+        return Err("patient folder does not exist".to_string());
+    }
+
+    let using_existing_folder = existing_folder.is_some();
+    let target_folder = if let Some(existing) = existing_folder {
+        let e = existing.trim().to_string();
+        if e.is_empty() {
+            return Err("existing folder is empty".to_string());
+        }
+        if e.contains('/') || e.contains('\\') {
+            return Err("existing folder contains invalid path separators".to_string());
+        }
+        e
+    } else {
+        let d = date.unwrap_or_default().trim().to_string();
+        let t = treatment_name.unwrap_or_default().trim().to_string();
+        if d.is_empty() || t.is_empty() {
+            return Err("date and folder name are required for new folder".to_string());
+        }
+        if t.contains('/') || t.contains('\\') {
+            return Err("folder name cannot contain / or \\".to_string());
+        }
+        format!("{d} {t}")
+    };
+
+    let target_dir = patient_path.join(&target_folder);
+    let created_new_folder = if using_existing_folder {
+        if !target_dir.exists() || !target_dir.is_dir() {
+            return Err("selected existing folder does not exist".to_string());
+        }
+        false
+    } else {
+        let created = !target_dir.exists();
+        if created {
+            fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
+        } else if !target_dir.is_dir() {
+            return Err("target is not a directory".to_string());
+        }
+        created
+    };
+
+    if let Err(err) = ensure_treatment_index_row(
+        &open_db(&app_handle)?,
+        &workspace_dir,
+        &patient_folder,
+        &target_folder,
+    ) {
+        return Err(format!("failed to update treatment index: {err}"));
+    }
+
+    Ok(PrepareImportTargetResponse {
+        target_folder,
+        created_new_folder,
+    })
+}
+
+#[tauri::command]
 fn start_import_files(
     app_handle: tauri::AppHandle,
     workspace_dir: String,
@@ -7000,10 +7106,34 @@ fn start_import_files(
             }
         });
 
-        let emit_progress = |percent: f64, done: bool, error: Option<String>| {
+        let progress_started = Instant::now();
+        let mut last_emitted_percent = -1.0_f64;
+        let mut last_emitted_at_ms = 0_u128;
+        let mut emit_progress = |percent: f64, done: bool, error: Option<String>| {
+            let bounded = percent.clamp(0.0, 100.0);
+            if !done {
+                let now_ms = progress_started.elapsed().as_millis();
+                let percent_step = if bounded < 12.0 {
+                    0.35
+                } else if bounded < 80.0 {
+                    0.6
+                } else {
+                    0.4
+                };
+                let elapsed_ms = now_ms.saturating_sub(last_emitted_at_ms);
+                if last_emitted_percent >= 0.0
+                    && bounded < 100.0
+                    && (bounded - last_emitted_percent) < percent_step
+                    && elapsed_ms < 45
+                {
+                    return;
+                }
+                last_emitted_percent = bounded;
+                last_emitted_at_ms = now_ms;
+            }
             let payload = ImportProgressEvent {
                 job_id,
-                percent,
+                percent: bounded,
                 done,
                 error,
             };
@@ -7441,36 +7571,50 @@ async fn delete_main_cache_files(
 }
 
 #[tauri::command]
-fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
-    let max_bytes = get_preview_cache_max_bytes(&app_handle);
-    let cache_dir = get_active_preview_cache_dir(&app_handle);
-    let used_bytes = if let Ok(_guard) = preview_cache_lock().try_lock() {
-        let mut index = load_preview_cache_index(&cache_dir);
-        cleanup_preview_cache(&cache_dir, &mut index, max_bytes);
-        index.entries.retain(|_, entry| {
-            let path = cache_dir.join(&entry.file_name);
-            fs::metadata(&path).is_ok()
-        });
-        let _ = save_preview_cache_index(&cache_dir, &index);
-        compute_preview_cache_used_bytes(&cache_dir)
-    } else {
-        // Avoid blocking UI calls (e.g. cache slider updates) while background fill holds the lock.
-        compute_preview_cache_used_bytes(&cache_dir)
-    };
+async fn get_preview_cache_stats(app_handle: tauri::AppHandle) -> Result<PreviewCacheStatsRow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let max_bytes = get_preview_cache_max_bytes(&app_handle);
+        let cache_dir = get_active_preview_cache_dir(&app_handle);
+        let used_bytes = if let Ok(_guard) = preview_cache_lock().try_lock() {
+            let mut index = load_preview_cache_index(&cache_dir);
+            cleanup_preview_cache(&cache_dir, &mut index, max_bytes);
+            index.entries.retain(|_, entry| {
+                let path = cache_dir.join(&entry.file_name);
+                fs::metadata(&path).is_ok()
+            });
+            let _ = save_preview_cache_index(&cache_dir, &index);
+            compute_preview_cache_used_bytes(&cache_dir)
+        } else {
+            // Avoid blocking UI calls (e.g. cache slider updates) while background fill holds the lock.
+            compute_preview_cache_used_bytes(&cache_dir)
+        };
 
-    let used_percent = if max_bytes > 0 {
-        ((used_bytes as f64 / max_bytes as f64) * 100.0).clamp(0.0, 100.0)
-    } else {
-        0.0
-    };
-    let active_cache_image_count = compute_preview_cache_image_count(&cache_dir);
+        let used_percent = if max_bytes > 0 {
+            ((used_bytes as f64 / max_bytes as f64) * 100.0).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let active_cache_image_count = compute_preview_cache_image_count(&cache_dir);
 
-    Ok(PreviewCacheStatsRow {
-        used_bytes,
-        max_bytes,
-        used_percent,
-        active_cache_image_count,
+        Ok(PreviewCacheStatsRow {
+            used_bytes,
+            max_bytes,
+            used_percent,
+            active_cache_image_count,
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_active_preview_cache_image_count(app_handle: tauri::AppHandle) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let cache_dir = get_active_preview_cache_dir(&app_handle);
+        Ok(compute_active_preview_cache_image_count_fast(&cache_dir))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -8005,6 +8149,7 @@ pub fn run() {
             get_import_wizard_cached_previews,
             get_existing_cached_preview_paths,
             prefetch_treatment_folder_previews,
+            prepare_import_target_folder,
             start_import_files,
             set_cache_size_gb,
             set_preview_performance_mode,
@@ -8015,6 +8160,7 @@ pub fn run() {
             delete_local_cache_copy_files,
             delete_main_cache_files,
             get_preview_cache_stats,
+            get_active_preview_cache_image_count,
             run_system_update,
             check_system_update,
             get_db_image_count,

@@ -373,6 +373,115 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function nextAnimationFrame() {
+  return new Promise((resolve) => requestAnimationFrame(() => resolve()));
+}
+
+async function yieldToUi() {
+  await nextAnimationFrame();
+  await delay(0);
+}
+
+function createStartupProgressController(segments = []) {
+  const normalizedSegments = Array.isArray(segments)
+    ? segments
+      .map((segment) => ({
+        key: String(segment?.key ?? "").trim(),
+        weight: Math.max(0, Number(segment?.weight) || 0),
+        durationMs: Math.max(300, Number(segment?.durationMs) || 1000),
+        reservePercent: Math.max(0, Math.min(45, Number(segment?.reservePercent) || 0)),
+      }))
+      .filter((segment) => segment.key && segment.weight > 0)
+    : [];
+  const totalWeight = normalizedSegments.reduce((sum, segment) => sum + segment.weight, 0) || 1;
+  let displayedPercent = 0;
+  let targetPercent = 0;
+  let activeSegmentKey = normalizedSegments[0]?.key ?? "";
+  let segmentStartedAt = performance.now();
+  let rafId = 0;
+
+  const segmentBounds = new Map();
+  let offset = 0;
+  for (const segment of normalizedSegments) {
+    const start = (offset / totalWeight) * 100;
+    offset += segment.weight;
+    const end = (offset / totalWeight) * 100;
+    segmentBounds.set(segment.key, { ...segment, start, end });
+  }
+
+  const render = () => {
+    setStartupSpinnerPercent(displayedPercent);
+  };
+
+  const step = () => {
+    rafId = 0;
+    const active = segmentBounds.get(activeSegmentKey);
+    if (active) {
+      const now = performance.now();
+      const elapsed = Math.max(0, now - segmentStartedAt);
+      const reserve = ((active.end - active.start) * active.reservePercent) / 100;
+      const softCap = Math.max(active.start, active.end - reserve);
+      const creepProgress = Math.max(0, Math.min(1, elapsed / active.durationMs));
+      const creepTarget = active.start + ((softCap - active.start) * creepProgress);
+      targetPercent = Math.max(targetPercent, creepTarget);
+    }
+
+    const delta = targetPercent - displayedPercent;
+    if (delta > 0.01) {
+      const smoothing = Math.max(0.18, Math.min(1, delta * 0.14));
+      displayedPercent = Math.min(targetPercent, displayedPercent + smoothing);
+      render();
+      rafId = requestAnimationFrame(step);
+      return;
+    }
+
+    displayedPercent = Math.max(displayedPercent, targetPercent);
+    render();
+    if (displayedPercent < 100 && activeSegmentKey) {
+      rafId = requestAnimationFrame(step);
+    }
+  };
+
+  const ensureRunning = () => {
+    if (!rafId) rafId = requestAnimationFrame(step);
+  };
+
+  return {
+    startSegment(key) {
+      const segment = segmentBounds.get(key);
+      if (!segment) return;
+      activeSegmentKey = key;
+      segmentStartedAt = performance.now();
+      targetPercent = Math.max(targetPercent, segment.start);
+      ensureRunning();
+    },
+    setSegmentProgress(key, localPercent = 0) {
+      const segment = segmentBounds.get(key);
+      if (!segment) return;
+      if (activeSegmentKey !== key) {
+        activeSegmentKey = key;
+        segmentStartedAt = performance.now();
+      }
+      const pct = Math.max(0, Math.min(100, Number(localPercent) || 0));
+      const absolute = segment.start + ((segment.end - segment.start) * pct) / 100;
+      targetPercent = Math.max(targetPercent, absolute);
+      ensureRunning();
+    },
+    finishSegment(key) {
+      const segment = segmentBounds.get(key);
+      if (!segment) return;
+      activeSegmentKey = key;
+      targetPercent = Math.max(targetPercent, segment.end);
+      ensureRunning();
+    },
+    complete() {
+      activeSegmentKey = "";
+      targetPercent = 100;
+      ensureRunning();
+    },
+  };
+}
+
 async function withTimeout(promise, timeoutMs, label = "operation") {
   let timerId = null;
   try {
@@ -419,7 +528,7 @@ let indexingProgressMessage = "Up to date";
 let backgroundCrawlerRunning = false;
 let indexingCountsSuffix = "";
 let indexingCustomSuffix = "";
-let previewImagesCreatedActiveCount = 0;
+let previewImagesCreatedActiveCount = null;
 let previewImagesCreatedDbCount = 0;
 let previewFillProgressMessage = "";
 let previewFillProgressCompleted = 0;
@@ -1023,12 +1132,13 @@ function setIndexingDebugCountsUi(dbImageCount = 0, cacheImageCount = 0, { show 
 }
 
 function setPreviewImagesCreatedUi(
-  activeFolderImageCount = 0,
+  activeFolderImageCount = null,
   dbImageCount = 0,
   { loading = false, updateDbTotal = false } = {}
 ) {
   if (!previewImagesCreatedCount) return;
-  const active = Math.max(0, Number(activeFolderImageCount) || 0);
+  const hasActiveValue = activeFolderImageCount !== null && activeFolderImageCount !== undefined;
+  const active = hasActiveValue ? Math.max(0, Number(activeFolderImageCount) || 0) : null;
   const db = Math.max(0, Number(dbImageCount) || 0);
   if (!loading) {
     previewImagesCreatedActiveCount = active;
@@ -1038,7 +1148,22 @@ function setPreviewImagesCreatedUi(
   } else if (updateDbTotal) {
     previewImagesCreatedDbCount = db;
   }
-  previewImagesCreatedCount.textContent = `(${previewImagesCreatedActiveCount}/${previewImagesCreatedDbCount})`;
+  const activeLabel = previewImagesCreatedActiveCount === null ? "..." : `${previewImagesCreatedActiveCount}`;
+  previewImagesCreatedCount.textContent = `(${activeLabel}/${previewImagesCreatedDbCount})`;
+}
+
+async function refreshPreviewImagesCreatedActiveCount() {
+  try {
+    const activeCount = await invoke("get_active_preview_cache_image_count");
+    setPreviewImagesCreatedUi(activeCount, previewImagesCreatedDbCount, {
+      loading: false,
+      updateDbTotal: false,
+    });
+    return activeCount;
+  } catch (err) {
+    console.error("get_active_preview_cache_image_count failed:", err);
+    return null;
+  }
 }
 
 async function refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir = currentWorkspaceDir) {
@@ -1169,7 +1294,7 @@ async function refreshIndexingDebugCounts() {
   if (!currentWorkspaceDir) {
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: false });
-    setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
+    setPreviewImagesCreatedUi(null, 0, { loading: false, updateDbTotal: true });
     return;
   }
   if (indexingDebugCountsInFlight) return;
@@ -1180,7 +1305,7 @@ async function refreshIndexingDebugCounts() {
     const dbImageCount = Number(stats?.db_image_count ?? stats?.dbImageCount ?? 0) || 0;
     const cacheImageCount = Number(stats?.cache_image_count ?? stats?.cacheImageCount ?? 0) || 0;
     setIndexingCategoryTitle(dbImageCount, { loading });
-    setPreviewImagesCreatedUi(cacheImageCount, dbImageCount, { loading, updateDbTotal: false });
+    setPreviewImagesCreatedUi(loading ? null : cacheImageCount, dbImageCount, { loading, updateDbTotal: false });
     setIndexingDebugCountsUi(dbImageCount, cacheImageCount, { show: shouldShowIndexingDebugCounts() });
     if (loading && indexingCountsWarmRetryTimerId === null) {
       const workspaceKey = String(currentWorkspaceDir ?? "").trim();
@@ -1220,7 +1345,7 @@ async function refreshIndexingDebugCounts() {
     console.error("get_preview_debug_counts failed:", err);
     setIndexingCategoryTitle(null);
     setIndexingDebugCountsUi(0, 0, { show: shouldShowIndexingDebugCounts() });
-    setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: false });
+    setPreviewImagesCreatedUi(null, 0, { loading: false, updateDbTotal: false });
   } finally {
     indexingDebugCountsInFlight = false;
   }
@@ -1414,6 +1539,13 @@ async function refreshCacheUsageUi() {
       maxBytes: stats?.max_bytes ?? stats?.maxBytes ?? 0,
       percent: stats?.used_percent ?? stats?.usedPercent ?? 0,
     });
+    if (stats?.active_cache_image_count !== undefined || stats?.activeCacheImageCount !== undefined) {
+      setPreviewImagesCreatedUi(
+        stats?.active_cache_image_count ?? stats?.activeCacheImageCount ?? null,
+        previewImagesCreatedDbCount,
+        { loading: false, updateDbTotal: false }
+      );
+    }
     return stats;
   } catch (err) {
     console.error("get_preview_cache_stats failed:", err);
@@ -2977,6 +3109,7 @@ async function loadPatients(workspaceDir, options = {}) {
 
   try {
     setStartupStageIfChanged("Loading patient list...");
+    await yieldToUi();
     const loadListTask = searchPatients(query);
     const loadInvalidTask = withTimeout(
       refreshInvalidPatientFolderWarning(workspaceDir),
@@ -3009,10 +3142,13 @@ async function loadPatients(workspaceDir, options = {}) {
     } else {
       await loadListTask;
       setStartupStageIfChanged("Scanning invalid folders...");
+      await yieldToUi();
       await loadInvalidTask;
       setStartupStageIfChanged("Preparing timeline...");
+      await yieldToUi();
       await loadTimelineTask;
       setStartupStageIfChanged("Refreshing index counters...");
+      await yieldToUi();
       await loadCountsTask;
     }
   } finally {
@@ -3069,7 +3205,7 @@ function clearPatients() {
   setPreviewFillRunning(false);
   setIndexingProgressUi({ running: false, message: "Up to date" });
   setIndexingDebugCountsUi(0, 0, { show: false });
-  setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
+  setPreviewImagesCreatedUi(null, 0, { loading: false, updateDbTotal: true });
   backgroundCrawlerRunning = false;
   setDbStatusIdle();
 }
@@ -3081,6 +3217,7 @@ function showMainScreen(workspaceDir) {
 async function showMainScreenWithOptions(workspaceDir, options = {}) {
   const skipLoadPatients = options?.skipLoadPatients ?? false;
   const deferShowUntilReady = options?.deferShowUntilReady ?? false;
+  const startupBackgroundTasks = [];
   console.log(`[transition ${ts()}] showing main screen`);
   if (!deferShowUntilReady && startupView) startupView.hidden = true;
   onboardingView.hidden = true;
@@ -3089,61 +3226,66 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   currentWorkspaceDir = workspaceDir;
   setWorkspacePathDisplay(workspaceDir);
   initialMainReadyInProgress = true;
-  const STARTUP_PROGRESS_PHASES = [
-    "indexing",
-    "dbCount",
-    "cacheUsage",
-    "previewMaintenance",
-    "cacheStatus",
-    "indexingStatus",
-    "finalize",
-  ];
-  const startupSetOverallProgress = (segment, localPercent = 0) => {
-    const pct = Math.max(0, Math.min(100, Number(localPercent) || 0));
-    let overall = pct;
-    if (segment === "indexing") {
-      overall = (pct / 100) * 95;
-    } else {
-      const phaseIndex = STARTUP_PROGRESS_PHASES.indexOf(segment);
-      const postIndexPhaseCount = STARTUP_PROGRESS_PHASES.length - 1;
-      if (phaseIndex >= 1 && postIndexPhaseCount > 0) {
-        overall = 95 + ((phaseIndex - 1) + (pct / 100)) * (5 / postIndexPhaseCount);
-      }
-    }
-    setStartupSpinnerPercent(overall);
-  };
+  const startupProgress = createStartupProgressController([
+    { key: "indexing", weight: 76, durationMs: 12000, reservePercent: 9 },
+    { key: "dbCount", weight: 5, durationMs: 1400, reservePercent: 12 },
+    { key: "cacheUsage", weight: 5, durationMs: 1100, reservePercent: 12 },
+    { key: "previewMaintenance", weight: 5, durationMs: 1500, reservePercent: 16 },
+    { key: "cacheStatus", weight: 4, durationMs: 1000, reservePercent: 12 },
+    { key: "indexingStatus", weight: 3, durationMs: 900, reservePercent: 10 },
+    { key: "finalize", weight: 2, durationMs: 700, reservePercent: 0 },
+  ]);
   setStartupProcessStatus("Loading cache state...");
-  startupSetOverallProgress("indexing", 0);
+  startupProgress.startSegment("indexing");
+  startupProgress.setSegmentProgress("indexing", 0);
   if (!skipLoadPatients) {
+    await yieldToUi();
     await loadPatients(workspaceDir, {
       onStartupStage: (message) => setStartupProcessStatus(message),
-      onReindexProgress: (percent) => startupSetOverallProgress("indexing", percent),
+      onReindexProgress: (percent) => startupProgress.setSegmentProgress("indexing", percent),
     });
   } else {
-    startupSetOverallProgress("indexing", 100);
+    startupProgress.finishSegment("indexing");
   }
+  startupProgress.finishSegment("indexing");
   setStartupProcessStatus("Counting indexed images...");
-  startupSetOverallProgress("dbCount", 0);
+  startupProgress.startSegment("dbCount");
+  await yieldToUi();
   await refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir);
-  startupSetOverallProgress("dbCount", 100);
+  startupProgress.finishSegment("dbCount");
   setStartupProcessStatus("Loading cache usage...");
-  startupSetOverallProgress("cacheUsage", 0);
-  const cacheStats = await refreshCacheUsageUi();
-  startupSetOverallProgress("cacheUsage", 100);
+  startupProgress.startSegment("cacheUsage");
+  await yieldToUi();
+  let cacheStats = null;
+  startupBackgroundTasks.push(
+    refreshCacheUsageUi()
+      .then((stats) => {
+        cacheStats = stats;
+        return stats;
+      })
+      .catch(() => null)
+  );
+  startupProgress.finishSegment("cacheUsage");
   setStartupProcessStatus("Preparing preview maintenance...");
-  startupSetOverallProgress("previewMaintenance", 0);
+  startupProgress.startSegment("previewMaintenance");
+  await yieldToUi();
   await ensureBackgroundPreviewFill(cacheStats);
-  startupSetOverallProgress("previewMaintenance", 100);
+  startupProgress.finishSegment("previewMaintenance");
   setStartupProcessStatus("Refreshing cache status...");
-  startupSetOverallProgress("cacheStatus", 0);
-  await refreshLocalCacheCopyStatus();
-  startupSetOverallProgress("cacheStatus", 100);
+  startupProgress.startSegment("cacheStatus");
+  await yieldToUi();
+  startupBackgroundTasks.push(refreshLocalCacheCopyStatus().catch(() => null));
+  startupProgress.finishSegment("cacheStatus");
   setStartupProcessStatus("Refreshing indexing status...");
-  startupSetOverallProgress("indexingStatus", 0);
+  startupProgress.startSegment("indexingStatus");
+  await yieldToUi();
   await refreshIndexingStatus();
-  startupSetOverallProgress("indexingStatus", 100);
+  startupProgress.finishSegment("indexingStatus");
   setStartupProcessStatus("Finalizing startup...");
-  startupSetOverallProgress("finalize", 100);
+  startupProgress.startSegment("finalize");
+  startupProgress.finishSegment("finalize");
+  startupProgress.complete();
+  await yieldToUi();
   appView.hidden = false;
   if (startupView) startupView.hidden = true;
   updateCacheReloadButtonState();
@@ -3159,6 +3301,10 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   initialMainReadyInProgress = false;
   void triggerWorkspaceChangeCrawl({ requireIdle: false });
   void refreshIndexingDebugCounts();
+  void refreshPreviewImagesCreatedActiveCount();
+  for (const task of startupBackgroundTasks) {
+    void task;
+  }
   requestAnimationFrame(sidebarLayout.updateTopButtonSpacing);
   console.log(
     `[transition ${ts()}] view flags onboarding.hidden=${onboardingView.hidden} app.hidden=${appView.hidden}`
@@ -3399,13 +3545,17 @@ async function pickImportWizardFolderAndSave() {
 async function boot() {
   setDebugState("booting");
   setStartupProcessStatus("Loading settings...");
+  setStartupSpinnerPercent(0);
   setStartupUpdateNoticeVisible(false);
   if (startupView) startupView.hidden = false;
   onboardingView.hidden = true;
   appView.hidden = true;
+  await yieldToUi();
   await initSystemUpdateStatus();
 
   try {
+    setStartupSpinnerPercent(3);
+    await yieldToUi();
     const settings = await invoke("load_settings");
 
     console.log("Loaded settings:", settings);
@@ -3485,7 +3635,9 @@ async function boot() {
     }
 
     setStartupProcessStatus("Preparing workspace...");
-    await refreshLocalCacheCopyStatus();
+    setStartupSpinnerPercent(8);
+    await yieldToUi();
+    void refreshLocalCacheCopyStatus();
     await showMainScreenWithOptions(workspaceDir, { deferShowUntilReady: true });
     setDebugState("ready");
 
@@ -4040,7 +4192,7 @@ sidebarLayout.applyPatientSidebarMode();
 sidebarLayout.updateTopButtonSpacing();
 updateAddPatientFormState();
 renderPatientList([], "");
-setPreviewImagesCreatedUi(0, 0, { loading: false, updateDbTotal: true });
+setPreviewImagesCreatedUi(null, 0, { loading: false, updateDbTotal: true });
 void listen("preview-fill-status", (event) => {
   const running = Boolean(event?.payload?.running);
   setPreviewFillRunning(running);
@@ -4107,6 +4259,18 @@ void listen("import-wizard-completed", async (event) => {
   ).trim();
   if (!workspace || !patient) return;
   if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
+
+  if (
+    targetFolder &&
+    typeof mainContent.ensureTargetFolderVisibleAndSelected === "function" &&
+    selectTargetFolder
+  ) {
+    await mainContent.ensureTargetFolderVisibleAndSelected({
+      workspaceDir: workspace,
+      patientFolder: patient,
+      targetFolder,
+    });
+  }
 
   if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
     if (wizardDir) {

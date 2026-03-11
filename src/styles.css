@@ -733,7 +733,7 @@ body{
 }
 
 .import-progress-capsule.holding .import-progress-ring{
-  animation: importCapsuleSpin 0.9s linear infinite;
+  animation: none;
 }
 
 .import-progress-track{
@@ -2693,8 +2693,8 @@ body{
   display: none;
   place-items: center;
   font-size: 0.88rem;
-  font-weight: 600;
-  color: #1f2937;
+  font-weight: 700;
+  color: #2563eb;
 }
 
 .startup-subtitle{

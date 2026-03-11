@@ -1350,19 +1350,28 @@ drawSaveBtn?.addEventListener("click", () => {
   drawSaveBtn.disabled = true;
   if (drawSaveInput) drawSaveInput.disabled = true;
   if (drawSaveDropdownBtn) drawSaveDropdownBtn.disabled = true;
-  void invoke("notify_import_wizard_completed", {
-    workspaceDir: previewWorkspaceDir,
-    patientFolder: previewPatientFolder,
-    targetFolder: optimisticTargetFolder,
-    jobId: null,
-    importWizardDir: null,
-    importedImageCount: 1,
-    importedTotalCount: 1,
-    selectTargetFolder: true,
-    plannedPaths: [],
-  }).catch(() => {});
   void (async () => {
     try {
+      const prepared = await invoke("prepare_import_target_folder", {
+        workspaceDir: previewWorkspaceDir,
+        patientFolder: previewPatientFolder,
+        existingFolder: existingMatch || null,
+        date: existingMatch ? null : currentDateYmd(),
+        treatmentName: existingMatch ? null : typed,
+      });
+      const preparedTargetFolder = String(prepared?.target_folder ?? prepared?.targetFolder ?? optimisticTargetFolder).trim();
+      await invoke("notify_import_wizard_completed", {
+        workspaceDir: previewWorkspaceDir,
+        patientFolder: previewPatientFolder,
+        targetFolder: preparedTargetFolder,
+        jobId: null,
+        importWizardDir: null,
+        importedImageCount: 1,
+        importedTotalCount: 1,
+        selectTargetFolder: true,
+        plannedPaths: [],
+      }).catch(() => {});
+      await new Promise((resolve) => setTimeout(resolve, 80));
       await new Promise((resolve) => requestAnimationFrame(resolve));
       const tempPath = await invoke("export_annotated_image_to_temp", {
         path: currentPreviewPath,
@@ -1373,9 +1382,9 @@ drawSaveBtn?.addEventListener("click", () => {
       const result = await invoke("start_import_files", {
         workspaceDir: previewWorkspaceDir,
         patientFolder: previewPatientFolder,
-        existingFolder: existingMatch || null,
-        date: existingMatch ? null : currentDateYmd(),
-        treatmentName: existingMatch ? null : typed,
+        existingFolder: preparedTargetFolder,
+        date: null,
+        treatmentName: null,
         filePaths: [tempPath],
         deleteOrigin: true,
         importWizardDir: null,

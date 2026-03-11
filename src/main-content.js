@@ -364,6 +364,7 @@ export function initMainContent({
   const IMPORT_PREVIEW_CONCURRENCY = 4;
   const importJobs = new Map();
   const bufferedImportProgressByJobId = new Map();
+  const optimisticTimelineEntries = new Map();
   let importLiveRefreshTimerId = null;
   let importLiveRefreshPending = false;
   let missingPatientIdTaken = false;
@@ -692,7 +693,10 @@ export function initMainContent({
       let targetDot = null;
       let targetPoint = null;
       for (const point of points) {
-        if (point?.dataset?.timelineKey === leadJob.targetFolder) {
+        if (
+          point?.dataset?.timelineKey === leadJob.targetFolder ||
+          point?.dataset?.folderName === leadJob.targetFolder
+        ) {
           targetPoint = point;
           targetDot = point.querySelector(".main-timeline-dot");
           break;
@@ -718,6 +722,12 @@ export function initMainContent({
       }
 
       updateImportProgressCapsule(leadJob.capsule, combinedProgress);
+      if (targetPoint && selectedTimelinePoint !== targetPoint) {
+        setSelectedTimelinePoint(targetPoint);
+      }
+      if (targetPoint) {
+        ensureTimelinePointVisible(targetPoint);
+      }
       if (targetPoint && leadJob.capsule.parentElement !== targetPoint) {
         targetPoint.appendChild(leadJob.capsule);
       }
@@ -727,8 +737,15 @@ export function initMainContent({
         "on-selected-dot",
         Boolean(targetPoint?.classList?.contains("selected"))
       );
-      leadJob.capsule.style.left = "50%";
-      leadJob.capsule.style.top = "5px";
+      if (targetDot && targetPoint) {
+        const dotLeft = targetDot.offsetLeft + (targetDot.offsetWidth / 2);
+        const dotTop = targetDot.offsetTop + (targetDot.offsetHeight / 2);
+        leadJob.capsule.style.left = `${dotLeft}px`;
+        leadJob.capsule.style.top = `${dotTop}px`;
+      } else {
+        leadJob.capsule.style.left = "50%";
+        leadJob.capsule.style.top = "50%";
+      }
 
       for (let i = 1; i < groupJobs.length; i += 1) {
         const job = groupJobs[i];
@@ -760,6 +777,8 @@ export function initMainContent({
       animationRafId: null,
       bufferedProgressTimerId: null,
       provisionalTimerId: null,
+      creepRafId: null,
+      lastProgressEventAt: performance.now(),
     };
     const provisional = findProvisionalImportJob({
       targetFolder: job.targetFolder,
@@ -779,6 +798,7 @@ export function initMainContent({
     importJobs.set(id, job);
     updateImportProgressCapsule(capsule, job.displayedProgressValue);
     updateImportProgressActiveClass();
+    ensureImportProgressCreep(job);
     if (typeof onImportDebugStateChange === "function") {
       onImportDebugStateChange(`import started (#${id})`);
     }
@@ -790,6 +810,60 @@ export function initMainContent({
     }
 
     requestAnimationFrame(positionImportProgressCapsules);
+  }
+
+  function optimisticTimelineEntryKey({ workspaceDir = "", patientFolder = "", targetFolder = "" } = {}) {
+    return `${String(workspaceDir ?? "").trim()}::${String(patientFolder ?? "").trim()}::${String(targetFolder ?? "").trim()}`;
+  }
+
+  function rememberOptimisticTimelineEntry({ workspaceDir = "", patientFolder = "", targetFolder = "" } = {}) {
+    const normalizedWorkspace = String(workspaceDir ?? "").trim();
+    const normalizedPatient = String(patientFolder ?? "").trim();
+    const normalizedTarget = String(targetFolder ?? "").trim();
+    if (!normalizedWorkspace || !normalizedPatient || !normalizedTarget) return;
+    optimisticTimelineEntries.set(
+      optimisticTimelineEntryKey({
+        workspaceDir: normalizedWorkspace,
+        patientFolder: normalizedPatient,
+        targetFolder: normalizedTarget,
+      }),
+      {
+        folder_name: normalizedTarget,
+        folder_date: extractFolderDate(normalizedTarget),
+        treatment_name: extractFolderTreatment(normalizedTarget),
+      }
+    );
+  }
+
+  function mergeOptimisticTimelineEntries(folders = [], context = null) {
+    if (!context?.workspaceDir || !context?.patientFolder) return Array.isArray(folders) ? folders : [];
+    const list = Array.isArray(folders) ? folders.slice() : [];
+    const existing = new Set(
+      list.map((row) => String(row?.folder_name ?? row?.folderName ?? "").trim()).filter(Boolean)
+    );
+    for (const [key, row] of optimisticTimelineEntries.entries()) {
+      const [workspaceDir, patientFolder, targetFolder] = key.split("::");
+      if (
+        workspaceDir !== String(context.workspaceDir ?? "").trim() ||
+        patientFolder !== String(context.patientFolder ?? "").trim()
+      ) {
+        continue;
+      }
+      if (existing.has(targetFolder)) {
+        optimisticTimelineEntries.delete(key);
+        continue;
+      }
+      list.push(row);
+    }
+    list.sort((a, b) => {
+      const aDate = String(a?.folder_date ?? a?.folderDate ?? "").trim();
+      const bDate = String(b?.folder_date ?? b?.folderDate ?? "").trim();
+      if (aDate !== bDate) return aDate.localeCompare(bDate);
+      const aName = String(a?.folder_name ?? a?.folderName ?? "").trim();
+      const bName = String(b?.folder_name ?? b?.folderName ?? "").trim();
+      return aName.localeCompare(bName);
+    });
+    return list;
   }
 
   function findProvisionalImportJob({ targetFolder, workspaceDir, patientFolder } = {}) {
@@ -839,10 +913,13 @@ export function initMainContent({
       animationRafId: null,
       bufferedProgressTimerId: null,
       provisionalTimerId: null,
+      creepRafId: null,
+      lastProgressEventAt: performance.now(),
     };
     importJobs.set(id, job);
     updateImportProgressCapsule(capsule, 3);
     updateImportProgressActiveClass();
+    ensureImportProgressCreep(job);
     const tick = () => {
       if (!importJobs.has(id) || job.released || job.done || !job.provisional) return;
       const current = Number(job.targetProgressValue ?? job.displayedProgressValue ?? 3) || 3;
@@ -872,6 +949,7 @@ export function initMainContent({
 
     job.progressValue = Math.max(0, Math.min(100, Number(percent) || 0));
     job.targetProgressValue = job.progressValue;
+    job.lastProgressEventAt = performance.now();
     if (immediateDisplay && !done) {
       job.displayedProgressValue = job.progressValue;
       updateImportProgressCapsule(job.capsule, job.progressValue);
@@ -884,6 +962,7 @@ export function initMainContent({
     }
 
     if (!done) {
+      ensureImportProgressCreep(job);
       return;
     }
     if (job.done) return;
@@ -990,6 +1069,35 @@ export function initMainContent({
     job.animationRafId = requestAnimationFrame(tick);
   }
 
+  function ensureImportProgressCreep(job) {
+    if (!job || job.done || job.released) return;
+    if (job.creepRafId !== null) return;
+    const creepTick = (now) => {
+      job.creepRafId = null;
+      if (!job || job.done || job.released) return;
+      const msSinceBackendEvent = now - (Number(job.lastProgressEventAt) || 0);
+      const currentTarget = Number(job.targetProgressValue ?? job.progressValue ?? 0) || 0;
+      const currentDisplay = Number(job.displayedProgressValue ?? currentTarget) || 0;
+      const softCap = currentTarget < 85
+        ? Math.min(92, currentTarget + 10)
+        : currentTarget < 96
+          ? Math.min(98.6, currentTarget + 4.5)
+          : Math.min(99.2, currentTarget + 1.2);
+      if (msSinceBackendEvent >= 180 && currentDisplay < softCap) {
+        const creepStep = currentDisplay < 80 ? 0.18 : currentDisplay < 95 ? 0.1 : 0.045;
+        const next = Math.min(softCap, currentDisplay + creepStep);
+        if (next > currentDisplay) {
+          job.displayedProgressValue = next;
+          updateImportProgressCapsule(job.capsule, next);
+        }
+      }
+      if (!job.done && !job.released) {
+        job.creepRafId = requestAnimationFrame(creepTick);
+      }
+    };
+    job.creepRafId = requestAnimationFrame(creepTick);
+  }
+
   function flushBufferedImportProgress(job, buffered = []) {
     if (!job || !Array.isArray(buffered) || buffered.length < 1) return;
     const sourceQueue = buffered.slice(-12);
@@ -1031,6 +1139,7 @@ export function initMainContent({
     if (job.animationRafId !== null) cancelAnimationFrame(job.animationRafId);
     if (job.bufferedProgressTimerId !== null) clearTimeout(job.bufferedProgressTimerId);
     if (job.provisionalTimerId !== null) clearTimeout(job.provisionalTimerId);
+    if (job.creepRafId !== null) cancelAnimationFrame(job.creepRafId);
     if (typeof onImportActivityChange === "function" && job.patientFolder) {
       onImportActivityChange({ patientFolder: job.patientFolder, active: false });
     }
@@ -1461,6 +1570,66 @@ export function initMainContent({
     prefetchNeighborTreatmentPreviews();
   }
 
+  function selectTimelinePointByFolderName(folderName = "", { ensureVisible = true } = {}) {
+    const normalizedFolder = String(folderName ?? "").trim();
+    if (!normalizedFolder || !timelineTrack) return null;
+    const point = timelineTrack.querySelector(
+      `.main-timeline-point[data-folder-name="${CSS.escape(normalizedFolder)}"]`
+    ) ?? timelineTrack.querySelector(
+      `.main-timeline-point[data-timeline-key="${CSS.escape(normalizedFolder)}"]`
+    );
+    if (!point) return null;
+    setSelectedTimelinePoint(point);
+    if (ensureVisible) ensureTimelinePointVisible(point);
+    positionImportProgressCapsules();
+    return point;
+  }
+
+  function scheduleTimelineFolderSelection(folderName = "", attemptsLeft = 10) {
+    const normalizedFolder = String(folderName ?? "").trim();
+    if (!normalizedFolder || attemptsLeft <= 0) return;
+    const selectedPoint = selectTimelinePointByFolderName(normalizedFolder, { ensureVisible: true });
+    if (selectedPoint) return;
+    requestAnimationFrame(() => {
+      scheduleTimelineFolderSelection(normalizedFolder, attemptsLeft - 1);
+    });
+  }
+
+  async function prepareTimelineFolderForImport(folderName = "") {
+    const normalizedFolder = String(folderName ?? "").trim();
+    if (!normalizedFolder) return null;
+    await refreshTimeline();
+    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    let point = selectTimelinePointByFolderName(normalizedFolder, { ensureVisible: true });
+    if (point) return point;
+    await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+    point = selectTimelinePointByFolderName(normalizedFolder, { ensureVisible: true });
+    if (point) return point;
+    scheduleTimelineFolderSelection(normalizedFolder);
+    return null;
+  }
+
+  async function ensureTargetFolderVisibleAndSelected({
+    workspaceDir = "",
+    patientFolder = "",
+    targetFolder = "",
+  } = {}) {
+    const normalizedWorkspace = String(workspaceDir ?? "").trim();
+    const normalizedPatient = String(patientFolder ?? "").trim();
+    const normalizedTarget = String(targetFolder ?? "").trim();
+    if (!normalizedWorkspace || !normalizedPatient || !normalizedTarget) return null;
+    rememberOptimisticTimelineEntry({
+      workspaceDir: normalizedWorkspace,
+      patientFolder: normalizedPatient,
+      targetFolder: normalizedTarget,
+    });
+    selectedTimelineKey = normalizedTarget;
+    if (timelineSelectionOwner !== normalizedPatient) {
+      timelineSelectionOwner = normalizedPatient;
+    }
+    return await prepareTimelineFolderForImport(normalizedTarget);
+  }
+
   function resetTimelineFolderDragArmedPoint() {
     if (timelineFolderDragArmedPoint) {
       timelineFolderDragArmedPoint.classList.remove("folder-drag-armed", "folder-dragging");
@@ -1679,6 +1848,7 @@ export function initMainContent({
     } catch (err) {
       console.error("list_patient_timeline_entries failed (timeline):", err);
     }
+    folders = mergeOptimisticTimelineEntries(folders, context);
 
     if (reqId !== timelineRequestId) return;
 
@@ -2260,12 +2430,6 @@ export function initMainContent({
         if (typeof onImportActivityChange === "function" && context.patientFolder) {
           onImportActivityChange({ patientFolder: context.patientFolder, active: true });
         }
-        trackNewImportJob({
-          jobId: startedJobId,
-          targetFolder: startedTargetFolder,
-          workspaceDir: context.workspaceDir,
-          patientFolder: context.patientFolder,
-        });
         if (startedTargetFolder && typeof treatmentFilesPanel.setOptimisticImportPlaceholders === "function") {
           const importedImageCount = lastDroppedPaths.filter((path) => (
             /\.(avif|bmp|gif|heic|heif|jfif|jpe|jpeg|jpg|png|tif|tiff|webp)$/i.test(String(path ?? "").trim())
@@ -2294,20 +2458,21 @@ export function initMainContent({
         }
         setImportPanelVisible(false);
         if (startedTargetFolder) {
-          selectedTimelineKey = startedTargetFolder;
-          await refreshTimeline();
-          requestAnimationFrame(() => {
-            const targetPoint = timelineTrack?.querySelector?.(
-              `.main-timeline-point[data-timeline-key="${CSS.escape(startedTargetFolder)}"]`
-            );
-            if (!targetPoint) return;
-            setSelectedTimelinePoint(targetPoint);
-            requestAnimationFrame(() => {
-              ensureTimelinePointVisible(targetPoint);
-              positionImportProgressCapsules();
-            });
+          rememberOptimisticTimelineEntry({
+            workspaceDir: context.workspaceDir,
+            patientFolder: context.patientFolder,
+            targetFolder: startedTargetFolder,
           });
+          selectedTimelineKey = startedTargetFolder;
+          await prepareTimelineFolderForImport(startedTargetFolder);
         }
+        trackNewImportJob({
+          jobId: startedJobId,
+          targetFolder: startedTargetFolder,
+          workspaceDir: context.workspaceDir,
+          patientFolder: context.patientFolder,
+        });
+        positionImportProgressCapsules();
       } catch (err) {
         console.error("start_import_files failed:", err);
         if (typeof onImportDebugStateChange === "function") {
@@ -2422,6 +2587,7 @@ export function initMainContent({
       }
       await refreshTimeline();
     },
+    ensureTargetFolderVisibleAndSelected,
     showOptimisticImportPreview: ({
       targetFolder,
       workspaceDir,
@@ -2434,6 +2600,9 @@ export function initMainContent({
       const normalizedPatient = String(patientFolder ?? "").trim();
       const normalizedTarget = String(targetFolder ?? "").trim();
       if (!normalizedWorkspace || !normalizedPatient || !normalizedTarget) return;
+      if (typeof onImportActivityChange === "function") {
+        onImportActivityChange({ patientFolder: normalizedPatient, active: true });
+      }
       trackProvisionalImportJob({
         targetFolder: normalizedTarget,
         workspaceDir: normalizedWorkspace,
@@ -2473,12 +2642,7 @@ export function initMainContent({
         });
         void (async () => {
           await refreshTimeline();
-          requestAnimationFrame(() => {
-            const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
-            if (!selectedPoint) return;
-            ensureTimelinePointVisible(selectedPoint);
-            positionImportProgressCapsules();
-          });
+          scheduleTimelineFolderSelection(normalizedTarget);
         })();
         return;
       }
@@ -2508,6 +2672,11 @@ export function initMainContent({
       if (typeof onImportActivityChange === "function") {
         onImportActivityChange({ patientFolder: normalizedPatient, active: true });
       }
+      rememberOptimisticTimelineEntry({
+        workspaceDir: normalizedWorkspace,
+        patientFolder: normalizedPatient,
+        targetFolder: normalizedTarget,
+      });
       trackNewImportJob({
         jobId: numericJobId,
         targetFolder: normalizedTarget,
@@ -2548,12 +2717,7 @@ export function initMainContent({
             treatmentFolder: normalizedTarget,
           });
           applyOptimisticPlaceholders();
-          requestAnimationFrame(() => {
-            const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
-            if (!selectedPoint) return;
-            ensureTimelinePointVisible(selectedPoint);
-            positionImportProgressCapsules();
-          });
+          scheduleTimelineFolderSelection(normalizedTarget);
         })();
         return;
       }
@@ -2570,23 +2734,14 @@ export function initMainContent({
       if (selectTargetFolder) {
         if (isTargetAlreadySelected) {
           requestAnimationFrame(() => {
-            const targetPoint = timelineTrack?.querySelector?.(`.main-timeline-point[data-timeline-key="${CSS.escape(normalizedTarget)}"]`)
-              ?? timelineTrack?.querySelector?.(".main-timeline-point.selected");
-            if (!targetPoint) return;
-            ensureTimelinePointVisible(targetPoint);
-            positionImportProgressCapsules();
+            scheduleTimelineFolderSelection(normalizedTarget, 2);
           });
           return;
         }
         selectedTimelineKey = normalizedTarget;
         void (async () => {
           await refreshTimeline();
-          requestAnimationFrame(() => {
-            const selectedPoint = timelineTrack?.querySelector(".main-timeline-point.selected");
-            if (!selectedPoint) return;
-            ensureTimelinePointVisible(selectedPoint);
-            positionImportProgressCapsules();
-          });
+          scheduleTimelineFolderSelection(normalizedTarget);
         })();
         return;
       }
