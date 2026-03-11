@@ -17,6 +17,8 @@ const drawCanvas = document.getElementById("drawCanvas");
 const previewLoading = document.getElementById("previewLoading");
 const previewToolbar = document.getElementById("previewToolbar");
 const markBtn = document.getElementById("markBtn");
+const measureBtn = document.getElementById("measureBtn");
+const measureCalibrationInput = document.getElementById("measureCalibrationInput");
 const drawColorPicker = document.getElementById("drawColorPicker");
 const drawColorPopover = document.getElementById("drawColorPopover");
 const drawCustomColorInput = document.getElementById("drawCustomColorInput");
@@ -42,6 +44,7 @@ let translateX = 0;
 let translateY = 0;
 let controlsVisible = false;
 let markModeActive = false;
+let measureModeActive = false;
 let selectedDrawColor = "white";
 let activeCustomColorDot = null;
 const pendingRotationStepsByPath = new Map();
@@ -69,6 +72,14 @@ let isDrawingLine = false;
 let lastDrawPoint = null;
 let hasDrawnLines = false;
 let lineSegments = [];
+let measurementSegments = [];
+let pendingMeasureStart = null;
+let hoverMeasurePoint = null;
+let activeMeasurementLabelDrag = null;
+let measurementLabelHover = false;
+let calibrationMmPerPx = null;
+let calibrationReferencePixels = null;
+let calibrationReferenceSegmentIndex = -1;
 let drawCanvasRenderScale = 1;
 let currentStroke = null;
 const toolbarHiddenForMode = previewMode === "wizard";
@@ -90,6 +101,7 @@ let folderRefreshRequestId = 0;
 const ROTATION_UI_STATE_STORAGE_KEY = "mpm.imagePreviewRotationUiState.v1";
 const DRAW_COLOR_PALETTE_STORAGE_KEY = "mpm.imagePreviewDrawPalette.v1";
 const PREVIEW_TRACE_FORWARD_TO_RUST = FULL_TRACE;
+const SAVE_BUTTON_ORANGE = "#fb923c";
 
 function previewTrace(scope, message, extra = null) {
   const ts = new Date().toISOString();
@@ -255,6 +267,43 @@ function updateDrawCursor(colorValue = selectedDrawColor) {
   previewRoot?.style.setProperty("--draw-cursor", buildDrawCursorValue(colorValue));
 }
 
+function hasMeasurementSegments() {
+  return Array.isArray(measurementSegments) && measurementSegments.length > 0;
+}
+
+function updateMeasurementToolbarState() {
+  previewToolbar?.classList.toggle("has-measurements", hasMeasurementSegments());
+}
+
+function formatMeasurementMm(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return t("preview.calibration_placeholder");
+  return `${numeric.toFixed(1)} mm`;
+}
+
+function setCalibrationEditing(active) {
+  if (!measureCalibrationInput) return;
+  if (active) {
+    measureCalibrationInput.focus();
+    measureCalibrationInput.select();
+  }
+}
+
+function updateCalibrationDisplay() {
+  if (!measureCalibrationInput) return;
+  if (Number.isFinite(calibrationMmPerPx) && calibrationMmPerPx > 0 && Number.isFinite(calibrationReferencePixels) && calibrationReferencePixels > 0) {
+    measureCalibrationInput.value = (calibrationMmPerPx * calibrationReferencePixels).toFixed(1);
+  } else {
+    measureCalibrationInput.value = "";
+  }
+}
+
+function syncCalibrationReferenceSegment() {
+  measurementSegments.forEach((segment, index) => {
+    segment.isCalibrationReference = index === calibrationReferenceSegmentIndex;
+  });
+}
+
 function getDotColorValue(dot) {
   if (!(dot instanceof HTMLElement)) return "#ffffff";
   return normalizeHexColor(dot.dataset.drawColorValue || drawColorToCss(dot.dataset.color), "#ffffff");
@@ -338,9 +387,40 @@ function clearDrawCanvas() {
   ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
   hasDrawnLines = false;
   lineSegments = [];
+  measurementSegments = [];
+  pendingMeasureStart = null;
+  hoverMeasurePoint = null;
+  activeMeasurementLabelDrag = null;
+  setMeasurementLabelHover(false);
+  setMeasurementLabelDragging(false);
+  calibrationReferenceSegmentIndex = -1;
+  currentStroke = null;
+  previewToolbar?.classList.remove("has-lines");
+  previewToolbar?.classList.remove("has-measurements");
+  setSaveModeActive(false);
+  redrawDrawCanvas();
+}
+
+function clearDrawOnly() {
+  hasDrawnLines = false;
+  lineSegments = [];
   currentStroke = null;
   previewToolbar?.classList.remove("has-lines");
   setSaveModeActive(false);
+  redrawDrawCanvas();
+}
+
+function clearMeasurementsOnly() {
+  measurementSegments = [];
+  pendingMeasureStart = null;
+  hoverMeasurePoint = null;
+  activeMeasurementLabelDrag = null;
+  setMeasurementLabelHover(false);
+  setMeasurementLabelDragging(false);
+  calibrationReferenceSegmentIndex = -1;
+  previewToolbar?.classList.remove("has-measurements");
+  setSaveModeActive(false);
+  redrawDrawCanvas();
 }
 
 function drawPointFromClient(clientX, clientY) {
@@ -389,36 +469,282 @@ function redrawDrawCanvas() {
   if (!ctx) return;
   ctx.imageSmoothingEnabled = true;
   ctx.clearRect(0, 0, drawCanvas.width, drawCanvas.height);
-  if (!Array.isArray(lineSegments) || lineSegments.length < 1) return;
   const { sx, sy } = getDrawScale();
   const baseStrokeWidth = Math.max(1.15, Math.min(2.1, 1.35 * Math.max(window.devicePixelRatio || 1, 1)));
-  for (const stroke of lineSegments) {
-    if (!stroke || !Array.isArray(stroke.points) || stroke.points.length < 1) continue;
-    const points = stroke.points;
-    ctx.strokeStyle = drawColorToCss(stroke.color);
-    ctx.lineWidth = baseStrokeWidth * Math.max(sx, sy);
+  if (Array.isArray(lineSegments) && lineSegments.length > 0) {
+    for (const stroke of lineSegments) {
+      if (!stroke || !Array.isArray(stroke.points) || stroke.points.length < 1) continue;
+      const points = stroke.points;
+      ctx.strokeStyle = drawColorToCss(stroke.color);
+      ctx.lineWidth = baseStrokeWidth * Math.max(sx, sy);
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      if (points.length === 1) {
+        const p = points[0];
+        ctx.arc(p.x * sx, p.y * sy, ctx.lineWidth * 0.5, 0, Math.PI * 2);
+        ctx.fillStyle = drawColorToCss(stroke.color);
+        ctx.fill();
+        continue;
+      }
+      ctx.moveTo(points[0].x * sx, points[0].y * sy);
+      for (let i = 1; i < points.length - 1; i += 1) {
+        const current = points[i];
+        const next = points[i + 1];
+        const midX = ((current.x + next.x) / 2) * sx;
+        const midY = ((current.y + next.y) / 2) * sy;
+        ctx.quadraticCurveTo(current.x * sx, current.y * sy, midX, midY);
+      }
+      const penultimate = points[points.length - 2];
+      const last = points[points.length - 1];
+      ctx.quadraticCurveTo(penultimate.x * sx, penultimate.y * sy, last.x * sx, last.y * sy);
+      ctx.stroke();
+    }
+  }
+  drawMeasurementSegments(ctx, sx, sy);
+}
+
+function drawCrossMarker(ctx, x, y, size, color) {
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(1.4, size * 0.12);
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(x - size, y);
+  ctx.lineTo(x + size, y);
+  ctx.moveTo(x, y - size);
+  ctx.lineTo(x, y + size);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function getMeasurementLabel(segment) {
+  const mm = Number(segment?.mm);
+  return Number.isFinite(mm) && mm > 0 ? formatMeasurementMm(mm) : t("preview.calibration_placeholder");
+}
+
+function getMeasurementLabelPosition(segment, markerSize = 0) {
+  const fallbackX = (Number(segment?.start?.x ?? 0) + Number(segment?.end?.x ?? 0)) / 2;
+  const fallbackY = ((Number(segment?.start?.y ?? 0) + Number(segment?.end?.y ?? 0)) / 2) - Math.max(18, markerSize + 7);
+  return {
+    x: Number(segment?.labelX),
+    y: Number(segment?.labelY),
+    fallbackX,
+    fallbackY,
+  };
+}
+
+function getMeasurementLabelRect(ctx, text, x, y) {
+  const metrics = ctx.measureText(text);
+  const width = metrics.width + 14;
+  const height = 22;
+  return {
+    left: x - (width / 2),
+    top: y - (height / 2),
+    width,
+    height,
+  };
+}
+
+function fillRoundedRect(ctx, x, y, width, height, radius) {
+  const r = Math.max(0, Math.min(radius, width / 2, height / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + width, y, x + width, y + height, r);
+  ctx.arcTo(x + width, y + height, x, y + height, r);
+  ctx.arcTo(x, y + height, x, y, r);
+  ctx.arcTo(x, y, x + width, y, r);
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawMeasurementLabel(ctx, text, x, y) {
+  ctx.save();
+  ctx.font = `${Math.max(13, 13 * Math.max(window.devicePixelRatio || 1, 1))}px "Avenir Next", "Segoe UI", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const rect = getMeasurementLabelRect(ctx, text, x, y);
+  const left = rect.left;
+  const top = rect.top;
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  fillRoundedRect(ctx, left, top, rect.width, rect.height, 5);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "#ffffff";
+  ctx.fillText(text, x, y + 0.5);
+  ctx.restore();
+  return rect;
+}
+
+function drawMeasurementLabelWithColor(ctx, text, x, y, textColor = "#ffffff") {
+  ctx.save();
+  ctx.font = `${Math.max(13, 13 * Math.max(window.devicePixelRatio || 1, 1))}px "Avenir Next", "Segoe UI", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  const rect = getMeasurementLabelRect(ctx, text, x, y);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  fillRoundedRect(ctx, rect.left, rect.top, rect.width, rect.height, 5);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = textColor;
+  ctx.fillText(text, x, y + 0.5);
+  ctx.restore();
+  return rect;
+}
+
+function setMeasurementLabelHover(active) {
+  measurementLabelHover = Boolean(active);
+  previewRoot?.classList.toggle("measure-label-hover", measurementLabelHover);
+}
+
+function setMeasurementLabelDragging(active) {
+  previewRoot?.classList.toggle("dragging-measure-label", Boolean(active));
+}
+
+function getMeasurementLeaderAnchor(segment) {
+  const labelX = Number(segment?.labelX);
+  const labelY = Number(segment?.labelY);
+  if (!Number.isFinite(labelX) || !Number.isFinite(labelY)) {
+    return segment?.start ?? { x: 0, y: 0 };
+  }
+  const start = segment?.start ?? { x: 0, y: 0 };
+  const end = segment?.end ?? { x: 0, y: 0 };
+  const startDistance = Math.hypot(labelX - Number(start.x ?? 0), labelY - Number(start.y ?? 0));
+  const endDistance = Math.hypot(labelX - Number(end.x ?? 0), labelY - Number(end.y ?? 0));
+  return endDistance < startDistance ? end : start;
+}
+
+function findMeasurementLabelHit(clientX, clientY) {
+  if (!drawCanvas || measurementSegments.length < 1) return null;
+  const ctx = drawCanvas.getContext("2d");
+  if (!ctx) return null;
+  const imagePoint = getImagePointFromClient(clientX, clientY);
+  if (!imagePoint) return null;
+  const { sx, sy } = getDrawScale();
+  ctx.save();
+  ctx.font = `${Math.max(13, 13 * Math.max(window.devicePixelRatio || 1, 1))}px "Avenir Next", "Segoe UI", sans-serif`;
+  const canvasX = imagePoint.x * sx;
+  const canvasY = imagePoint.y * sy;
+  for (let i = measurementSegments.length - 1; i >= 0; i -= 1) {
+    const segment = measurementSegments[i];
+    if (!segment?.start || !segment?.end) continue;
+    const markerSize = Math.max(6, 5.5 * Math.max(sx, sy));
+    const labelPosition = getMeasurementLabelPosition(segment, markerSize);
+    const labelX = Number.isFinite(labelPosition.x) ? labelPosition.x : labelPosition.fallbackX;
+    const labelY = Number.isFinite(labelPosition.y) ? labelPosition.y : labelPosition.fallbackY;
+    const rect = getMeasurementLabelRect(ctx, getMeasurementLabel(segment), labelX * sx, labelY * sy);
+    if (
+      canvasX >= rect.left &&
+      canvasX <= rect.left + rect.width &&
+      canvasY >= rect.top &&
+      canvasY <= rect.top + rect.height
+    ) {
+      ctx.restore();
+      return {
+        index: i,
+        offsetX: imagePoint.x - labelX,
+        offsetY: imagePoint.y - labelY,
+      };
+    }
+  }
+  ctx.restore();
+  return null;
+}
+
+function renderMeasurementLabelSprite(text) {
+  return renderMeasurementLabelSpriteWithColor(text, "#ffffff");
+}
+
+function renderMeasurementLabelSpriteWithColor(text, textColor = "#ffffff") {
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  const scale = 4;
+  const fontSize = 26;
+  ctx.font = `600 ${fontSize}px "Avenir Next", "Segoe UI", sans-serif`;
+  const metrics = ctx.measureText(text);
+  const width = Math.ceil(metrics.width + 28);
+  const height = 44;
+  canvas.width = width * scale;
+  canvas.height = height * scale;
+  ctx.scale(scale, scale);
+  ctx.font = `600 ${fontSize}px "Avenir Next", "Segoe UI", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  fillRoundedRect(ctx, 0, 0, width, height, 5);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = textColor;
+  ctx.fillText(text, width / 2, (height / 2) + 0.5);
+  return {
+    dataUrl: canvas.toDataURL("image/png"),
+    width,
+    height,
+  };
+}
+
+function getMeasurementLabelTextColor(segment) {
+  return segment?.isCalibrationReference ? SAVE_BUTTON_ORANGE : "#ffffff";
+}
+
+function drawMeasurementSegments(ctx, sx, sy) {
+  const markerSize = Math.max(6, 5.5 * Math.max(sx, sy));
+  const lineWidth = Math.max(1.2, 1.05 * Math.max(sx, sy));
+  for (const segment of measurementSegments) {
+    if (!segment?.start || !segment?.end) continue;
+    const ax = segment.start.x * sx;
+    const ay = segment.start.y * sy;
+    const bx = segment.end.x * sx;
+    const by = segment.end.y * sy;
+    ctx.save();
+    ctx.strokeStyle = "#f8fafc";
+    ctx.lineWidth = lineWidth;
     ctx.lineCap = "round";
-    ctx.lineJoin = "round";
     ctx.beginPath();
-    if (points.length === 1) {
-      const p = points[0];
-      ctx.arc(p.x * sx, p.y * sy, ctx.lineWidth * 0.5, 0, Math.PI * 2);
-      ctx.fillStyle = drawColorToCss(stroke.color);
-      ctx.fill();
-      continue;
-    }
-    ctx.moveTo(points[0].x * sx, points[0].y * sy);
-    for (let i = 1; i < points.length - 1; i += 1) {
-      const current = points[i];
-      const next = points[i + 1];
-      const midX = ((current.x + next.x) / 2) * sx;
-      const midY = ((current.y + next.y) / 2) * sy;
-      ctx.quadraticCurveTo(current.x * sx, current.y * sy, midX, midY);
-    }
-    const penultimate = points[points.length - 2];
-    const last = points[points.length - 1];
-    ctx.quadraticCurveTo(penultimate.x * sx, penultimate.y * sy, last.x * sx, last.y * sy);
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
     ctx.stroke();
+    ctx.restore();
+    drawCrossMarker(ctx, ax, ay, markerSize, "#f8fafc");
+    drawCrossMarker(ctx, bx, by, markerSize, "#f8fafc");
+    const labelPosition = getMeasurementLabelPosition(segment, markerSize);
+    const labelX = Number.isFinite(labelPosition.x) ? labelPosition.x : labelPosition.fallbackX;
+    const labelY = Number.isFinite(labelPosition.y) ? labelPosition.y : labelPosition.fallbackY;
+    const anchor = getMeasurementLeaderAnchor(segment);
+    ctx.save();
+    ctx.strokeStyle = "rgba(226,232,240,0.95)";
+    ctx.lineWidth = Math.max(0.8, 0.75 * Math.max(sx, sy));
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(anchor.x * sx, anchor.y * sy);
+    ctx.lineTo(labelX * sx, labelY * sy);
+    ctx.stroke();
+    ctx.restore();
+    drawMeasurementLabelWithColor(
+      ctx,
+      getMeasurementLabel(segment),
+      labelX * sx,
+      labelY * sy,
+      getMeasurementLabelTextColor(segment),
+    );
+  }
+  if (measureModeActive && pendingMeasureStart && hoverMeasurePoint) {
+    const ax = pendingMeasureStart.x * sx;
+    const ay = pendingMeasureStart.y * sy;
+    const bx = hoverMeasurePoint.x * sx;
+    const by = hoverMeasurePoint.y * sy;
+    ctx.save();
+    ctx.strokeStyle = "rgba(248,250,252,0.9)";
+    ctx.lineWidth = lineWidth;
+    ctx.setLineDash([6, 6]);
+    ctx.beginPath();
+    ctx.moveTo(ax, ay);
+    ctx.lineTo(bx, by);
+    ctx.stroke();
+    ctx.restore();
+    drawCrossMarker(ctx, ax, ay, markerSize, "#f8fafc");
+    drawCrossMarker(ctx, bx, by, markerSize, "#f8fafc");
   }
 }
 
@@ -439,6 +765,74 @@ function continueDrawingTo(clientX, clientY) {
   }
   redrawDrawCanvas();
   lastDrawPoint = next;
+}
+
+function updateMeasurementValues() {
+  if (!(Number.isFinite(calibrationMmPerPx) && calibrationMmPerPx > 0)) {
+    for (const segment of measurementSegments) {
+      segment.mm = null;
+    }
+    redrawDrawCanvas();
+    updateCalibrationDisplay();
+    return;
+  }
+  for (const segment of measurementSegments) {
+    const dx = Number(segment?.end?.x ?? 0) - Number(segment?.start?.x ?? 0);
+    const dy = Number(segment?.end?.y ?? 0) - Number(segment?.start?.y ?? 0);
+    segment.mm = Math.hypot(dx, dy) * calibrationMmPerPx;
+  }
+  syncCalibrationReferenceSegment();
+  redrawDrawCanvas();
+  updateCalibrationDisplay();
+}
+
+function applyCalibrationMm(value) {
+  const numeric = Number(String(value ?? "").replace(",", "."));
+  if (!(Number.isFinite(numeric) && numeric > 0)) return false;
+  if (measurementSegments.length > 0) {
+    const latestIndex = measurementSegments.length - 1;
+    const latestSegment = measurementSegments[latestIndex];
+    const dx = Number(latestSegment?.end?.x ?? 0) - Number(latestSegment?.start?.x ?? 0);
+    const dy = Number(latestSegment?.end?.y ?? 0) - Number(latestSegment?.start?.y ?? 0);
+    const latestPixels = Math.hypot(dx, dy);
+    if (Number.isFinite(latestPixels) && latestPixels > 0) {
+      calibrationReferencePixels = latestPixels;
+      calibrationReferenceSegmentIndex = latestIndex;
+    }
+  }
+  if (!(Number.isFinite(calibrationReferencePixels) && calibrationReferencePixels > 0)) return false;
+  calibrationMmPerPx = numeric / calibrationReferencePixels;
+  syncCalibrationReferenceSegment();
+  updateMeasurementValues();
+  return true;
+}
+
+function beginCalibrationEdit() {
+  if (!measureCalibrationInput) return;
+  measureCalibrationInput.value =
+    Number.isFinite(calibrationMmPerPx) && calibrationMmPerPx > 0 && Number.isFinite(calibrationReferencePixels) && calibrationReferencePixels > 0
+      ? (calibrationMmPerPx * calibrationReferencePixels).toFixed(1)
+      : "";
+  setCalibrationEditing(true);
+  measureCalibrationInput.focus();
+  measureCalibrationInput.select();
+}
+
+function commitCalibrationInput() {
+  if (!measureCalibrationInput) return;
+  const raw = String(measureCalibrationInput.value ?? "").trim();
+  if (!raw) {
+    setCalibrationEditing(false);
+    updateCalibrationDisplay();
+    return;
+  }
+  if (applyCalibrationMm(raw)) {
+    setCalibrationEditing(false);
+    measureCalibrationInput.blur();
+    return;
+  }
+  measureCalibrationInput.focus();
+  measureCalibrationInput.select();
 }
 
 function normalizeRotationSteps(value) {
@@ -646,6 +1040,15 @@ function toggleControlsVisible() {
 
 function setMarkModeActive(active) {
   markModeActive = Boolean(active);
+  if (markModeActive) {
+    measureModeActive = false;
+    measureBtn?.classList.remove("active");
+    measureBtn?.setAttribute("aria-pressed", "false");
+    previewRoot?.classList.remove("measure-mode");
+    pendingMeasureStart = null;
+    hoverMeasurePoint = null;
+    setCalibrationEditing(false);
+  }
   markBtn?.classList.toggle("active", markModeActive);
   markBtn?.setAttribute("aria-pressed", markModeActive ? "true" : "false");
   previewRoot?.classList.toggle("draw-mode", markModeActive);
@@ -655,6 +1058,28 @@ function setMarkModeActive(active) {
     lastDrawPoint = null;
     setSaveModeActive(false);
   }
+}
+
+function setMeasureModeActive(active) {
+  measureModeActive = Boolean(active);
+  if (measureModeActive) {
+    markModeActive = false;
+    markBtn?.classList.remove("active");
+    markBtn?.setAttribute("aria-pressed", "false");
+    previewRoot?.classList.remove("draw-mode");
+    isDrawingLine = false;
+    lastDrawPoint = null;
+    currentStroke = null;
+    setSaveModeActive(false);
+  } else {
+    pendingMeasureStart = null;
+    hoverMeasurePoint = null;
+    setCalibrationEditing(false);
+  }
+  measureBtn?.classList.toggle("active", measureModeActive);
+  measureBtn?.setAttribute("aria-pressed", measureModeActive ? "true" : "false");
+  previewRoot?.classList.toggle("measure-mode", measureModeActive);
+  redrawDrawCanvas();
 }
 
 function setSaveModeActive(active) {
@@ -823,6 +1248,17 @@ async function exportAnnotatedTempFile() {
   return await invoke("export_annotated_image_to_temp", {
     path: currentPreviewPath,
     strokes: lineSegments,
+    measurements: measurementSegments.map((segment) => ({
+      start: {
+        x: Number(segment?.start?.x) || 0,
+        y: Number(segment?.start?.y) || 0,
+      },
+      end: {
+        x: Number(segment?.end?.x) || 0,
+        y: Number(segment?.end?.y) || 0,
+      },
+      label_mm: Number(segment?.mm) || 0,
+    })),
     previewWidth: Math.max(1, baseImageWidth),
     previewHeight: Math.max(1, baseImageHeight),
   });
@@ -1164,7 +1600,7 @@ window.addEventListener("keydown", (event) => {
 
 
 previewRoot?.addEventListener("wheel", (event) => {
-  if (markModeActive) return;
+  if (markModeActive || measureModeActive) return;
   event.preventDefault();
   const delta = Number(event.deltaY) || 0;
   if (!Number.isFinite(delta) || delta === 0) return;
@@ -1174,7 +1610,7 @@ previewRoot?.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 previewRoot?.addEventListener("pointerdown", (event) => {
-  if (markModeActive) return;
+  if (markModeActive || measureModeActive) return;
   if (event.target instanceof Element && event.target.closest(".preview-nav")) return;
   if (event.target instanceof Element && event.target.closest(".preview-toolbar")) return;
 
@@ -1209,7 +1645,7 @@ previewRoot?.addEventListener("pointerdown", (event) => {
 });
 
 previewRoot?.addEventListener("pointermove", (event) => {
-  if (markModeActive) return;
+  if (markModeActive || measureModeActive) return;
   if (event.pointerType === "touch") {
     if (!activeTouchPoints.has(event.pointerId)) return;
     activeTouchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -1361,6 +1797,10 @@ markBtn?.addEventListener("click", () => {
   setMarkModeActive(!markModeActive);
 });
 
+measureBtn?.addEventListener("click", () => {
+  setMeasureModeActive(!measureModeActive);
+});
+
 drawColorPicker?.addEventListener("click", (event) => {
   const dot = event.target instanceof Element ? event.target.closest(".draw-color-dot") : null;
   if (!dot) return;
@@ -1404,7 +1844,37 @@ drawCustomColorInput?.addEventListener("change", (event) => {
 });
 
 clearDrawBtn?.addEventListener("click", () => {
+  if (measureModeActive) {
+    clearMeasurementsOnly();
+    return;
+  }
+  if (markModeActive) {
+    clearDrawOnly();
+    return;
+  }
   clearDrawCanvas();
+});
+
+measureCalibrationInput?.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    commitCalibrationInput();
+    return;
+  }
+  if (event.key === "Escape") {
+    event.preventDefault();
+    setCalibrationEditing(false);
+    updateCalibrationDisplay();
+  }
+});
+
+measureCalibrationInput?.addEventListener("blur", () => {
+  commitCalibrationInput();
+});
+
+measureCalibrationInput?.addEventListener("focus", () => {
+  if (!measureModeActive) return;
+  beginCalibrationEdit();
 });
 
 drawSaveInput?.addEventListener("input", () => {
@@ -1450,7 +1920,7 @@ drawSaveDropdownBtn?.addEventListener("click", (event) => {
 });
 
 drawSaveBtn?.addEventListener("click", () => {
-  if (!hasDrawnLines) return;
+  if (!hasDrawnLines && !hasMeasurementSegments()) return;
   if (!saveModeActive) {
     setSaveModeActive(true);
     renderSaveDropdown(drawSaveInput?.value ?? "");
@@ -1472,10 +1942,33 @@ drawSaveBtn?.addEventListener("click", () => {
         }))
       : [],
   })).filter((stroke) => stroke.points.length > 0);
+  const committedMeasurements = measurementSegments.map((segment) => {
+    const labelSprite = renderMeasurementLabelSpriteWithColor(
+      getMeasurementLabel(segment),
+      getMeasurementLabelTextColor(segment),
+    );
+    return {
+      start: {
+        x: Number(segment?.start?.x) || 0,
+        y: Number(segment?.start?.y) || 0,
+      },
+      end: {
+        x: Number(segment?.end?.x) || 0,
+        y: Number(segment?.end?.y) || 0,
+      },
+      label_mm: Number(segment?.mm) || 0,
+      label_x: Number(segment?.labelX) || 0,
+      label_y: Number(segment?.labelY) || 0,
+      label_data_url: labelSprite?.dataUrl ?? "",
+      label_width: labelSprite?.width ?? 0,
+      label_height: labelSprite?.height ?? 0,
+    };
+  });
   const previewWidth = Math.max(1, baseImageWidth);
   const previewHeight = Math.max(1, baseImageHeight);
   setSaveModeActive(false);
   setMarkModeActive(false);
+  setMeasureModeActive(false);
   drawSaveBtn.disabled = true;
   if (drawSaveInput) drawSaveInput.disabled = true;
   if (drawSaveDropdownBtn) drawSaveDropdownBtn.disabled = true;
@@ -1498,13 +1991,13 @@ drawSaveBtn?.addEventListener("click", () => {
         importedImageCount: 1,
         importedTotalCount: 1,
         selectTargetFolder: true,
+        preferExistingThumbnailsFirst: Boolean(existingMatch),
         plannedPaths: [],
       }).catch(() => {});
-      await new Promise((resolve) => setTimeout(resolve, 80));
-      await new Promise((resolve) => requestAnimationFrame(resolve));
       const tempPath = await invoke("export_annotated_image_to_temp", {
         path: currentPreviewPath,
         strokes: committedStrokes,
+        measurements: committedMeasurements,
         previewWidth,
         previewHeight,
       });
@@ -1532,6 +2025,7 @@ drawSaveBtn?.addEventListener("click", () => {
         importedImageCount: 1,
         importedTotalCount: 1,
         selectTargetFolder: true,
+        preferExistingThumbnailsFirst: Boolean(existingMatch),
       }).catch(() => {});
       clearDrawCanvas();
     } catch (err) {
@@ -1545,10 +2039,75 @@ drawSaveBtn?.addEventListener("click", () => {
 });
 
 drawCanvas?.addEventListener("pointerdown", (event) => {
-  if (!markModeActive) return;
+  if (!markModeActive && !measureModeActive) return;
+  if (measureModeActive && event.button === 2) {
+    event.preventDefault();
+    if (pendingMeasureStart) {
+      pendingMeasureStart = null;
+      hoverMeasurePoint = null;
+      redrawDrawCanvas();
+    }
+    return;
+  }
   if (event.button !== undefined && event.button !== 0) return;
   event.preventDefault();
   resizeDrawCanvas();
+  if (measureModeActive) {
+    const labelHit = findMeasurementLabelHit(event.clientX, event.clientY);
+    if (labelHit) {
+      activeMeasurementLabelDrag = {
+        index: labelHit.index,
+        offsetX: labelHit.offsetX,
+        offsetY: labelHit.offsetY,
+      };
+      setMeasurementLabelHover(false);
+      setMeasurementLabelDragging(true);
+      drawCanvas.setPointerCapture?.(event.pointerId);
+      return;
+    }
+    const point = getImagePointFromClient(event.clientX, event.clientY);
+    if (!point) return;
+    if (!pendingMeasureStart) {
+      pendingMeasureStart = point;
+      hoverMeasurePoint = point;
+      redrawDrawCanvas();
+      return;
+    }
+    const end = point;
+    const dx = end.x - pendingMeasureStart.x;
+    const dy = end.y - pendingMeasureStart.y;
+    const pixels = Math.hypot(dx, dy);
+    if (pixels < 1) {
+      pendingMeasureStart = null;
+      hoverMeasurePoint = null;
+      redrawDrawCanvas();
+      return;
+    }
+    measurementSegments.push({
+      start: pendingMeasureStart,
+      end,
+      mm: Number.isFinite(calibrationMmPerPx) && calibrationMmPerPx > 0 ? pixels * calibrationMmPerPx : null,
+      labelX: (pendingMeasureStart.x + end.x) / 2,
+      labelY: ((pendingMeasureStart.y + end.y) / 2) - 18,
+      isCalibrationReference: false,
+    });
+    if (!(Number.isFinite(calibrationMmPerPx) && calibrationMmPerPx > 0)) {
+      calibrationReferencePixels = pixels;
+      calibrationReferenceSegmentIndex = measurementSegments.length - 1;
+    }
+    syncCalibrationReferenceSegment();
+    pendingMeasureStart = null;
+    hoverMeasurePoint = null;
+    updateMeasurementToolbarState();
+    redrawDrawCanvas();
+    if (!(Number.isFinite(calibrationMmPerPx) && calibrationMmPerPx > 0)) {
+      updateCalibrationDisplay();
+      beginCalibrationEdit();
+    } else {
+      updateCalibrationDisplay();
+    }
+    return;
+  }
   const start = getImagePointFromClient(event.clientX, event.clientY);
   if (!start) return;
   isDrawingLine = true;
@@ -1567,6 +2126,24 @@ drawCanvas?.addEventListener("pointerdown", (event) => {
 });
 
 drawCanvas?.addEventListener("pointermove", (event) => {
+  if (measureModeActive) {
+    if (activeMeasurementLabelDrag) {
+      const segment = measurementSegments[activeMeasurementLabelDrag.index];
+      const point = getImagePointFromClient(event.clientX, event.clientY);
+      if (!segment || !point) return;
+      segment.labelX = point.x - activeMeasurementLabelDrag.offsetX;
+      segment.labelY = point.y - activeMeasurementLabelDrag.offsetY;
+      redrawDrawCanvas();
+      return;
+    }
+    setMeasurementLabelHover(Boolean(findMeasurementLabelHit(event.clientX, event.clientY)));
+    if (!pendingMeasureStart) return;
+    const point = getImagePointFromClient(event.clientX, event.clientY);
+    if (!point) return;
+    hoverMeasurePoint = point;
+    redrawDrawCanvas();
+    return;
+  }
   if (!markModeActive || !isDrawingLine) return;
   event.preventDefault();
   continueDrawingTo(event.clientX, event.clientY);
@@ -1583,11 +2160,31 @@ function stopDrawing(pointerId = null) {
 }
 
 drawCanvas?.addEventListener("pointerup", (event) => {
+  if (activeMeasurementLabelDrag) {
+    activeMeasurementLabelDrag = null;
+    setMeasurementLabelDragging(false);
+    setMeasurementLabelHover(Boolean(findMeasurementLabelHit(event.clientX, event.clientY)));
+    drawCanvas?.releasePointerCapture?.(event.pointerId);
+    return;
+  }
   stopDrawing(event.pointerId);
 });
 
 drawCanvas?.addEventListener("pointercancel", (event) => {
+  activeMeasurementLabelDrag = null;
+  setMeasurementLabelDragging(false);
+  setMeasurementLabelHover(false);
   stopDrawing(event.pointerId);
+});
+
+drawCanvas?.addEventListener("contextmenu", (event) => {
+  if (!measureModeActive) return;
+  event.preventDefault();
+});
+
+drawCanvas?.addEventListener("pointerleave", () => {
+  if (activeMeasurementLabelDrag) return;
+  setMeasurementLabelHover(false);
 });
 
 void listen(previewEventName, (event) => {
@@ -1607,6 +2204,7 @@ void listen(previewEventName, (event) => {
   if (drawSaveDropdownBtn) drawSaveDropdownBtn.hidden = true;
   setSaveDropdownOpen(false);
   if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
+  updateCalibrationDisplay();
   if (!path) {
     setNavigationPaths(paths);
     updateNavigationButtons();
@@ -1629,11 +2227,14 @@ void (async () => {
       if (drawSaveBtn) {
         drawSaveBtn.textContent = saveModeActive ? t("preview.done") : t("preview.save");
       }
+      updateCalibrationDisplay();
     });
     loadRotationUiState();
     resizeDrawCanvas();
     applyInitialDrawPalette();
     setSelectedDrawColor(drawColorToCss("white"));
+    updateCalibrationDisplay();
+    setCalibrationEditing(false);
     setControlsVisible(false);
     const navStart = performance.now();
     const navPaths = await invoke(getCurrentPathsCommand);

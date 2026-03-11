@@ -4378,6 +4378,11 @@ void listen("import-wizard-completed", async (event) => {
     event?.payload?.selectTargetFolder ??
     false,
   );
+  const preferExistingThumbnailsFirst = Boolean(
+    event?.payload?.prefer_existing_thumbnails_first ??
+    event?.payload?.preferExistingThumbnailsFirst ??
+    false,
+  );
   const wizardDir = String(
     event?.payload?.import_wizard_dir ??
     event?.payload?.importWizardDir ??
@@ -4386,19 +4391,37 @@ void listen("import-wizard-completed", async (event) => {
   if (!workspace || !patient) return;
   if (!currentWorkspaceDir || workspace !== String(currentWorkspaceDir).trim()) return;
 
-  if (
-    targetFolder &&
-    typeof mainContent.ensureTargetFolderVisibleAndSelected === "function" &&
-    selectTargetFolder
-  ) {
-    await mainContent.ensureTargetFolderVisibleAndSelected({
+  if (!jobId && targetFolder && typeof mainContent.showOptimisticImportPreview === "function") {
+    mainContent.showOptimisticImportPreview({
+      targetFolder,
       workspaceDir: workspace,
       patientFolder: patient,
-      targetFolder,
+      importedImageCount,
+      importedTotalCount,
+      selectTargetFolder,
+      preferExistingThumbnailsFirst,
     });
-  }
-
-  if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
+    if (
+      selectTargetFolder &&
+      typeof mainContent.ensureTargetFolderVisibleAndSelected === "function"
+    ) {
+      void mainContent.ensureTargetFolderVisibleAndSelected({
+        workspaceDir: workspace,
+        patientFolder: patient,
+        targetFolder,
+      });
+    }
+  } else if (jobId && targetFolder && typeof mainContent.registerExternalImportJob === "function") {
+    if (
+      selectTargetFolder &&
+      typeof mainContent.ensureTargetFolderVisibleAndSelected === "function"
+    ) {
+      await mainContent.ensureTargetFolderVisibleAndSelected({
+        workspaceDir: workspace,
+        patientFolder: patient,
+        targetFolder,
+      });
+    }
     if (wizardDir) {
       importWizardCleanupByJobId.set(jobId, wizardDir);
     }
@@ -4410,15 +4433,7 @@ void listen("import-wizard-completed", async (event) => {
       importedImageCount,
       importedTotalCount,
       selectTargetFolder,
-    });
-  } else if (targetFolder && typeof mainContent.showOptimisticImportPreview === "function") {
-    mainContent.showOptimisticImportPreview({
-      targetFolder,
-      workspaceDir: workspace,
-      patientFolder: patient,
-      importedImageCount,
-      importedTotalCount,
-      selectTargetFolder,
+      preferExistingThumbnailsFirst,
     });
   } else {
     void mainContent.refreshTimelineForSelection();

@@ -38,6 +38,18 @@ struct AnnotatedStroke {
     points: Vec<AnnotatedStrokePoint>,
 }
 
+#[derive(Deserialize, Clone)]
+struct AnnotatedMeasurement {
+    start: AnnotatedStrokePoint,
+    end: AnnotatedStrokePoint,
+    label_mm: f32,
+    label_x: f32,
+    label_y: f32,
+    label_data_url: String,
+    label_width: f32,
+    label_height: f32,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Settings {
@@ -5448,10 +5460,275 @@ fn draw_annotated_stroke(
     }
 }
 
+fn draw_measurement_cross(
+    image: &mut image::RgbaImage,
+    center_x: f32,
+    center_y: f32,
+    size: f32,
+    color: image::Rgba<u8>,
+) {
+    let radius = (size * 0.12).max(0.8);
+    let steps = (size.ceil() as usize).max(1);
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let offset = -size + (2.0 * size * t);
+        stamp_circle(image, center_x + offset, center_y, radius, color);
+        stamp_circle(image, center_x, center_y + offset, radius, color);
+    }
+}
+
+fn draw_measurement_line(
+    image: &mut image::RgbaImage,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    radius: f32,
+    color: image::Rgba<u8>,
+) {
+    let dx = bx - ax;
+    let dy = by - ay;
+    let distance = (dx * dx + dy * dy).sqrt();
+    let steps = ((distance / 0.5).ceil() as usize).max(1);
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let x = ax + (dx * t);
+        let y = ay + (dy * t);
+        stamp_circle(image, x, y, radius, color);
+    }
+}
+
+fn draw_measurement_label(
+    image: &mut image::RgbaImage,
+    center_x: f32,
+    center_y: f32,
+    label_mm: f32,
+) {
+    if !(label_mm.is_finite() && label_mm > 0.0) {
+        return;
+    }
+    let text = format!("{:.1} mm", label_mm);
+    let char_w = 56.0_f32;
+    let width = text.chars().count() as f32 * char_w + 28.0;
+    let height = 108.0_f32;
+    let left = center_x - width / 2.0;
+    let top = center_y - height / 2.0;
+    let min_x = left.floor() as i32;
+    let min_y = top.floor() as i32;
+    let max_x = (left + width).ceil() as i32;
+    let max_y = (top + height).ceil() as i32;
+    let bg = image::Rgba([0, 0, 0, 170]);
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            if px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 {
+                continue;
+            }
+            let pixel = image.get_pixel_mut(px as u32, py as u32);
+            blend_rgba_over(pixel, bg, 1.0);
+        }
+    }
+    let fg = image::Rgba([255, 255, 255, 255]);
+    let digit_scale = 8.0_f32;
+    let mut cursor_x = left + 18.0;
+    let cursor_y = top + 18.0;
+    for ch in text.chars() {
+        draw_measurement_label_char(image, cursor_x, cursor_y, ch, digit_scale, fg);
+        cursor_x += if ch == 'm' { 62.0 } else if ch == ' ' { 28.0 } else { 52.0 };
+    }
+}
+
+fn blend_label_image(
+    image: &mut image::RgbaImage,
+    center_x: f32,
+    center_y: f32,
+    data_url: &str,
+    target_width: f32,
+    target_height: f32,
+) {
+    let comma_idx = match data_url.find(',') {
+        Some(idx) => idx,
+        None => return,
+    };
+    let b64 = data_url[(comma_idx + 1)..].trim();
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let decoded = match image::load_from_memory(&bytes) {
+        Ok(img) => img.to_rgba8(),
+        Err(_) => return,
+    };
+    let overlay = if target_width > 0.0 && target_height > 0.0 {
+        image::imageops::resize(
+            &decoded,
+            target_width.max(1.0).round() as u32,
+            target_height.max(1.0).round() as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        decoded
+    };
+    let left = (center_x - (overlay.width() as f32 / 2.0)).round() as i32;
+    let top = (center_y - (overlay.height() as f32 / 2.0)).round() as i32;
+    for oy in 0..overlay.height() {
+        for ox in 0..overlay.width() {
+            let px = left + ox as i32;
+            let py = top + oy as i32;
+            if px < 0 || py < 0 || px >= image.width() as i32 || py >= image.height() as i32 {
+                continue;
+            }
+            let src = *overlay.get_pixel(ox, oy);
+            let dst = image.get_pixel_mut(px as u32, py as u32);
+            blend_rgba_over(dst, src, 1.0);
+        }
+    }
+}
+
+fn draw_measurement_label_char(
+    image: &mut image::RgbaImage,
+    x: f32,
+    y: f32,
+    ch: char,
+    scale: f32,
+    color: image::Rgba<u8>,
+) {
+    match ch {
+        '0'..='9' => draw_segment_digit(image, x, y, ch, scale, color),
+        '.' => stamp_circle(image, x + 1.6 * scale, y + 8.5 * scale, 0.85 * scale, color),
+        'm' => {
+            draw_measurement_line(image, x, y + 8.5 * scale, x, y + 2.5 * scale, 0.45 * scale, color);
+            draw_measurement_line(image, x + 2.8 * scale, y + 8.5 * scale, x + 2.8 * scale, y + 3.5 * scale, 0.45 * scale, color);
+            draw_measurement_line(image, x + 5.6 * scale, y + 8.5 * scale, x + 5.6 * scale, y + 3.5 * scale, 0.45 * scale, color);
+        }
+        _ => {}
+    }
+}
+
+fn draw_segment_digit(
+    image: &mut image::RgbaImage,
+    x: f32,
+    y: f32,
+    digit: char,
+    scale: f32,
+    color: image::Rgba<u8>,
+) {
+    let w = 4.8 * scale;
+    let h = 8.8 * scale;
+    let t = 0.9 * scale;
+    let segments: &[u8] = match digit {
+        '0' => &[0, 1, 2, 4, 5, 6],
+        '1' => &[2, 5],
+        '2' => &[0, 2, 3, 4, 6],
+        '3' => &[0, 2, 3, 5, 6],
+        '4' => &[1, 2, 3, 5],
+        '5' => &[0, 1, 3, 5, 6],
+        '6' => &[0, 1, 3, 4, 5, 6],
+        '7' => &[0, 2, 5],
+        '8' => &[0, 1, 2, 3, 4, 5, 6],
+        '9' => &[0, 1, 2, 3, 5, 6],
+        _ => &[],
+    };
+    for segment in segments {
+        match segment {
+            0 => draw_measurement_line(image, x + t, y, x + w - t, y, t * 0.45, color),
+            1 => draw_measurement_line(image, x, y + t, x, y + (h / 2.0) - t, t * 0.45, color),
+            2 => draw_measurement_line(image, x + w, y + t, x + w, y + (h / 2.0) - t, t * 0.45, color),
+            3 => draw_measurement_line(image, x + t, y + (h / 2.0), x + w - t, y + (h / 2.0), t * 0.45, color),
+            4 => draw_measurement_line(image, x, y + (h / 2.0) + t, x, y + h - t, t * 0.45, color),
+            5 => draw_measurement_line(image, x + w, y + (h / 2.0) + t, x + w, y + h - t, t * 0.45, color),
+            6 => draw_measurement_line(image, x + t, y + h, x + w - t, y + h, t * 0.45, color),
+            _ => {}
+        }
+    }
+}
+
+fn draw_annotated_measurement(
+    image: &mut image::RgbaImage,
+    measurement: &AnnotatedMeasurement,
+    scale_x: f32,
+    scale_y: f32,
+) {
+    let color = image::Rgba([248, 250, 252, 255]);
+    let ax = measurement.start.x * scale_x;
+    let ay = measurement.start.y * scale_y;
+    let bx = measurement.end.x * scale_x;
+    let by = measurement.end.y * scale_y;
+    let base_scale = scale_x.max(scale_y).max(1.0);
+    let line_radius = (0.8 * base_scale).max(0.8);
+    let marker_size = (5.5 * base_scale).max(6.0);
+    let has_custom_label_position = measurement.label_x.is_finite()
+        && measurement.label_y.is_finite()
+        && measurement.label_x > 0.0
+        && measurement.label_y > 0.0;
+    let default_label_x = (ax + bx) * 0.5;
+    let default_label_y = ((ay + by) * 0.5) - (marker_size + 8.0);
+    let label_x = if has_custom_label_position {
+        measurement.label_x * scale_x
+    } else {
+        default_label_x
+    };
+    let label_y = if has_custom_label_position {
+        measurement.label_y * scale_y
+    } else {
+        default_label_y
+    };
+    let (anchor_x, anchor_y) = if has_custom_label_position {
+        let start_distance = ((measurement.label_x - measurement.start.x).powi(2)
+            + (measurement.label_y - measurement.start.y).powi(2))
+        .sqrt();
+        let end_distance = ((measurement.label_x - measurement.end.x).powi(2)
+            + (measurement.label_y - measurement.end.y).powi(2))
+        .sqrt();
+        if end_distance < start_distance {
+            (bx, by)
+        } else {
+            (ax, ay)
+        }
+    } else {
+        (ax, ay)
+    };
+    draw_measurement_line(image, ax, ay, bx, by, line_radius, color);
+    draw_measurement_cross(image, ax, ay, marker_size, color);
+    draw_measurement_cross(image, bx, by, marker_size, color);
+    let leader_color = image::Rgba([226, 232, 240, 230]);
+    draw_measurement_line(
+        image,
+        anchor_x,
+        anchor_y,
+        label_x,
+        label_y,
+        (0.45 * base_scale).max(0.45),
+        leader_color,
+    );
+    if !measurement.label_data_url.trim().is_empty() {
+        let target_width = if measurement.label_width > 0.0 {
+            measurement.label_width * scale_x
+        } else {
+            0.0
+        };
+        let target_height = if measurement.label_height > 0.0 {
+            measurement.label_height * scale_y
+        } else {
+            0.0
+        };
+        blend_label_image(
+            image,
+            label_x,
+            label_y,
+            &measurement.label_data_url,
+            target_width,
+            target_height,
+        );
+    } else {
+        draw_measurement_label(image, label_x, label_y, measurement.label_mm);
+    }
+}
+
 #[tauri::command]
 async fn export_annotated_image_to_temp(
     path: String,
     strokes: Vec<AnnotatedStroke>,
+    measurements: Vec<AnnotatedMeasurement>,
     preview_width: f32,
     preview_height: f32,
 ) -> Result<String, String> {
@@ -5460,8 +5737,8 @@ async fn export_annotated_image_to_temp(
         if path.is_empty() {
             return Err("path is required".to_string());
         }
-        if strokes.is_empty() {
-            return Err("strokes are required".to_string());
+        if strokes.is_empty() && measurements.is_empty() {
+            return Err("annotations are required".to_string());
         }
         if preview_width <= 0.0 || preview_height <= 0.0 {
             return Err("preview size is invalid".to_string());
@@ -5498,6 +5775,9 @@ async fn export_annotated_image_to_temp(
 
         for stroke in &strokes {
             draw_annotated_stroke(&mut image, stroke, scale_x, scale_y, stroke_width);
+        }
+        for measurement in &measurements {
+            draw_annotated_measurement(&mut image, measurement, scale_x, scale_y);
         }
 
         let safe_ext = if ext == "png" { "png" } else { "jpg" };

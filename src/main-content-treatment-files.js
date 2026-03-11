@@ -435,12 +435,23 @@ export function createTreatmentFilesPanel({
     treatmentFolder = "",
     imageCount = 0,
     totalCount = 0,
+    preferExistingThumbnailsFirst = false,
   } = {}) {
     const key = getContextKey(workspaceDir, patientFolder, treatmentFolder);
     if (!workspaceDir || !patientFolder || !treatmentFolder || !key) return;
+    const previousState = optimisticImportPlaceholdersByContext.get(key);
+    const baselineLoadedImageCount = Number(previousState?.baselineLoadedImageCount);
     const optimisticState = {
       imageCount: Math.max(0, Number(imageCount) || 0),
       totalCount: Math.max(0, Number(totalCount) || 0),
+      preferExistingThumbnailsFirst: Boolean(preferExistingThumbnailsFirst),
+      baselineLoadedImageCount: Number.isFinite(baselineLoadedImageCount)
+        ? Math.max(0, baselineLoadedImageCount)
+        : (Array.isArray(activeLoadedFiles)
+            ? activeLoadedFiles.reduce((count, file) => (
+                count + (Boolean(file?.is_image ?? file?.isImage) ? 1 : 0)
+              ), 0)
+            : 0),
     };
     optimisticImportPlaceholdersByContext.set(key, optimisticState);
     if (key !== activeContextKey || panel.hidden) return;
@@ -460,7 +471,12 @@ export function createTreatmentFilesPanel({
     const loadedImageCount = (Array.isArray(loadedFiles) ? loadedFiles : []).reduce((count, file) => (
       count + (Boolean(file?.is_image ?? file?.isImage) ? 1 : 0)
     ), 0);
-    return Math.max(0, optimisticImageCount - loadedImageCount);
+    const baselineLoadedImageCount = Math.max(
+      0,
+      Number(optimistic?.baselineLoadedImageCount) || 0
+    );
+    const newlyLoadedImageCount = Math.max(0, loadedImageCount - baselineLoadedImageCount);
+    return Math.max(0, optimisticImageCount - newlyLoadedImageCount);
   }
 
   function renderOptimisticImportPlaceholders(count = 0) {
@@ -1728,7 +1744,7 @@ export function createTreatmentFilesPanel({
     const requestId = ++activeRequestId;
     if (!append && !keepExistingVisible) {
       setLoadingState(t);
-      if (optimistic) {
+      if (optimistic && !optimistic.preferExistingThumbnailsFirst) {
         const placeholderCount = getRemainingOptimisticPlaceholderCount(optimistic, []);
         const didRender = renderOptimisticImportPlaceholders(placeholderCount);
         if (didRender) {

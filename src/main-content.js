@@ -966,7 +966,9 @@ export function initMainContent({
   function applyImportProgressEventForJob(job, { percent = 0, done = false, error = "" } = {}, { immediateDisplay = false } = {}) {
     if (!job) return;
 
-    job.progressValue = Math.max(0, Math.min(100, Number(percent) || 0));
+    const nextPercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    const displayedFloor = Math.max(0, Math.min(100, Number(job.displayedProgressValue ?? 0) || 0));
+    job.progressValue = done ? nextPercent : Math.max(nextPercent, Math.floor(displayedFloor));
     job.targetProgressValue = job.progressValue;
     job.lastProgressEventAt = performance.now();
     if (immediateDisplay && !done) {
@@ -2617,6 +2619,7 @@ export function initMainContent({
       importedImageCount,
       importedTotalCount,
       selectTargetFolder = false,
+      preferExistingThumbnailsFirst = false,
     } = {}) => {
       const normalizedWorkspace = String(workspaceDir ?? "").trim();
       const normalizedPatient = String(patientFolder ?? "").trim();
@@ -2625,6 +2628,11 @@ export function initMainContent({
       if (typeof onImportActivityChange === "function") {
         onImportActivityChange({ patientFolder: normalizedPatient, active: true });
       }
+      rememberOptimisticTimelineEntry({
+        workspaceDir: normalizedWorkspace,
+        patientFolder: normalizedPatient,
+        targetFolder: normalizedTarget,
+      });
       trackProvisionalImportJob({
         targetFolder: normalizedTarget,
         workspaceDir: normalizedWorkspace,
@@ -2638,6 +2646,7 @@ export function initMainContent({
           treatmentFolder: normalizedTarget,
           imageCount: Math.max(0, Number(importedImageCount) || 0),
           totalCount: Math.max(0, Number(importedTotalCount) || 0),
+          preferExistingThumbnailsFirst,
         });
       };
       const isAlreadyVisible = typeof treatmentFilesPanel.isActiveTreatmentContext === "function"
@@ -2685,6 +2694,7 @@ export function initMainContent({
       importedImageCount,
       importedTotalCount,
       selectTargetFolder = false,
+      preferExistingThumbnailsFirst = false,
     } = {}) => {
       const normalizedWorkspace = String(workspaceDir ?? "").trim();
       const normalizedPatient = String(patientFolder ?? "").trim();
@@ -2713,6 +2723,7 @@ export function initMainContent({
           treatmentFolder: normalizedTarget,
           imageCount: Math.max(0, Number(importedImageCount) || 0),
           totalCount: Math.max(0, Number(importedTotalCount) || 0),
+          preferExistingThumbnailsFirst,
         });
       };
       const isAlreadyVisible = typeof treatmentFilesPanel.isActiveTreatmentContext === "function"

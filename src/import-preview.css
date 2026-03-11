@@ -99,6 +99,17 @@ body{
   stroke: #ffffff;
 }
 
+#measureBtn{
+  margin-left: 8px;
+}
+
+#measureBtn svg{
+  transform: rotate(45deg);
+  transform-origin: center;
+  display: block;
+  margin: 0 auto;
+}
+
 .draw-color-picker{
   display: flex;
   align-items: center;
@@ -151,6 +162,57 @@ body{
   pointer-events: none;
 }
 
+.measure-calibrator{
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 0;
+  padding: 0;
+  max-width: 0;
+  opacity: 0;
+  transform: translateX(-10px);
+  overflow: hidden;
+  white-space: nowrap;
+  pointer-events: none;
+  transition: max-width 180ms ease, margin-left 180ms ease, opacity 180ms ease, transform 180ms ease;
+}
+
+#measureBtn.active + .measure-calibrator{
+  margin-left: 2px;
+  padding: 0 6px;
+  max-width: 130px;
+  opacity: 1;
+  transform: translateX(0);
+  overflow: visible;
+  pointer-events: auto;
+}
+
+.measure-calibration-input{
+  width: 70px;
+  height: 36px;
+  border: 1px solid rgba(0,0,0,0.16);
+  border-radius: 10px;
+  background: rgba(255,255,255,0.92);
+  color: #111827;
+  font: 600 12px/1 "Avenir Next", "Segoe UI", sans-serif;
+  letter-spacing: 0.02em;
+  text-align: center;
+  padding: 0 8px;
+  outline: none;
+}
+
+.measure-calibration-input{
+  color: #111827;
+}
+
+.measure-calibration-input:focus{
+  border-color: #2563eb;
+}
+
+.measure-calibration-input::placeholder{
+  color: rgba(17,24,39,0.46);
+}
+
 .draw-clear-btn{
   width: 0;
   height: 36px;
@@ -173,7 +235,14 @@ body{
   background: rgba(255,255,255,0.98);
 }
 
-.preview-toolbar.has-lines .draw-clear-btn{
+.preview-root.draw-mode .preview-toolbar.has-lines .draw-clear-btn{
+  width: 36px;
+  margin-left: 6px;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.preview-root.measure-mode .preview-toolbar.has-measurements .draw-clear-btn{
   width: 36px;
   margin-left: 6px;
   opacity: 1;
@@ -319,7 +388,14 @@ body{
   transition: width 170ms ease, margin-left 170ms ease, opacity 170ms ease;
 }
 
-.preview-toolbar.has-lines .draw-save-btn{
+.preview-root.draw-mode .preview-toolbar.has-lines .draw-save-btn{
+  width: 64px;
+  margin-left: 6px;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.preview-root.measure-mode .preview-toolbar.has-measurements .draw-save-btn{
   width: 64px;
   margin-left: 6px;
   opacity: 1;
@@ -402,6 +478,19 @@ body{
 .preview-root.draw-mode .draw-canvas{
   pointer-events: auto;
   cursor: var(--draw-cursor, crosshair) 4 20, crosshair;
+}
+
+.preview-root.measure-mode .draw-canvas{
+  pointer-events: auto;
+  cursor: crosshair;
+}
+
+.preview-root.measure-mode.measure-label-hover .draw-canvas{
+  cursor: grab;
+}
+
+.preview-root.measure-mode.dragging-measure-label .draw-canvas{
+  cursor: grabbing;
 }
 
 .preview-loading{

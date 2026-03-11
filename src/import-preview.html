@@ -31,6 +31,18 @@
         <div id="drawColorPopover" class="draw-color-popover" hidden>
           <input id="drawCustomColorInput" class="draw-custom-color-input" type="color" />
         </div>
+        <button id="measureBtn" class="preview-toolbar-btn preview-toolbar-btn-accent" type="button" aria-label="Measure mode" data-i18n-aria-label="preview.measure_mode">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M4.5 15.5L15.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M7.5 12.5L9 14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M10.5 9.5L12 11" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M13.5 6.5L15 8" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M15.5 4.5L19.5 8.5L8.5 19.5L4.5 15.5Z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+          </svg>
+        </button>
+        <div id="measureCalibrator" class="measure-calibrator">
+          <input id="measureCalibrationInput" class="measure-calibration-input" type="text" inputmode="decimal" placeholder="CAL" aria-label="Calibration value" data-i18n-aria-label="preview.calibration_value" data-i18n-placeholder="preview.calibration_placeholder" />
+        </div>
         <button id="clearDrawBtn" class="draw-clear-btn" type="button" aria-label="Clear drawn lines" data-i18n-aria-label="preview.clear_lines">
           <svg class="draw-clear-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M7 7L17 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
