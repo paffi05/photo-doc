@@ -77,8 +77,91 @@ fn get_settings_path(app_handle: &tauri::AppHandle) -> PathBuf {
     app_dir.join("settings.json")
 }
 
+fn get_legacy_settings_path(app_handle: &tauri::AppHandle) -> Option<PathBuf> {
+    let app_dir = app_handle.path().app_data_dir().ok()?;
+    let parent = app_dir.parent()?;
+    let legacy_dir = parent.join("com.clemens.photo-doc");
+    Some(legacy_dir.join("settings.json"))
+}
+
+fn read_settings_file(path: &Path) -> Result<Settings, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    serde_json::from_str(&content).map_err(|e| e.to_string())
+}
+
+fn merge_settings_missing_fields(base: &mut Settings, fallback: Settings) -> bool {
+    let mut changed = false;
+    if base.workspace_dir.is_none() && fallback.workspace_dir.is_some() {
+        base.workspace_dir = fallback.workspace_dir;
+        changed = true;
+    }
+    if base.import_wizard_dir.is_none() && fallback.import_wizard_dir.is_some() {
+        base.import_wizard_dir = fallback.import_wizard_dir;
+        changed = true;
+    }
+    if base.import_wizard_live_preview.is_none() && fallback.import_wizard_live_preview.is_some() {
+        base.import_wizard_live_preview = fallback.import_wizard_live_preview;
+        changed = true;
+    }
+    if base.window_state.is_none() && fallback.window_state.is_some() {
+        base.window_state = fallback.window_state;
+        changed = true;
+    }
+    if base.import_wizard_window_state.is_none() && fallback.import_wizard_window_state.is_some() {
+        base.import_wizard_window_state = fallback.import_wizard_window_state;
+        changed = true;
+    }
+    if base.import_wizard_preview_window_state.is_none() && fallback.import_wizard_preview_window_state.is_some() {
+        base.import_wizard_preview_window_state = fallback.import_wizard_preview_window_state;
+        changed = true;
+    }
+    if base.cache_size_gb.is_none() && fallback.cache_size_gb.is_some() {
+        base.cache_size_gb = fallback.cache_size_gb;
+        changed = true;
+    }
+    if base.keep_local_cache_copy.is_none() && fallback.keep_local_cache_copy.is_some() {
+        base.keep_local_cache_copy = fallback.keep_local_cache_copy;
+        changed = true;
+    }
+    if base.preview_performance_mode.is_none() && fallback.preview_performance_mode.is_some() {
+        base.preview_performance_mode = fallback.preview_performance_mode;
+        changed = true;
+    }
+    if base.background_preview_creation.is_none() && fallback.background_preview_creation.is_some() {
+        base.background_preview_creation = fallback.background_preview_creation;
+        changed = true;
+    }
+    if base.language.is_none() && fallback.language.is_some() {
+        base.language = fallback.language;
+        changed = true;
+    }
+    changed
+}
+
+fn migrate_legacy_settings_if_needed(app_handle: &tauri::AppHandle, target_path: &Path) {
+    if target_path.exists() {
+        return;
+    }
+    let Some(legacy_path) = get_legacy_settings_path(app_handle) else {
+        return;
+    };
+    if !legacy_path.exists() {
+        return;
+    }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    if fs::copy(&legacy_path, target_path).is_ok() {
+        let _ = fs::remove_file(&legacy_path);
+        if let Some(parent) = legacy_path.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+    }
+}
+
 fn read_settings(app_handle: &tauri::AppHandle) -> Result<Settings, String> {
     let path = get_settings_path(app_handle);
+    migrate_legacy_settings_if_needed(app_handle, &path);
     if !path.exists() {
         let mut settings = Settings::default();
         settings.preview_performance_mode = Some(PREVIEW_PERF_AUTO.to_string());
@@ -86,8 +169,26 @@ fn read_settings(app_handle: &tauri::AppHandle) -> Result<Settings, String> {
         return Ok(settings);
     }
 
-    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-    let mut settings: Settings = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+    let mut settings = read_settings_file(&path)?;
+    if let Some(legacy_path) = get_legacy_settings_path(app_handle) {
+        if legacy_path.exists() {
+            if let Ok(legacy_settings) = read_settings_file(&legacy_path) {
+                if merge_settings_missing_fields(&mut settings, legacy_settings) {
+                    if write_settings(app_handle, &settings).is_ok() {
+                        let _ = fs::remove_file(&legacy_path);
+                        if let Some(parent) = legacy_path.parent() {
+                            let _ = fs::remove_dir(parent);
+                        }
+                    }
+                } else {
+                    let _ = fs::remove_file(&legacy_path);
+                    if let Some(parent) = legacy_path.parent() {
+                        let _ = fs::remove_dir(parent);
+                    }
+                }
+            }
+        }
+    }
     let normalized_mode = normalize_preview_performance_mode(
         settings
             .preview_performance_mode
