@@ -154,6 +154,49 @@ function setStartupSpinnerPercent(percent = 0) {
   startupSpinnerPercent.textContent = `${safe}%`;
 }
 
+let startupProgressFloor = 0;
+let startupProgressDisplayed = 0;
+let startupProgressTimerId = null;
+
+function startContinuousStartupProgress(initialPercent = 1) {
+  startupProgressFloor = Math.max(1, Math.min(99, Math.round(Number(initialPercent) || 1)));
+  startupProgressDisplayed = startupProgressFloor;
+  setStartupSpinnerPercent(startupProgressDisplayed);
+  if (startupProgressTimerId !== null) {
+    clearInterval(startupProgressTimerId);
+  }
+  startupProgressTimerId = setInterval(() => {
+    if (startupProgressDisplayed < startupProgressFloor) {
+      startupProgressDisplayed = Math.min(startupProgressFloor, startupProgressDisplayed + 1);
+      setStartupSpinnerPercent(startupProgressDisplayed);
+    }
+  }, 120);
+}
+
+function setContinuousStartupProgressFloor(percent = 0) {
+  startupProgressFloor = Math.max(startupProgressFloor, Math.min(99, Math.round(Number(percent) || 0)));
+  if (startupProgressDisplayed < startupProgressFloor) {
+    startupProgressDisplayed = startupProgressFloor;
+    setStartupSpinnerPercent(startupProgressDisplayed);
+  }
+}
+
+function completeContinuousStartupProgress() {
+  startupProgressFloor = 100;
+  startupProgressDisplayed = 100;
+  if (startupProgressTimerId !== null) {
+    clearInterval(startupProgressTimerId);
+    startupProgressTimerId = null;
+  }
+  setStartupSpinnerPercent(100);
+}
+
+async function setStartupUiStep(message, percent) {
+  setStartupProcessStatus(message);
+  setContinuousStartupProgressFloor(percent);
+  await yieldToUi();
+}
+
 function setStartupUpdateNoticeVisible(visible) {
   if (!startupUpdateNotice) return;
   startupUpdateNotice.hidden = !visible;
@@ -484,6 +527,8 @@ function createStartupProgressController(segments = []) {
       activeSegmentKey = key;
       segmentStartedAt = performance.now();
       targetPercent = Math.max(targetPercent, segment.start);
+      displayedPercent = Math.max(displayedPercent, segment.start);
+      render();
       ensureRunning();
     },
     setSegmentProgress(key, localPercent = 0) {
@@ -496,6 +541,8 @@ function createStartupProgressController(segments = []) {
       const pct = Math.max(0, Math.min(100, Number(localPercent) || 0));
       const absolute = segment.start + ((segment.end - segment.start) * pct) / 100;
       targetPercent = Math.max(targetPercent, absolute);
+      displayedPercent = Math.max(displayedPercent, absolute);
+      render();
       ensureRunning();
     },
     finishSegment(key) {
@@ -503,11 +550,15 @@ function createStartupProgressController(segments = []) {
       if (!segment) return;
       activeSegmentKey = key;
       targetPercent = Math.max(targetPercent, segment.end);
+      displayedPercent = Math.max(displayedPercent, segment.end);
+      render();
       ensureRunning();
     },
     complete() {
       activeSegmentKey = "";
       targetPercent = 100;
+      displayedPercent = 100;
+      render();
       ensureRunning();
     },
   };
@@ -544,6 +595,7 @@ let invalidPatientLoading = false;
 let invalidPanelHideTimerId = null;
 let patientSearchDebounceId = null;
 let isDbUpdating = false;
+let dbBackgroundRefreshPromise = null;
 let isPreviewFillRunning = false;
 let isPreviewFillStopInFlight = false;
 let previewFillPausedByUser = false;
@@ -1818,6 +1870,7 @@ function setDbStatusIdle() {
 
 function syncDbStatusWithCrawlerState() {
   if (!currentWorkspaceDir) return;
+  if (dbBackgroundRefreshPromise) return;
   if (backgroundCrawlerRunning) {
     setDbStatusUpdating();
     if (dbStatusTime) dbStatusTime.textContent = t("settings.background_crawl");
@@ -2029,12 +2082,14 @@ function setImportWizardPathDisplay(pathValue) {
   if (!importWizardPathEl) return;
   const normalized = String(pathValue ?? "").trim();
   if (!normalized) {
+    importWizardPathEl.dataset.i18n = "settings.import_wizard_folder_none";
     importWizardPathEl.textContent = t("settings.import_wizard_folder_none");
     importWizardPathEl.title = "";
     importWizardPathEl.classList.add("no-path");
     updateImportWizardButtonState();
     return;
   }
+  delete importWizardPathEl.dataset.i18n;
   importWizardPathEl.textContent = normalized;
   importWizardPathEl.title = normalized;
   importWizardPathEl.classList.remove("no-path");
@@ -3256,6 +3311,24 @@ function showMainScreen(workspaceDir) {
 async function showMainScreenWithOptions(workspaceDir, options = {}) {
   const skipLoadPatients = options?.skipLoadPatients ?? false;
   const deferShowUntilReady = options?.deferShowUntilReady ?? false;
+  const startupProgress = options?.startupProgress ?? createStartupProgressController([
+    { key: "indexing", weight: 76, durationMs: 12000, reservePercent: 9 },
+    { key: "dbCount", weight: 5, durationMs: 1400, reservePercent: 12 },
+    { key: "cacheUsage", weight: 5, durationMs: 1100, reservePercent: 12 },
+    { key: "previewMaintenance", weight: 5, durationMs: 1500, reservePercent: 16 },
+    { key: "cacheStatus", weight: 4, durationMs: 1000, reservePercent: 12 },
+    { key: "indexingStatus", weight: 3, durationMs: 900, reservePercent: 10 },
+    { key: "finalize", weight: 2, durationMs: 700, reservePercent: 0 },
+  ]);
+  const setOverallStartupPercent = typeof options?.setOverallStartupPercent === "function"
+    ? options.setOverallStartupPercent
+    : (percent) => {
+      if (startupProgress) {
+        startupProgress.setSegmentProgress("indexing", percent);
+      } else {
+        setContinuousStartupProgressFloor(percent);
+      }
+    };
   const startupBackgroundTasks = [];
   console.log(`[transition ${ts()}] showing main screen`);
   if (!deferShowUntilReady && startupView) startupView.hidden = true;
@@ -3265,35 +3338,32 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
   currentWorkspaceDir = workspaceDir;
   setWorkspacePathDisplay(workspaceDir);
   initialMainReadyInProgress = true;
-  const startupProgress = createStartupProgressController([
-    { key: "indexing", weight: 76, durationMs: 12000, reservePercent: 9 },
-    { key: "dbCount", weight: 5, durationMs: 1400, reservePercent: 12 },
-    { key: "cacheUsage", weight: 5, durationMs: 1100, reservePercent: 12 },
-    { key: "previewMaintenance", weight: 5, durationMs: 1500, reservePercent: 16 },
-    { key: "cacheStatus", weight: 4, durationMs: 1000, reservePercent: 12 },
-    { key: "indexingStatus", weight: 3, durationMs: 900, reservePercent: 10 },
-    { key: "finalize", weight: 2, durationMs: 700, reservePercent: 0 },
-  ]);
   setStartupProcessStatus(t("settings.loading_cache_state"));
-  startupProgress.startSegment("indexing");
-  startupProgress.setSegmentProgress("indexing", 0);
+  startupProgress?.startSegment("indexing");
+  startupProgress?.setSegmentProgress("indexing", 0);
+  setOverallStartupPercent(18);
   if (!skipLoadPatients) {
     await yieldToUi();
     await loadPatients(workspaceDir, {
       onStartupStage: (message) => setStartupProcessStatus(message),
-      onReindexProgress: (percent) => startupProgress.setSegmentProgress("indexing", percent),
+      onReindexProgress: (percent) => setOverallStartupPercent(18 + (Math.max(0, Math.min(100, Number(percent) || 0)) * 0.58)),
     });
   } else {
-    startupProgress.finishSegment("indexing");
+    startupProgress?.finishSegment("indexing");
+    setOverallStartupPercent(76);
   }
-  startupProgress.finishSegment("indexing");
+  startupProgress?.finishSegment("indexing");
+  setOverallStartupPercent(76);
   setStartupProcessStatus(t("settings.startup_counting_indexed_images"));
-  startupProgress.startSegment("dbCount");
+  startupProgress?.startSegment("dbCount");
+  setOverallStartupPercent(81);
   await yieldToUi();
   await refreshPreviewImagesCreatedDbTotalFromStartup(workspaceDir);
-  startupProgress.finishSegment("dbCount");
+  startupProgress?.finishSegment("dbCount");
+  setOverallStartupPercent(83);
   setStartupProcessStatus(t("startup.loading_cache_usage"));
-  startupProgress.startSegment("cacheUsage");
+  startupProgress?.startSegment("cacheUsage");
+  setOverallStartupPercent(84);
   await yieldToUi();
   let cacheStats = null;
   startupBackgroundTasks.push(
@@ -3304,26 +3374,34 @@ async function showMainScreenWithOptions(workspaceDir, options = {}) {
       })
       .catch(() => null)
   );
-  startupProgress.finishSegment("cacheUsage");
+  startupProgress?.finishSegment("cacheUsage");
+  setOverallStartupPercent(88);
   setStartupProcessStatus(t("settings.startup_preparing_preview_maintenance"));
-  startupProgress.startSegment("previewMaintenance");
+  startupProgress?.startSegment("previewMaintenance");
+  setOverallStartupPercent(89);
   await yieldToUi();
   await ensureBackgroundPreviewFill(cacheStats);
-  startupProgress.finishSegment("previewMaintenance");
+  startupProgress?.finishSegment("previewMaintenance");
+  setOverallStartupPercent(93);
   setStartupProcessStatus(t("settings.startup_refreshing_cache_status"));
-  startupProgress.startSegment("cacheStatus");
+  startupProgress?.startSegment("cacheStatus");
+  setOverallStartupPercent(94);
   await yieldToUi();
   startupBackgroundTasks.push(refreshLocalCacheCopyStatus().catch(() => null));
-  startupProgress.finishSegment("cacheStatus");
+  startupProgress?.finishSegment("cacheStatus");
+  setOverallStartupPercent(96);
   setStartupProcessStatus(t("settings.startup_refreshing_indexing_status"));
-  startupProgress.startSegment("indexingStatus");
+  startupProgress?.startSegment("indexingStatus");
+  setOverallStartupPercent(97);
   await yieldToUi();
   await refreshIndexingStatus();
-  startupProgress.finishSegment("indexingStatus");
+  startupProgress?.finishSegment("indexingStatus");
+  setOverallStartupPercent(99);
   setStartupProcessStatus(t("startup.finalizing"));
-  startupProgress.startSegment("finalize");
-  startupProgress.finishSegment("finalize");
-  startupProgress.complete();
+  startupProgress?.startSegment("finalize");
+  startupProgress?.finishSegment("finalize");
+  startupProgress?.complete();
+  completeContinuousStartupProgress();
   await yieldToUi();
   appView.hidden = false;
   if (startupView) startupView.hidden = true;
@@ -3380,7 +3458,130 @@ function syncOnboardingLanguagePickerUi(language = "en") {
   }
 }
 
-async function applyLanguageSelection(language, { persist = false } = {}) {
+async function waitForWorkspaceReindexCompletion(workspaceDir, { allowBlockingFallback = false } = {}) {
+  const normalizedWorkspaceDir = String(workspaceDir ?? "").trim();
+  if (!normalizedWorkspaceDir) {
+    throw new Error("workspace directory is required");
+  }
+
+  let startAccepted = await withTimeout(
+    invoke("start_workspace_reindex", { workspaceDir: normalizedWorkspaceDir }),
+    WORKSPACE_REINDEX_START_TIMEOUT_MS,
+    "start_workspace_reindex",
+  ).catch(() => false);
+
+  if (!startAccepted) {
+    if (dbStatusTime) dbStatusTime.textContent = t("settings.indexing_retrying");
+  }
+
+  while (true) {
+    const status = await withTimeout(
+      invoke("get_workspace_reindex_status"),
+      WORKSPACE_REINDEX_STATUS_TIMEOUT_MS,
+      "get_workspace_reindex_status",
+    ).catch(() => null);
+
+    if (!status) {
+      if (!startAccepted && allowBlockingFallback) {
+        return await withTimeout(
+          invoke("reindex_patient_folders", { workspaceDir: normalizedWorkspaceDir }),
+          WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
+          "reindex_patient_folders fallback",
+        );
+      }
+      await delay(180);
+      continue;
+    }
+
+    const statusWorkspaceDir = String(status?.workspace_dir ?? status?.workspaceDir ?? "").trim();
+    const running = Boolean(status?.running);
+
+    if (statusWorkspaceDir && statusWorkspaceDir !== normalizedWorkspaceDir) {
+      if (!running && !startAccepted) {
+        startAccepted = await withTimeout(
+          invoke("start_workspace_reindex", { workspaceDir: normalizedWorkspaceDir }),
+          WORKSPACE_REINDEX_START_TIMEOUT_MS,
+          "retry start_workspace_reindex",
+        ).catch(() => false);
+      }
+      await delay(120);
+      continue;
+    }
+
+    const completed = Number(status?.completed ?? 0) || 0;
+    const total = Number(status?.total ?? 0) || 0;
+    const statusMessage = String(status?.message ?? "").trim();
+    const importingKeywords = /importing keywords/i.test(statusMessage);
+    if (dbStatusText) {
+      dbStatusText.textContent = importingKeywords ? "importing keywords..." : t("settings.updating");
+    }
+    if (dbStatusTime) {
+      if (running && total > 0) {
+        dbStatusTime.textContent = `${completed}/${total}`;
+      } else if (running) {
+        dbStatusTime.textContent = t("settings.indexing_updating_database");
+      }
+    }
+
+    if (!statusWorkspaceDir && !running && !startAccepted && allowBlockingFallback) {
+      return await withTimeout(
+        invoke("reindex_patient_folders", { workspaceDir: normalizedWorkspaceDir }),
+        WORKSPACE_REINDEX_FALLBACK_TIMEOUT_MS,
+        "reindex_patient_folders fallback",
+      );
+    }
+
+    const errorMessage = String(status?.error ?? "").trim();
+    if (!running) {
+      if (errorMessage) {
+        throw new Error(errorMessage);
+      }
+      return Number(status?.indexed_count ?? status?.indexedCount ?? completed) || 0;
+    }
+
+    await delay(120);
+  }
+}
+
+async function refreshWorkspaceAfterBackgroundReindex(workspaceDir) {
+  const normalizedWorkspaceDir = String(workspaceDir ?? "").trim();
+  if (!normalizedWorkspaceDir || normalizedWorkspaceDir !== String(currentWorkspaceDir ?? "").trim()) return;
+  await searchPatients(patientSearchInput?.value ?? "");
+  await yieldToUi();
+  await refreshInvalidPatientFolderWarning(normalizedWorkspaceDir);
+  await yieldToUi();
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  await mainContent.refreshTimelineForSelection();
+  await yieldToUi();
+  await new Promise((resolve) => requestAnimationFrame(() => resolve()));
+  mainContent.invalidateTreatmentPreviewCache();
+  await mainContent.refreshTreatmentFilesForSelection();
+  await yieldToUi();
+  await refreshIndexingDebugCounts();
+}
+
+function startDatabaseRefreshInBackground(workspaceDir) {
+  const normalizedWorkspaceDir = String(workspaceDir ?? "").trim();
+  if (!normalizedWorkspaceDir || dbBackgroundRefreshPromise) return dbBackgroundRefreshPromise;
+
+  setDbStatusUpdating();
+  dbBackgroundRefreshPromise = (async () => {
+    try {
+      await waitForWorkspaceReindexCompletion(normalizedWorkspaceDir, { allowBlockingFallback: false });
+      await refreshWorkspaceAfterBackgroundReindex(normalizedWorkspaceDir);
+      setDbStatusUpToDate(new Date());
+    } catch (err) {
+      console.error("background database refresh failed:", err);
+      setDbStatusUpToDate(new Date());
+    } finally {
+      dbBackgroundRefreshPromise = null;
+    }
+  })();
+
+  return dbBackgroundRefreshPromise;
+}
+
+async function applyLanguageSelection(language, { persist = false, lightweight = false } = {}) {
   const next = await setLanguage(language, { persist });
   syncLanguagePickerUi(next);
   syncOnboardingLanguagePickerUi(next);
@@ -3394,12 +3595,21 @@ async function applyLanguageSelection(language, { persist = false } = {}) {
   setPreviewPerformanceUi(previewPerformanceMode);
   updateCacheReloadButtonState();
   updateLocalCacheDeleteButtonState();
-  renderPatientList(lastRenderedPatientEntries, lastRenderedFilterText);
+  if (!lightweight) {
+    renderPatientList(lastRenderedPatientEntries, lastRenderedFilterText);
+  }
   if (importWizardPatientLabel) importWizardPatientLabel.textContent = formatWizardPatientLabel();
   if (!String(importWizardEmpty?.textContent ?? "").trim() || importWizardEmpty?.textContent === "Waiting for new files...") {
     if (importWizardEmpty) importWizardEmpty.textContent = t("wizard.waiting_for_new_files");
   }
   return next;
+}
+
+function applyStartupLanguageState(language) {
+  const normalized = String(language ?? "en").trim().toLowerCase() || "en";
+  syncLanguagePickerUi(normalized);
+  syncOnboardingLanguagePickerUi(normalized);
+  applyTranslations(document);
 }
 
 function replaceFolderWithCheckmark() {
@@ -3634,20 +3844,21 @@ async function boot() {
   hydrateLanguageFromStorage();
   applyTranslations(document);
   setDebugState("booting");
-  setStartupProcessStatus(t("startup.loading_settings"));
-  setStartupSpinnerPercent(0);
+  startContinuousStartupProgress(1);
+  await setStartupUiStep(t("startup.checking_updates"), 1);
   setStartupUpdateNoticeVisible(false);
   if (startupView) startupView.hidden = false;
   onboardingView.hidden = true;
   appView.hidden = true;
-  await yieldToUi();
-  await initSystemUpdateStatus();
+  void (async () => {
+    await initSystemUpdateStatus();
+  })();
+  await setStartupUiStep(t("startup.loading_settings"), 8);
   let loadedWorkspaceDir = null;
 
   try {
-    setStartupSpinnerPercent(3);
-    await yieldToUi();
     const settings = await invoke("load_settings");
+    await setStartupUiStep(t("startup.loading_settings"), 12);
 
     console.log("Loaded settings:", settings);
 
@@ -3695,18 +3906,21 @@ async function boot() {
       false
     );
     const language = String(settings?.language ?? "en").trim().toLowerCase() || "en";
+    await setStartupUiStep(t("startup.applying_settings"), 14);
+    importWizardDir = typeof importWizardDirFromSettings === "string"
+      ? importWizardDirFromSettings.trim() || null
+      : null;
+    setImportWizardPathDisplay(importWizardDir);
     keepLocalCacheCopyEnabled = keepLocalCopy;
     backgroundPreviewCreationEnabled = backgroundPreviewCreation;
-    await applyLanguageSelection(language, { persist: false });
+    await setStartupUiStep(t("startup.applying_settings"), 16);
+    applyStartupLanguageState(language);
     if (keepLocalCacheCopyToggle) keepLocalCacheCopyToggle.checked = keepLocalCopy;
     if (backgroundPreviewCreationToggle) {
       backgroundPreviewCreationToggle.checked = backgroundPreviewCreation;
     }
     setCacheSizeUi(cacheSizeGb);
     setPreviewPerformanceUi(previewPerformanceMode);
-    importWizardDir = typeof importWizardDirFromSettings === "string"
-      ? importWizardDirFromSettings.trim() || null
-      : null;
     importWizardWindowState =
       importWizardWindowStateFromSettings &&
       typeof importWizardWindowStateFromSettings === "object"
@@ -3717,11 +3931,12 @@ async function boot() {
       typeof importWizardPreviewWindowStateFromSettings === "object"
         ? importWizardPreviewWindowStateFromSettings
         : null;
-    setImportWizardPathDisplay(importWizardDir);
+    await setStartupUiStep(t("startup.applying_settings"), 18);
     updateImportWizardButtonState();
     console.log("workspaceDir:", workspaceDir);
 
     if (!workspaceDir) {
+      completeContinuousStartupProgress();
       if (startupView) startupView.hidden = true;
       onboardingView.hidden = false;
       appView.hidden = true;
@@ -3731,11 +3946,13 @@ async function boot() {
       return;
     }
 
-    setStartupProcessStatus(t("startup.preparing_workspace"));
-    setStartupSpinnerPercent(8);
-    await yieldToUi();
+    await setStartupUiStep(t("startup.preparing_workspace"), 20);
     void refreshLocalCacheCopyStatus();
-    await showMainScreenWithOptions(workspaceDir, { deferShowUntilReady: true });
+    await showMainScreenWithOptions(workspaceDir, {
+      deferShowUntilReady: true,
+      startupProgress: null,
+      setOverallStartupPercent: (percent) => setContinuousStartupProgressFloor(percent),
+    });
     setDebugState("ready");
 
   } catch (err) {
@@ -3909,12 +4126,7 @@ deleteMainCacheBtn?.addEventListener("click", async () => {
 });
 dbReloadBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || isDbUpdating) return;
-  await loadPatients(currentWorkspaceDir, {
-    minStatusMs: 300,
-    lightweight: true,
-    allowBlockingFallback: false,
-  });
-  void refreshIndexingDebugCounts();
+  void startDatabaseRefreshInBackground(currentWorkspaceDir);
 });
 cacheReloadBtn?.addEventListener("click", async () => {
   if (!currentWorkspaceDir || isPreviewFillStopInFlight) return;

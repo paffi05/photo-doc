@@ -1834,18 +1834,20 @@ export function initMainContent({
 
   function ensureTimelinePointVisible(point) {
     if (!timelineScroll || !point) return;
-    const viewportRect = timelineScroll.getBoundingClientRect();
-    const pointRect = point.getBoundingClientRect();
-    let target = timelineScroll.scrollLeft;
+    const pointLeft = point.offsetLeft;
+    const pointRight = pointLeft + point.offsetWidth;
+    const currentLeft = timelineScroll.scrollLeft;
+    const currentRight = currentLeft + timelineScroll.clientWidth;
+    const viewportPadding = Math.min(56, Math.max(20, Math.round(timelineScroll.clientWidth * 0.08)));
+    const visibleLeft = currentLeft + viewportPadding;
+    const visibleRight = currentRight - viewportPadding;
 
-    if (pointRect.left < viewportRect.left) {
-      target -= viewportRect.left - pointRect.left;
-    } else if (pointRect.right > viewportRect.right) {
-      target += pointRect.right - viewportRect.right;
-    } else {
+    if (pointLeft >= visibleLeft && pointRight <= visibleRight) {
       return;
     }
 
+    const pointCenter = pointLeft + point.offsetWidth / 2;
+    const target = pointCenter - timelineScroll.clientWidth / 2;
     animateTimelineScrollTo(target, 300);
   }
 
