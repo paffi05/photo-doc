@@ -74,6 +74,7 @@ export function initMainContent({
   onPatientKeywordsChanged,
   onCheckMissingPatientIdTaken,
   onSubmitMissingPatientId,
+  onExplorerSelectionChange,
 }) {
   const mainCanvas = appView?.querySelector(".main-canvas") ?? null;
   let imagePreviewWindow = null;
@@ -251,6 +252,15 @@ export function initMainContent({
           scope,
         });
         if (requestId !== latestImagePreviewRequestId) return;
+        await invoke("focus_image_preview_window").catch((focusErr) => {
+          previewTrace("image", "focus_image_preview_window failed", {
+            path,
+            navCount: navigationPaths.length,
+            scope,
+            err: String(focusErr ?? ""),
+          });
+        });
+        if (requestId !== latestImagePreviewRequestId) return;
         previewTrace("image", "window show+emit done", {
           path,
           navCount: navigationPaths.length,
@@ -285,6 +295,11 @@ export function initMainContent({
     onPatientKeywordsChanged: (payload) => {
       if (typeof onPatientKeywordsChanged === "function") {
         onPatientKeywordsChanged(payload);
+      }
+    },
+    onSelectionChange: (selection) => {
+      if (typeof onExplorerSelectionChange === "function") {
+        onExplorerSelectionChange(selection);
       }
     },
   });
@@ -2599,6 +2614,10 @@ export function initMainContent({
     mainCanvas,
     setSelectedPatientHeader,
     clearSelectedPatientHeader,
+    clearExplorerSelection: () => {
+      treatmentFilesPanel.clearSelection();
+    },
+    getExplorerSelection: () => treatmentFilesPanel.getSelection(),
     invalidateTreatmentPreviewCache: () => {
       treatmentFilesPanel.invalidateRuntimePreviewCache();
     },

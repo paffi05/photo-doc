@@ -89,6 +89,7 @@ export function createTreatmentFilesPanel({
   onOpenTreatmentFolder,
   onPreviewLoadingStatusChange,
   onPatientKeywordsChanged,
+  onSelectionChange,
 }) {
   const panel = document.createElement("section");
   panel.className = "treatment-files-panel";
@@ -195,6 +196,8 @@ export function createTreatmentFilesPanel({
   let activeOverviewKeywords = [];
   const optimisticImportPlaceholdersByContext = new Map();
   let optimisticPlaceholderCards = [];
+  let selectedExplorerItemKey = "";
+  let selectedExplorerItem = null;
 
   function formatCounts(imageCount = 0, otherCount = 0, importingCount = 0) {
     return importingCount > 0
@@ -387,6 +390,70 @@ export function createTreatmentFilesPanel({
     listEl.innerHTML = "";
     imagesGridEl.innerHTML = "";
     otherListEl.innerHTML = "";
+    clearExplorerSelection({ silent: true });
+  }
+
+  function getExplorerItemKey(item = null) {
+    const path = String(item?.path ?? "").trim();
+    const kind = String(item?.kind ?? "").trim();
+    return path && kind ? `${kind}::${path}` : "";
+  }
+
+  function emitSelectionChange() {
+    if (typeof onSelectionChange === "function") {
+      onSelectionChange(selectedExplorerItem ? { ...selectedExplorerItem } : null);
+    }
+  }
+
+  function clearExplorerSelection({ silent = false } = {}) {
+    if (selectedExplorerItemKey) {
+      panel
+        .querySelectorAll(".selection-active")
+        .forEach((element) => element.classList.remove("selection-active"));
+    }
+    selectedExplorerItemKey = "";
+    selectedExplorerItem = null;
+    if (!silent) emitSelectionChange();
+  }
+
+  function setExplorerSelection(item = null, element = null) {
+    const nextKey = getExplorerItemKey(item);
+    if (!nextKey || !element) {
+      clearExplorerSelection();
+      return;
+    }
+    if (selectedExplorerItemKey === nextKey) {
+      clearExplorerSelection();
+      return;
+    }
+    panel
+      .querySelectorAll(".selection-active")
+      .forEach((entry) => entry.classList.remove("selection-active"));
+    element.classList.add("selection-active");
+    selectedExplorerItemKey = nextKey;
+    selectedExplorerItem = { ...item };
+    emitSelectionChange();
+  }
+
+  function attachSelectionControl(element, item) {
+    if (!element || !item) return;
+    const selectBtn = document.createElement("span");
+    selectBtn.className = "explorer-item-select-btn";
+    selectBtn.setAttribute("role", "button");
+    selectBtn.setAttribute("tabindex", "0");
+    selectBtn.setAttribute("aria-label", "Select item");
+    selectBtn.setAttribute("title", "Select item");
+    const toggleSelection = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setExplorerSelection(item, element);
+    };
+    selectBtn.addEventListener("click", toggleSelection);
+    selectBtn.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      toggleSelection(event);
+    });
+    element.appendChild(selectBtn);
   }
 
   function setLoadingState(folderName = "") {
@@ -791,6 +858,17 @@ export function createTreatmentFilesPanel({
     card.type = "button";
     card.className = "treatment-folder-overview-card";
     card.title = folderName || treatmentName || "Folder";
+    attachSelectionControl(card, {
+      kind: "folder",
+      scope: "patient_overview",
+      path: activeContext?.workspaceDir && activeContext?.patientFolder && folderName
+        ? `${activeContext.workspaceDir}\\${activeContext.patientFolder}\\${folderName}`
+        : "",
+      name: treatmentName || folderName || "Folder",
+      workspaceDir: activeContext?.workspaceDir ?? "",
+      patientFolder: activeContext?.patientFolder ?? "",
+      treatmentFolder: folderName,
+    });
 
     const stack = document.createElement("span");
     stack.className = "treatment-folder-stack";
@@ -1229,6 +1307,16 @@ export function createTreatmentFilesPanel({
       <span class="treatment-image-thumb fallback">IMG</span>
       <span class="treatment-image-name">${file.name}</span>
     `;
+    attachSelectionControl(card, {
+      kind: "file",
+      scope: String(options?.scope ?? "").trim() || "treatment",
+      path: String(file?.path ?? "").trim(),
+      name: String(file?.name ?? "").trim(),
+      isImage: true,
+      workspaceDir: activeContext?.workspaceDir ?? "",
+      patientFolder: activeContext?.patientFolder ?? "",
+      treatmentFolder: activeContext?.treatmentFolder ?? "",
+    });
     let dragged = false;
     card.addEventListener("click", () => {
       if (dragged) {
@@ -1286,6 +1374,16 @@ export function createTreatmentFilesPanel({
         <span class="treatment-file-list-date">${dateText || "-"}</span>
       </span>
     `;
+    attachSelectionControl(row, {
+      kind: "file",
+      scope: String(options?.scope ?? "").trim() || (activeContext?.treatmentFolder ? "treatment" : "patient_root"),
+      path: String(file?.path ?? "").trim(),
+      name: String(file?.name ?? "").trim(),
+      isImage,
+      workspaceDir: activeContext?.workspaceDir ?? "",
+      patientFolder: activeContext?.patientFolder ?? "",
+      treatmentFolder: activeContext?.treatmentFolder ?? "",
+    });
     row.addEventListener("click", () => {
       if (typeof onOpenPath === "function") {
         void onOpenPath({
@@ -1996,6 +2094,8 @@ export function createTreatmentFilesPanel({
     clear: clearPanel,
     setContext,
     setPatientOverview: setPatientOverviewContext,
+    clearSelection: () => clearExplorerSelection(),
+    getSelection: () => (selectedExplorerItem ? { ...selectedExplorerItem } : null),
     isActiveTreatmentContext: ({ workspaceDir = "", patientFolder = "", treatmentFolder = "" } = {}) => (
       getContextKey(workspaceDir, patientFolder, treatmentFolder) === activeContextKey &&
       !panel.hidden
