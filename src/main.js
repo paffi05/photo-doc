@@ -37,6 +37,10 @@ const onboardingLanguageCodeFr = document.getElementById("onboardingLanguageCode
 
 const openBtn = document.getElementById("openSettings");
 const openImportWizardBtn = document.getElementById("openImportWizard");
+const explorerSelectionActions = document.getElementById("explorerSelectionActions");
+const explorerDeleteActionBtn = document.getElementById("explorerDeleteAction");
+const explorerCopyActionBtn = document.getElementById("explorerCopyAction");
+const explorerCutActionBtn = document.getElementById("explorerCutAction");
 const closeImportWizardBtn = document.getElementById("closeImportWizard");
 const importWizardPanel = document.getElementById("importWizardPanel");
 const importWizardLivePreviewToggle = document.getElementById("importWizardLivePreviewToggle");
@@ -83,6 +87,7 @@ const deleteMainCacheRow = document.getElementById("deleteMainCacheRow");
 const deleteMainCacheLabel = document.getElementById("deleteMainCacheLabel");
 const openLocalCacheCopyFolderBtn = document.getElementById("openLocalCacheCopyFolderBtn");
 const patientSearchInput = document.getElementById("patientSearchInput");
+const patientSearchResultCount = document.getElementById("patientSearchResultCount");
 const patientList = document.getElementById("patientList");
 const patientListWrap = document.querySelector(".patient-list-wrap");
 const addPatientForm = document.getElementById("addPatientForm");
@@ -638,6 +643,7 @@ let previewFillIdleTimerId = null;
 let previewFillLastAttemptMs = 0;
 let selectedPatient = null;
 let selectedPatientId = "";
+let activeExplorerSelection = null;
 let addPatientIdTaken = false;
 let addPatientIdChecking = false;
 let addPatientIdCheckToken = 0;
@@ -817,6 +823,10 @@ const mainContent = initMainContent({
   },
   onPatientKeywordsChanged: async () => {
     await searchPatients(patientSearchInput?.value ?? "");
+  },
+  onExplorerSelectionChange: (selection) => {
+    activeExplorerSelection = selection ? { ...selection } : null;
+    updateExplorerSelectionActionState();
   },
   onCheckMissingPatientIdTaken: async (patientId) => {
     if (!currentWorkspaceDir) return false;
@@ -1900,6 +1910,7 @@ function normalizePatientEntry(entry) {
       patientId: "",
       keywords: [],
       matchedKeywords: [],
+      matchedFolders: [],
       invalidFolder: false,
     };
   }
@@ -1911,6 +1922,9 @@ function normalizePatientEntry(entry) {
   const keywordsRaw = Array.isArray(entry?.keywords) ? entry.keywords : [];
   const matchedKeywordsRaw = Array.isArray(entry?.matched_keywords ?? entry?.matchedKeywords)
     ? (entry?.matched_keywords ?? entry?.matchedKeywords)
+    : [];
+  const matchedFoldersRaw = Array.isArray(entry?.matched_folders ?? entry?.matchedFolders)
+    ? (entry?.matched_folders ?? entry?.matchedFolders)
     : [];
   const normalizeKeywords = (list) => {
     const seen = new Set();
@@ -1927,10 +1941,11 @@ function normalizePatientEntry(entry) {
   };
   const keywords = normalizeKeywords(keywordsRaw);
   const matchedKeywords = normalizeKeywords(matchedKeywordsRaw);
+  const matchedFolders = normalizeKeywords(matchedFoldersRaw);
   const invalidFolder = Boolean(entry?.invalid_folder ?? entry?.invalidFolder ?? false);
   const invalidStart = Boolean(entry?.invalid_start ?? entry?.invalidStart ?? false);
 
-  return { folderName, patientId, keywords, matchedKeywords, invalidFolder, invalidStart };
+  return { folderName, patientId, keywords, matchedKeywords, matchedFolders, invalidFolder, invalidStart };
 }
 
 function splitPatientSearchTerms(query = "") {
@@ -2715,6 +2730,7 @@ function buildPatientListItem(entry) {
     patientId,
     keywords,
     matchedKeywords,
+    matchedFolders,
     invalidFolder,
     invalidStart,
   } = normalizePatientEntry(entry);
@@ -2801,10 +2817,18 @@ function buildPatientListItem(entry) {
     item.appendChild(editBtn);
   }
 
+  if (matchedFolders.length > 0) {
+    const foldersMeta = document.createElement("span");
+    foldersMeta.className = "patient-meta";
+    foldersMeta.textContent = matchedFolders.join(", ");
+    foldersMeta.title = matchedFolders.join(", ");
+    item.appendChild(foldersMeta);
+  }
+
   const shownKeywords = matchedKeywords.length > 0 ? matchedKeywords : [];
   if (shownKeywords.length > 0) {
     const meta = document.createElement("span");
-    meta.className = "patient-keywords";
+    meta.className = "patient-meta patient-keywords";
     meta.textContent = shownKeywords.join(", ");
     meta.title = keywords.length > 0 ? keywords.join(", ") : shownKeywords.join(", ");
     item.appendChild(meta);
@@ -2891,6 +2915,16 @@ function appendPatientListRows(rows) {
   patientList.appendChild(fragment);
   schedulePatientNameTruncationRefresh();
   ensureSelectedPatientVisibleInList();
+  updatePatientSearchResultCount(lastRenderedPatientEntries.length);
+}
+
+function updatePatientSearchResultCount(count = 0) {
+  if (!patientSearchResultCount) return;
+  const hasActiveSearch = String(activePatientSearchQuery ?? "").trim().length > 0;
+  patientSearchResultCount.hidden = !hasActiveSearch;
+  if (!hasActiveSearch) return;
+  const normalizedCount = Number.isFinite(count) ? Math.max(0, Math.trunc(count)) : 0;
+  patientSearchResultCount.textContent = normalizedCount === 1 ? "1 result" : `${normalizedCount} results`;
 }
 
 function renderPatientList(entries, filterText = "") {
@@ -2898,6 +2932,7 @@ function renderPatientList(entries, filterText = "") {
   const renderToken = ++patientListRenderToken;
   lastRenderedPatientEntries = entries;
   lastRenderedFilterText = filterText;
+  updatePatientSearchResultCount(entries.length);
 
   patientList.innerHTML = "";
   patientList.classList.remove("is-empty-state");
@@ -4003,6 +4038,90 @@ pickIcon?.addEventListener("click", async () => {
   if (onboardingStep !== "folder") return;
   if (onboardingReadyWorkspaceDir || isWorkspaceSetupInProgress) return;
   await pickWorkspaceAndSave();
+});
+
+function updateExplorerSelectionActionState() {
+  const hasSelection = Boolean(activeExplorerSelection?.path);
+  if (explorerSelectionActions) {
+    explorerSelectionActions.hidden = !hasSelection;
+  }
+  if (explorerDeleteActionBtn) explorerDeleteActionBtn.disabled = !hasSelection;
+  if (explorerCopyActionBtn) explorerCopyActionBtn.disabled = !hasSelection;
+  if (explorerCutActionBtn) explorerCutActionBtn.disabled = !hasSelection;
+}
+
+async function refreshAfterExplorerMutation() {
+  if (!currentWorkspaceDir) return;
+  try {
+    await invoke("reindex_patient_folders", { workspaceDir: currentWorkspaceDir });
+  } catch (err) {
+    console.error("reindex_patient_folders after explorer mutation failed:", err);
+  }
+  await mainContent.refreshTimelineForSelection();
+  await mainContent.refreshTreatmentFilesForSelection();
+  activeExplorerSelection = mainContent.getExplorerSelection();
+  updateExplorerSelectionActionState();
+}
+
+async function chooseDestinationDirectory() {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Choose destination folder",
+  });
+  return normalizeDialogPathSelection(selected);
+}
+
+async function runExplorerSelectionAction(action) {
+  const selection = activeExplorerSelection;
+  const path = String(selection?.path ?? "").trim();
+  if (!path) return;
+  try {
+    if (action === "delete") {
+      await invoke("delete_explorer_items", {
+        workspaceDir: currentWorkspaceDir,
+        paths: [path],
+      });
+      mainContent.clearExplorerSelection();
+      activeExplorerSelection = null;
+      updateExplorerSelectionActionState();
+      await refreshAfterExplorerMutation();
+      return;
+    }
+    const destinationDir = await chooseDestinationDirectory();
+    if (!destinationDir) return;
+    if (action === "copy") {
+      await invoke("copy_explorer_items_to_destination", {
+        workspaceDir: currentWorkspaceDir,
+        paths: [path],
+        destinationDir,
+      });
+      return;
+    }
+    if (action === "cut") {
+      await invoke("move_explorer_items_to_destination", {
+        workspaceDir: currentWorkspaceDir,
+        paths: [path],
+        destinationDir,
+      });
+      mainContent.clearExplorerSelection();
+      activeExplorerSelection = null;
+      updateExplorerSelectionActionState();
+      await refreshAfterExplorerMutation();
+    }
+  } catch (err) {
+    console.error(`explorer ${action} action failed:`, err);
+  }
+}
+
+explorerDeleteActionBtn?.addEventListener("click", () => {
+  void runExplorerSelectionAction("delete");
+});
+explorerCopyActionBtn?.addEventListener("click", () => {
+  void runExplorerSelectionAction("copy");
+});
+explorerCutActionBtn?.addEventListener("click", () => {
+  void runExplorerSelectionAction("cut");
 });
 onboardingNextBtn?.addEventListener("click", () => {
   restoreOnboardingIdleState();

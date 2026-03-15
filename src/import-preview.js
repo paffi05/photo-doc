@@ -2,6 +2,9 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { FULL_TRACE } from "./trace-config";
 import { applyTranslations, initLanguageFromSettings, onLanguageChanged, t } from "./i18n";
+import { buildCalibrationMetadata, computeMarkerCalibration, formatCalibrationDebug } from "./image-calibration-geometry";
+import { createCalibrationState, resetCalibrationState, setCalibrationProcessing } from "./image-calibration-state";
+import { getAiButtonMarkup, getCalibrationStatusText } from "./image-calibration-ui";
 
 const params = new URLSearchParams(window.location.search);
 const previewMode = params.get("mode") === "image" ? "image" : "wizard";
@@ -16,6 +19,8 @@ const previewRoot = document.querySelector(".preview-root");
 const drawCanvas = document.getElementById("drawCanvas");
 const previewLoading = document.getElementById("previewLoading");
 const previewToolbar = document.getElementById("previewToolbar");
+const alignMarkersBtn = document.getElementById("alignMarkersBtn");
+const alignMarkersBtnContent = document.getElementById("alignMarkersBtnContent");
 const markBtn = document.getElementById("markBtn");
 const measureBtn = document.getElementById("measureBtn");
 const measureCalibrationInput = document.getElementById("measureCalibrationInput");
@@ -30,6 +35,12 @@ const drawSaveSuggestions = document.getElementById("drawSaveSuggestions");
 const drawSaveSuggestionsList = document.getElementById("drawSaveSuggestionsList");
 const drawSaveBtn = document.getElementById("drawSaveBtn");
 const rotateRightBtn = document.getElementById("rotateRightBtn");
+const calibrationFaceBounds = document.getElementById("calibrationFaceBounds");
+const calibrationMarkerLeft = document.getElementById("calibrationMarkerLeft");
+const calibrationMarkerRight = document.getElementById("calibrationMarkerRight");
+const calibrationAiBadge = document.getElementById("calibrationAiBadge");
+const calibrationInstructionPanel = document.getElementById("calibrationInstructionPanel");
+const calibrationDebugPanel = document.getElementById("calibrationDebugPanel");
 const navPrevBtn = document.getElementById("navPrevBtn");
 const navNextBtn = document.getElementById("navNextBtn");
 let previewRequestToken = 0;
@@ -82,6 +93,7 @@ let calibrationReferencePixels = null;
 let calibrationReferenceSegmentIndex = -1;
 let drawCanvasRenderScale = 1;
 let currentStroke = null;
+const calibrationState = createCalibrationState();
 const toolbarHiddenForMode = previewMode === "wizard";
 
 if (toolbarHiddenForMode && previewToolbar) {
@@ -100,8 +112,19 @@ let previewPatientFolder = "";
 let folderRefreshRequestId = 0;
 const ROTATION_UI_STATE_STORAGE_KEY = "mpm.imagePreviewRotationUiState.v1";
 const DRAW_COLOR_PALETTE_STORAGE_KEY = "mpm.imagePreviewDrawPalette.v1";
+const DEBUG_PREF_KEY = "showFrontendDebug";
 const PREVIEW_TRACE_FORWARD_TO_RUST = FULL_TRACE;
 const SAVE_BUTTON_ORANGE = "#fb923c";
+let showFrontendDebug = false;
+let activeCalibrationHandle = null;
+let activeCalibrationDragPoint = null;
+let aiCalibrationRequested = false;
+let aiCalibrationCompleted = false;
+let aiCalibrationPath = "";
+let faceZoomAnimationFrame = 0;
+let calibrationRotationDisplayDeg = 0;
+let calibrationRotationAnimationFrame = 0;
+let noFaceResetTimer = 0;
 
 function previewTrace(scope, message, extra = null) {
   const ts = new Date().toISOString();
@@ -130,6 +153,12 @@ previewTrace("boot", "import-preview script loaded", {
   mode: previewMode,
   eventName: previewEventName,
 });
+if (calibrationAiBadge) {
+  calibrationAiBadge.hidden = true;
+  calibrationAiBadge.style.display = "none";
+}
+setCalibrationButtonProcessing(false);
+updateCalibrationBadgePosition();
 
 function normalizePath(value) {
   return String(value ?? "").trim();
@@ -218,8 +247,9 @@ function updatePanCursorState() {
 }
 
 function applyTransform() {
+  const totalRotationDeg = getTotalRotationDeg();
   const transform =
-    `translate(-50%, -50%) translate(${translateX}px, ${translateY}px) rotate(${rotationDeg}deg) scale(${currentScale})`;
+    `translate(-50%, -50%) translate(${translateX}px, ${translateY}px) rotate(${totalRotationDeg}deg) scale(${currentScale})`;
   if (previewImage) {
     previewImage.style.transform = transform;
   }
@@ -233,7 +263,66 @@ function applyTransform() {
   } else {
     redrawDrawCanvas();
   }
+  updateCalibrationBadgePosition();
+  updateCalibrationMarkerHandles();
+  updateCalibrationFaceBounds();
   updatePanCursorState();
+}
+
+function cancelFaceZoomAnimation() {
+  if (faceZoomAnimationFrame) {
+    cancelAnimationFrame(faceZoomAnimationFrame);
+    faceZoomAnimationFrame = 0;
+  }
+}
+
+function clearNoFaceResetTimer() {
+  if (noFaceResetTimer) {
+    clearTimeout(noFaceResetTimer);
+    noFaceResetTimer = 0;
+  }
+}
+
+function cancelCalibrationRotationAnimation() {
+  if (calibrationRotationAnimationFrame) {
+    cancelAnimationFrame(calibrationRotationAnimationFrame);
+    calibrationRotationAnimationFrame = 0;
+  }
+}
+
+function syncCalibrationRotationDisplay(immediateValue = null) {
+  cancelCalibrationRotationAnimation();
+  calibrationRotationDisplayDeg = Number(
+    immediateValue ?? calibrationState.metadata?.rotationAngleDeg ?? 0
+  ) || 0;
+}
+
+function animateCalibrationRotationTo(targetDeg) {
+  const nextTarget = Number(targetDeg) || 0;
+  const startDeg = Number(calibrationRotationDisplayDeg) || 0;
+  cancelCalibrationRotationAnimation();
+  if (Math.abs(nextTarget - startDeg) < 0.001) {
+    calibrationRotationDisplayDeg = nextTarget;
+    applyTransform();
+    return;
+  }
+  const durationMs = 300;
+  const startTime = performance.now();
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  const tick = (now) => {
+    const progress = Math.min(1, (now - startTime) / durationMs);
+    const eased = easeOutCubic(progress);
+    calibrationRotationDisplayDeg = startDeg + ((nextTarget - startDeg) * eased);
+    applyTransform();
+    if (progress < 1) {
+      calibrationRotationAnimationFrame = requestAnimationFrame(tick);
+      return;
+    }
+    calibrationRotationDisplayDeg = nextTarget;
+    calibrationRotationAnimationFrame = 0;
+    applyTransform();
+  };
+  calibrationRotationAnimationFrame = requestAnimationFrame(tick);
 }
 
 function drawColorToCss(color) {
@@ -273,6 +362,253 @@ function hasMeasurementSegments() {
 
 function updateMeasurementToolbarState() {
   previewToolbar?.classList.toggle("has-measurements", hasMeasurementSegments());
+}
+
+function shouldKeepToolbarVisible() {
+  return Boolean(
+    calibrationState.metadata.isProcessing ||
+    calibrationState.manualMode ||
+    calibrationState.metadata.calibrationStatus === "success" ||
+    activeCalibrationHandle
+  );
+}
+
+function hasCancelableCalibrationFlow() {
+  return Boolean(
+    calibrationState.metadata.isProcessing ||
+    calibrationState.manualMode ||
+    calibrationState.metadata.calibrationStatus === "failed"
+  );
+}
+
+function updateCalibrationButtonActiveState() {
+  alignMarkersBtn?.classList.toggle(
+    "active-state",
+    !calibrationState.metadata.isProcessing &&
+    (calibrationState.manualMode || calibrationState.metadata.calibrationStatus === "failed")
+  );
+}
+
+function syncDebugVisibilityFromStorage() {
+  try {
+    const raw = localStorage.getItem(DEBUG_PREF_KEY);
+    showFrontendDebug = raw === "true";
+  } catch {
+    showFrontendDebug = false;
+  }
+  updateCalibrationDebugPanel();
+}
+
+function setCalibrationButtonProcessing(isProcessing) {
+  alignMarkersBtn?.classList.toggle("processing", Boolean(isProcessing));
+  if (alignMarkersBtn) alignMarkersBtn.disabled = Boolean(isProcessing);
+  if (!alignMarkersBtnContent) return;
+  if (isProcessing) {
+    alignMarkersBtnContent.innerHTML = `<span class="preview-toolbar-btn-spinner" aria-hidden="true"></span>`;
+    updateCalibrationButtonActiveState();
+    setControlsVisible(true);
+    return;
+  }
+  alignMarkersBtnContent.innerHTML = getAiButtonMarkup();
+  if (calibrationAiBadge) calibrationAiBadge.innerHTML = getAiButtonMarkup();
+  updateCalibrationButtonActiveState();
+}
+
+function updateCalibrationBadgePosition() {
+  const shouldShow = Boolean(
+    aiCalibrationRequested &&
+    aiCalibrationCompleted &&
+    aiCalibrationPath &&
+    aiCalibrationPath === currentPreviewPath &&
+    calibrationState.metadata.calibrationStatus === "success" &&
+    !calibrationState.metadata.isProcessing
+  );
+  if (
+    !calibrationAiBadge ||
+    !shouldShow
+  ) {
+    if (calibrationAiBadge) {
+      calibrationAiBadge.hidden = true;
+      calibrationAiBadge.style.display = "none";
+    }
+    return;
+  }
+  calibrationAiBadge.hidden = false;
+  calibrationAiBadge.style.display = "grid";
+}
+
+function updateCalibrationFaceBounds() {
+  if (!(calibrationFaceBounds instanceof HTMLElement)) return;
+  const faceBounds = calibrationState.metadata?.faceBounds;
+  if (
+    !showFrontendDebug ||
+    !faceBounds ||
+    !(Number(faceBounds.width) > 0) ||
+    !(Number(faceBounds.height) > 0)
+  ) {
+    calibrationFaceBounds.hidden = true;
+    return;
+  }
+  const topLeft = getRootPointFromImagePoint({ x: faceBounds.x, y: faceBounds.y });
+  const topRight = getRootPointFromImagePoint({ x: faceBounds.x + faceBounds.width, y: faceBounds.y });
+  const bottomLeft = getRootPointFromImagePoint({ x: faceBounds.x, y: faceBounds.y + faceBounds.height });
+  if (!topLeft || !topRight || !bottomLeft) {
+    calibrationFaceBounds.hidden = true;
+    return;
+  }
+  calibrationFaceBounds.hidden = false;
+  calibrationFaceBounds.style.left = `${topLeft.x}px`;
+  calibrationFaceBounds.style.top = `${topLeft.y}px`;
+  calibrationFaceBounds.style.width = `${Math.max(0, topRight.x - topLeft.x)}px`;
+  calibrationFaceBounds.style.height = `${Math.max(0, bottomLeft.y - topLeft.y)}px`;
+}
+
+function updateCalibrationDebugPanel() {
+  if (!calibrationDebugPanel) return;
+  if (!showFrontendDebug) {
+    calibrationDebugPanel.hidden = true;
+    updateCalibrationFaceBounds();
+    return;
+  }
+  const lines = formatCalibrationDebug(calibrationState.metadata);
+  const points = [];
+  if (calibrationState.metadata.leftMarkerCenter) {
+    points.push(`left: ${Number(calibrationState.metadata.leftMarkerCenter.x).toFixed(1)}, ${Number(calibrationState.metadata.leftMarkerCenter.y).toFixed(1)}`);
+  }
+  if (calibrationState.metadata.rightMarkerCenter) {
+    points.push(`right: ${Number(calibrationState.metadata.rightMarkerCenter.x).toFixed(1)}, ${Number(calibrationState.metadata.rightMarkerCenter.y).toFixed(1)}`);
+  }
+  const allLines = [
+    ...lines,
+    ...points,
+  ].filter(Boolean);
+  calibrationDebugPanel.hidden = allLines.length < 1;
+  calibrationDebugPanel.textContent = allLines.join("\n");
+  updateCalibrationFaceBounds();
+}
+
+function updateCalibrationInstructionPanel() {
+  if (!calibrationInstructionPanel) return;
+  const noFaceMessage = t("preview.no_face_detected");
+  const shouldShowNoFaceMessage =
+    !calibrationState.manualMode &&
+    String(calibrationState.lastError ?? "").trim() === noFaceMessage &&
+    calibrationState.metadata.calibrationStatus === "failed";
+  if (!calibrationState.manualMode && !shouldShowNoFaceMessage) {
+    calibrationInstructionPanel.hidden = true;
+    calibrationInstructionPanel.textContent = "";
+    return;
+  }
+  calibrationInstructionPanel.hidden = false;
+  if (shouldShowNoFaceMessage) {
+    calibrationInstructionPanel.textContent = noFaceMessage;
+    return;
+  }
+  calibrationInstructionPanel.textContent = calibrationState.manualStep < 1
+    ? t("preview.select_left_marker")
+    : t("preview.select_right_marker");
+}
+
+function getTranslationForCenteredImagePoint(imagePoint, scale = currentScale) {
+  if (!imagePoint) return { x: translateX, y: translateY };
+  const localX = Number(imagePoint.x ?? 0) - (baseImageWidth / 2);
+  const localY = Number(imagePoint.y ?? 0) - (baseImageHeight / 2);
+  const angle = (getTotalRotationDeg() * Math.PI) / 180;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const rotatedX = (localX * cos) - (localY * sin);
+  const rotatedY = (localX * sin) + (localY * cos);
+  return clampTranslation(-(rotatedX * scale), -(rotatedY * scale), scale);
+}
+
+function maybeZoomToFaceBounds() {
+  const faceBounds = calibrationState.metadata?.faceBounds;
+  const faceDetectionSource = String(calibrationState.metadata?.faceDetectionSource ?? "").trim().toLowerCase();
+  if (
+    faceDetectionSource === "head" ||
+    !faceBounds ||
+    !(Number(faceBounds.width) > 0) ||
+    !(Number(faceBounds.height) > 0)
+  ) {
+    return;
+  }
+  const { height: rootHeight } = getRootSize();
+  const faceHeight = Number(faceBounds.height) || 0;
+  if (!(rootHeight > 0) || !(faceHeight > 0)) return;
+  const targetScale = clampScale((rootHeight * 0.8) / faceHeight);
+  if (!Number.isFinite(targetScale) || targetScale <= 0) return;
+  if (currentScale >= targetScale * 0.9) return;
+  const faceCenter = {
+    x: Number(faceBounds.x) + (Number(faceBounds.width) / 2),
+    y: Number(faceBounds.y) + (Number(faceBounds.height) / 2),
+  };
+  const startScale = currentScale;
+  const startTranslateX = translateX;
+  const startTranslateY = translateY;
+  const endCentered = getTranslationForCenteredImagePoint(faceCenter, targetScale);
+  const endTranslateX = endCentered.x;
+  const endTranslateY = endCentered.y;
+  const durationMs = 700;
+  const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+  cancelFaceZoomAnimation();
+  const startTime = performance.now();
+
+  const tick = (now) => {
+    const progress = Math.min(1, (now - startTime) / durationMs);
+    const eased = easeOutCubic(progress);
+    currentScale = startScale + ((targetScale - startScale) * eased);
+    translateX = startTranslateX + ((endTranslateX - startTranslateX) * eased);
+    translateY = startTranslateY + ((endTranslateY - startTranslateY) * eased);
+    applyTransform();
+    if (progress < 1) {
+      faceZoomAnimationFrame = requestAnimationFrame(tick);
+      return;
+    }
+    faceZoomAnimationFrame = 0;
+  };
+
+  faceZoomAnimationFrame = requestAnimationFrame(tick);
+}
+
+function normalizeFaceBoundsFromMarkers(
+  leftPoint,
+  rightPoint,
+  existingFaceBounds = calibrationState.metadata?.faceBounds ?? null,
+  options = {},
+) {
+  if (!leftPoint || !rightPoint) return existingFaceBounds ?? null;
+  const manualFixedWidth = Boolean(options?.manualFixedWidth);
+  const markerDistance = Math.max(
+    1,
+    Math.hypot(
+      Number(rightPoint.x) - Number(leftPoint.x),
+      Number(rightPoint.y) - Number(leftPoint.y),
+    ),
+  );
+  const markerCenterX = (Number(leftPoint.x) + Number(rightPoint.x)) / 2;
+  const markerCenterY = (Number(leftPoint.y) + Number(rightPoint.y)) / 2;
+  const minWidth = markerDistance * 0.8;
+  const maxWidth = markerDistance * 1.2;
+  let width = maxWidth;
+  let height = markerDistance * 1.35;
+
+  if (!manualFixedWidth && existingFaceBounds && Number(existingFaceBounds.width) > 0 && Number(existingFaceBounds.height) > 0) {
+    width = Math.min(maxWidth, Math.max(minWidth, Number(existingFaceBounds.width)));
+    height = Math.max(height, Number(existingFaceBounds.height), width);
+  }
+
+  width = Math.min(width, baseImageWidth * 0.92);
+  height = Math.min(Math.max(height, width), Math.min(baseImageHeight * 0.92, width * 1.5));
+  const x = Math.max(0, markerCenterX - (width / 2));
+  const y = Math.max(0, markerCenterY - (height / 2));
+  const clampedWidth = Math.max(0, Math.min(width, baseImageWidth - x));
+  const clampedHeight = Math.max(0, Math.min(height, baseImageHeight - y));
+  return {
+    x,
+    y,
+    width: clampedWidth,
+    height: clampedHeight,
+  };
 }
 
 function formatMeasurementMm(value) {
@@ -452,7 +788,7 @@ function getImagePointFromClient(clientX, clientY) {
   const centerY = (rootHeight / 2) + translateY;
   const scaledX = (point.x - centerX) / currentScale;
   const scaledY = (point.y - centerY) / currentScale;
-  const angle = (-rotationDeg * Math.PI) / 180;
+  const angle = (-getTotalRotationDeg() * Math.PI) / 180;
   const cos = Math.cos(angle);
   const sin = Math.sin(angle);
   const localX = (scaledX * cos) - (scaledY * sin);
@@ -502,12 +838,13 @@ function redrawDrawCanvas() {
     }
   }
   drawMeasurementSegments(ctx, sx, sy);
+  drawCalibrationOverlay(ctx, sx, sy);
 }
 
 function drawCrossMarker(ctx, x, y, size, color) {
   ctx.save();
   ctx.strokeStyle = color;
-  ctx.lineWidth = Math.max(1.4, size * 0.12);
+  ctx.lineWidth = Math.max(0.8, size * 0.07);
   ctx.lineCap = "round";
   ctx.beginPath();
   ctx.moveTo(x - size, y);
@@ -515,6 +852,10 @@ function drawCrossMarker(ctx, x, y, size, color) {
   ctx.moveTo(x, y - size);
   ctx.lineTo(x, y + size);
   ctx.stroke();
+  ctx.fillStyle = "#000000";
+  ctx.beginPath();
+  ctx.arc(x, y, Math.max(1, size * 0.12), 0, Math.PI * 2);
+  ctx.fill();
   ctx.restore();
 }
 
@@ -532,6 +873,126 @@ function getMeasurementLabelPosition(segment, markerSize = 0) {
     fallbackX,
     fallbackY,
   };
+}
+
+function getTotalRotationDeg() {
+  return rotationDeg + calibrationRotationDisplayDeg;
+}
+
+function getRootPointFromImagePoint(imagePoint) {
+  if (!imagePoint) return null;
+  const { width: rootWidth, height: rootHeight } = getRootSize();
+  const localX = Number(imagePoint.x ?? 0) - (baseImageWidth / 2);
+  const localY = Number(imagePoint.y ?? 0) - (baseImageHeight / 2);
+  const angle = (getTotalRotationDeg() * Math.PI) / 180;
+  const cos = Math.cos(angle);
+  const sin = Math.sin(angle);
+  const rotatedX = (localX * cos) - (localY * sin);
+  const rotatedY = (localX * sin) + (localY * cos);
+  return {
+    x: (rootWidth / 2) + translateX + (rotatedX * currentScale),
+    y: (rootHeight / 2) + translateY + (rotatedY * currentScale),
+  };
+}
+
+function normalizePointToPreviewCoordinates(point) {
+  const x = Number(point?.x);
+  const y = Number(point?.y);
+  const naturalWidth = Number(previewImage?.naturalWidth) || 0;
+  const naturalHeight = Number(previewImage?.naturalHeight) || 0;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    naturalWidth <= 0 ||
+    naturalHeight <= 0 ||
+    baseImageWidth <= 0 ||
+    baseImageHeight <= 0
+  ) {
+    return point;
+  }
+  return {
+    x: (x / naturalWidth) * baseImageWidth,
+    y: (y / naturalHeight) * baseImageHeight,
+  };
+}
+
+function normalizeRectToPreviewCoordinates(rect) {
+  const x = Number(rect?.x);
+  const y = Number(rect?.y);
+  const width = Number(rect?.width);
+  const height = Number(rect?.height);
+  const naturalWidth = Number(previewImage?.naturalWidth) || 0;
+  const naturalHeight = Number(previewImage?.naturalHeight) || 0;
+  if (
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    naturalWidth <= 0 ||
+    naturalHeight <= 0 ||
+    baseImageWidth <= 0 ||
+    baseImageHeight <= 0
+  ) {
+    return rect;
+  }
+  return {
+    x: (x / naturalWidth) * baseImageWidth,
+    y: (y / naturalHeight) * baseImageHeight,
+    width: (width / naturalWidth) * baseImageWidth,
+    height: (height / naturalHeight) * baseImageHeight,
+  };
+}
+
+function updateCalibrationMarkerHandles() {
+  const manualLeft = calibrationState.manualPoints[0] ?? null;
+  const manualRight = calibrationState.manualPoints[1] ?? null;
+  const pairs = [
+    [
+      calibrationMarkerLeft,
+      activeCalibrationHandle === "left" && activeCalibrationDragPoint
+        ? activeCalibrationDragPoint
+        : (calibrationState.manualMode ? manualLeft : calibrationState.metadata?.leftMarkerCenter),
+      "left",
+    ],
+    [
+      calibrationMarkerRight,
+      activeCalibrationHandle === "right" && activeCalibrationDragPoint
+        ? activeCalibrationDragPoint
+        : (calibrationState.manualMode ? manualRight : calibrationState.metadata?.rightMarkerCenter),
+      "right",
+    ],
+  ];
+  for (const [el, point, side] of pairs) {
+    if (
+      !(el instanceof HTMLElement) ||
+      !point ||
+      calibrationState.metadata.isProcessing ||
+      (!calibrationState.manualMode && calibrationState.metadata.calibrationStatus !== "success")
+    ) {
+      if (el instanceof HTMLElement) el.hidden = true;
+      continue;
+    }
+    const rootPoint = getRootPointFromImagePoint(point);
+    if (!rootPoint) {
+      el.hidden = true;
+      continue;
+    }
+    el.hidden = false;
+    el.dataset.markerSide = side;
+    el.style.left = `${rootPoint.x}px`;
+    el.style.top = `${rootPoint.y}px`;
+  }
+}
+
+function findCalibrationHandleHit(clientX, clientY) {
+  for (const el of [calibrationMarkerLeft, calibrationMarkerRight]) {
+    if (!(el instanceof HTMLElement) || el.hidden) continue;
+    const rect = el.getBoundingClientRect();
+    if (clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom) {
+      return el;
+    }
+  }
+  return null;
 }
 
 function getMeasurementLabelRect(ctx, text, x, y) {
@@ -689,8 +1150,8 @@ function getMeasurementLabelTextColor(segment) {
 }
 
 function drawMeasurementSegments(ctx, sx, sy) {
-  const markerSize = Math.max(6, 5.5 * Math.max(sx, sy));
-  const lineWidth = Math.max(1.2, 1.05 * Math.max(sx, sy));
+  const markerSize = Math.max(3.5, 3.1 * Math.max(sx, sy));
+  const lineWidth = Math.max(0.9, 0.72 * Math.max(sx, sy));
   for (const segment of measurementSegments) {
     if (!segment?.start || !segment?.end) continue;
     const ax = segment.start.x * sx;
@@ -714,7 +1175,7 @@ function drawMeasurementSegments(ctx, sx, sy) {
     const anchor = getMeasurementLeaderAnchor(segment);
     ctx.save();
     ctx.strokeStyle = "rgba(226,232,240,0.95)";
-    ctx.lineWidth = Math.max(0.8, 0.75 * Math.max(sx, sy));
+    ctx.lineWidth = Math.max(0.5, 0.42 * Math.max(sx, sy));
     ctx.setLineDash([3, 3]);
     ctx.beginPath();
     ctx.moveTo(anchor.x * sx, anchor.y * sy);
@@ -746,6 +1207,12 @@ function drawMeasurementSegments(ctx, sx, sy) {
     drawCrossMarker(ctx, ax, ay, markerSize, "#f8fafc");
     drawCrossMarker(ctx, bx, by, markerSize, "#f8fafc");
   }
+}
+
+function drawCalibrationOverlay(ctx, sx, sy) {
+  void ctx;
+  void sx;
+  void sy;
 }
 
 function continueDrawingTo(clientX, clientY) {
@@ -833,6 +1300,287 @@ function commitCalibrationInput() {
   }
   measureCalibrationInput.focus();
   measureCalibrationInput.select();
+}
+
+function applyCalibrationResult(metadataInput) {
+  const nextRotationDeg = Number(metadataInput?.rotationAngleDeg ?? 0) || 0;
+  calibrationState.metadata = buildCalibrationMetadata(metadataInput);
+  calibrationState.manualMode = false;
+  calibrationState.manualStep = 0;
+  calibrationState.manualPoints = [];
+  calibrationState.lastError = "";
+  calibrationMmPerPx = calibrationState.metadata.mmPerPx > 0 ? calibrationState.metadata.mmPerPx : null;
+  calibrationReferencePixels = calibrationState.metadata.markerDistancePx > 0 ? calibrationState.metadata.markerDistancePx : null;
+  setControlsVisible(true);
+  updateMeasurementValues();
+  updateCalibrationDebugPanel();
+  updateCalibrationInstructionPanel();
+  applyTransform();
+  maybeZoomToFaceBounds();
+  updateCalibrationButtonActiveState();
+  animateCalibrationRotationTo(nextRotationDeg);
+}
+
+function recomputeCalibrationFromCurrentMarkers(source = calibrationState.metadata.calibrationSource || "manual") {
+  const left = calibrationState.metadata.leftMarkerCenter;
+  const right = calibrationState.metadata.rightMarkerCenter;
+  if (!left || !right) return;
+  const computed = computeMarkerCalibration(left, right);
+  applyCalibrationResult({
+    ...computed,
+    calibrationStatus: "success",
+    detectionConfidence: Number(calibrationState.metadata.detectionConfidence) || 1,
+    isProcessing: false,
+    calibrationSource: source,
+    faceBounds: normalizeFaceBoundsFromMarkers(left, right, calibrationState.metadata?.faceBounds ?? null),
+    faceDetectionSource: calibrationState.metadata?.faceDetectionSource ?? null,
+  });
+}
+
+function setCalibrationFailure(message, metadataInput = {}) {
+  aiCalibrationCompleted = false;
+  aiCalibrationPath = "";
+  calibrationState.metadata = buildCalibrationMetadata({
+    ...metadataInput,
+    calibrationStatus: "failed",
+    isProcessing: false,
+  });
+  calibrationState.lastError = localizeCalibrationErrorMessage(message, "preview.calibration_failed");
+  syncCalibrationRotationDisplay(0);
+  updateCalibrationDebugPanel();
+  updateCalibrationInstructionPanel();
+  redrawDrawCanvas();
+  updateCalibrationBadgePosition();
+  maybeZoomToFaceBounds();
+  updateCalibrationButtonActiveState();
+}
+
+function enableManualCalibrationMode(reason = "") {
+  aiCalibrationCompleted = false;
+  aiCalibrationPath = "";
+  calibrationState.manualMode = true;
+  calibrationState.manualStep = 0;
+  calibrationState.manualPoints = [];
+  calibrationState.lastError = String(reason ?? "");
+  previewRoot?.classList.add("calibration-manual-mode");
+  setControlsVisible(true);
+  updateCalibrationDebugPanel();
+  updateCalibrationInstructionPanel();
+  redrawDrawCanvas();
+  updateCalibrationButtonActiveState();
+}
+
+function disableManualCalibrationMode() {
+  calibrationState.manualMode = false;
+  calibrationState.manualStep = 0;
+  calibrationState.manualPoints = [];
+  previewRoot?.classList.remove("calibration-manual-mode");
+  updateCalibrationDebugPanel();
+  updateCalibrationInstructionPanel();
+  updateCalibrationButtonActiveState();
+}
+
+function cancelCalibrationFlow() {
+  clearNoFaceResetTimer();
+  cancelFaceZoomAnimation();
+  syncCalibrationRotationDisplay(0);
+  calibrationState.requestId += 1;
+  setCalibrationProcessing(calibrationState, false);
+  stopCalibrationHandleDrag();
+  resetCalibrationState(calibrationState);
+  calibrationMmPerPx = null;
+  calibrationReferencePixels = null;
+  aiCalibrationRequested = false;
+  aiCalibrationCompleted = false;
+  aiCalibrationPath = "";
+  previewRoot?.classList.remove("calibration-manual-mode");
+  updateMeasurementValues();
+  updateCalibrationDebugPanel();
+  updateCalibrationInstructionPanel();
+  setCalibrationButtonProcessing(false);
+  updateCalibrationBadgePosition();
+  redrawDrawCanvas();
+  applyTransform();
+}
+
+function isNoFaceDetectionFailure(message) {
+  return localizeCalibrationErrorMessage(message, "preview.no_face_detected").trim().toLowerCase()
+    === t("preview.no_face_detected").trim().toLowerCase();
+}
+
+function scheduleNoFaceReset() {
+  clearNoFaceResetTimer();
+  noFaceResetTimer = window.setTimeout(() => {
+    noFaceResetTimer = 0;
+    cancelCalibrationFlow();
+  }, 3000);
+}
+
+function localizeCalibrationErrorMessage(message, fallbackKey = "preview.calibration_failed") {
+  const normalized = String(message ?? "").trim();
+  if (!normalized) return t(fallbackKey);
+  const mapping = new Map([
+    ["No face detected.", "preview.no_face_detected"],
+    ["Calibration failed.", "preview.calibration_failed"],
+    ["Manual calibration failed.", "preview.manual_calibration_failed"],
+    ["Automatic detection failed.", "preview.auto_detection_failed"],
+    ["Automatic detection was too uncertain. Manual calibration is enabled.", "preview.auto_detection_uncertain"],
+  ]);
+  const key = mapping.get(normalized);
+  return key ? t(key) : normalized;
+}
+
+function startCalibrationHandleDrag(handle, pointerId) {
+  if (!(handle instanceof HTMLElement)) return;
+  activeCalibrationHandle = handle.dataset.markerSide || null;
+  if (calibrationState.manualMode) {
+    activeCalibrationDragPoint = activeCalibrationHandle === "left"
+      ? calibrationState.manualPoints[0] ?? null
+      : calibrationState.manualPoints[1] ?? null;
+  } else {
+    activeCalibrationDragPoint = activeCalibrationHandle === "left"
+      ? calibrationState.metadata?.leftMarkerCenter ?? null
+      : calibrationState.metadata?.rightMarkerCenter ?? null;
+  }
+  handle.classList.add("dragging");
+  handle.setPointerCapture?.(pointerId);
+  setControlsVisible(true);
+  redrawDrawCanvas();
+  updateCalibrationMarkerHandles();
+}
+
+function finalizeManualCalibration() {
+  if (calibrationState.manualPoints.length < 2) return;
+  try {
+    const [first, second] = calibrationState.manualPoints;
+    const computed = computeMarkerCalibration(first, second);
+    disableManualCalibrationMode();
+    applyCalibrationResult({
+      ...computed,
+      calibrationStatus: "success",
+      detectionConfidence: 1,
+      isProcessing: false,
+      calibrationSource: "manual",
+      faceBounds: normalizeFaceBoundsFromMarkers(first, second, calibrationState.metadata?.faceBounds ?? null, {
+        manualFixedWidth: true,
+      }),
+      faceDetectionSource: calibrationState.metadata?.faceDetectionSource ?? null,
+      detectionConfidenceCutoff: calibrationState.metadata?.detectionConfidenceCutoff ?? 0.55,
+    });
+  } catch (err) {
+    setCalibrationFailure(localizeCalibrationErrorMessage(err, "preview.manual_calibration_failed"), {
+      faceBounds: calibrationState.metadata?.faceBounds ?? null,
+      detectionConfidenceCutoff: calibrationState.metadata?.detectionConfidenceCutoff ?? 0.55,
+    });
+  }
+}
+
+function stopCalibrationHandleDrag(pointerId = null) {
+  if (!activeCalibrationHandle) return;
+  const handle = activeCalibrationHandle === "left" ? calibrationMarkerLeft : calibrationMarkerRight;
+  const dragSide = activeCalibrationHandle;
+  const dragPoint = activeCalibrationDragPoint;
+  handle?.classList.remove("dragging");
+  if (pointerId !== null) {
+    handle?.releasePointerCapture?.(pointerId);
+  }
+  activeCalibrationHandle = null;
+  activeCalibrationDragPoint = null;
+  if (dragPoint) {
+    if (calibrationState.manualMode) {
+      const index = dragSide === "left" ? 0 : 1;
+      calibrationState.manualPoints[index] = dragPoint;
+      calibrationState.manualStep = calibrationState.manualPoints.length;
+      updateCalibrationDebugPanel();
+      updateCalibrationInstructionPanel();
+      redrawDrawCanvas();
+      updateCalibrationMarkerHandles();
+      if (calibrationState.manualPoints.length >= 2) {
+        finalizeManualCalibration();
+      }
+      return;
+    }
+    const key = dragSide === "left" ? "leftMarkerCenter" : "rightMarkerCenter";
+    calibrationState.metadata = {
+      ...calibrationState.metadata,
+      [key]: dragPoint,
+    };
+    recomputeCalibrationFromCurrentMarkers("manual-refine");
+    return;
+  }
+  redrawDrawCanvas();
+  updateCalibrationMarkerHandles();
+}
+
+async function runAlignAndCalibrateMarkers() {
+  if (!currentPreviewPath || calibrationState.metadata.isProcessing) return;
+  const requestId = ++calibrationState.requestId;
+  aiCalibrationRequested = true;
+  aiCalibrationCompleted = false;
+  aiCalibrationPath = currentPreviewPath;
+  disableManualCalibrationMode();
+  setControlsVisible(true);
+  setCalibrationProcessing(calibrationState, true);
+  updateCalibrationDebugPanel();
+  setCalibrationButtonProcessing(true);
+  try {
+    await new Promise((resolve) => requestAnimationFrame(resolve));
+    const result = await invoke("detect_glasses_markers", { path: currentPreviewPath });
+    if (requestId !== calibrationState.requestId) return;
+    const confidence = Number(result?.detection_confidence ?? result?.detectionConfidence ?? 0) || 0;
+    const left = normalizePointToPreviewCoordinates(result?.left_marker_center ?? result?.leftMarkerCenter ?? null);
+    const right = normalizePointToPreviewCoordinates(result?.right_marker_center ?? result?.rightMarkerCenter ?? null);
+    const faceBounds = normalizeRectToPreviewCoordinates(result?.face_bounds ?? result?.faceBounds ?? null);
+    const faceDetectionSource = String(result?.face_detection_source ?? result?.faceDetectionSource ?? "").trim() || null;
+    if (!left || !right || confidence < 0.55) {
+      const errorMessage = localizeCalibrationErrorMessage(result?.error, "preview.auto_detection_uncertain");
+      setCalibrationFailure(
+        errorMessage,
+        {
+          detectionConfidence: confidence,
+          detectionConfidenceCutoff: 0.55,
+          faceBounds,
+          faceDetectionSource,
+        },
+      );
+      if (isNoFaceDetectionFailure(errorMessage)) {
+        scheduleNoFaceReset();
+        return;
+      }
+      enableManualCalibrationMode(errorMessage);
+      return;
+    }
+    const computed = computeMarkerCalibration(left, right);
+    applyCalibrationResult({
+      ...computed,
+      calibrationStatus: "success",
+      detectionConfidence: confidence,
+      detectionConfidenceCutoff: 0.55,
+      isProcessing: false,
+      calibrationSource: "auto",
+      faceBounds,
+      faceDetectionSource,
+    });
+    aiCalibrationCompleted = true;
+    updateCalibrationBadgePosition();
+  } catch (err) {
+    console.error("align and calibrate markers failed:", err);
+    const errorMessage = localizeCalibrationErrorMessage(err, "preview.calibration_failed");
+    setCalibrationFailure(errorMessage);
+    if (isNoFaceDetectionFailure(errorMessage)) {
+      scheduleNoFaceReset();
+    } else {
+      enableManualCalibrationMode(t("preview.auto_detection_failed"));
+    }
+  } finally {
+    if (requestId === calibrationState.requestId) {
+      setCalibrationProcessing(calibrationState, false);
+    }
+    setCalibrationButtonProcessing(false);
+    updateCalibrationDebugPanel();
+    redrawDrawCanvas();
+    applyTransform();
+  }
 }
 
 function normalizeRotationSteps(value) {
@@ -1035,6 +1783,7 @@ function setControlsVisible(visible) {
 }
 
 function toggleControlsVisible() {
+  if (shouldKeepToolbarVisible() && controlsVisible) return;
   setControlsVisible(!controlsVisible);
 }
 
@@ -1261,6 +2010,9 @@ async function exportAnnotatedTempFile() {
     })),
     previewWidth: Math.max(1, baseImageWidth),
     previewHeight: Math.max(1, baseImageHeight),
+    calibrationTransform: calibrationState.metadata.calibrationStatus === "success"
+      ? { rotationAngleDeg: Number(calibrationState.metadata.rotationAngleDeg) || 0 }
+      : null,
   });
 }
 
@@ -1335,6 +2087,8 @@ function updateBaseImageSize() {
 }
 
 function resetTransform() {
+  cancelFaceZoomAnimation();
+  syncCalibrationRotationDisplay(0);
   currentScale = MIN_SCALE;
   rotationDeg = 0;
   translateX = 0;
@@ -1433,9 +2187,20 @@ async function setPreview(path) {
   if (!normalized) return;
   const startedAt = performance.now();
   previewTrace("setPreview", "start", { path: normalized });
+  clearNoFaceResetTimer();
   currentPreviewPath = normalized;
   resetTransform();
   clearDrawCanvas();
+  resetCalibrationState(calibrationState);
+  aiCalibrationRequested = false;
+  aiCalibrationCompleted = false;
+  aiCalibrationPath = "";
+  disableManualCalibrationMode();
+  stopCalibrationHandleDrag();
+  updateCalibrationDebugPanel();
+  updateCalibrationInstructionPanel();
+  setCalibrationButtonProcessing(false);
+  updateCalibrationBadgePosition();
   rotationDeg = getOptimisticRotationOverrideDeg(normalized);
   if (normalizeRotationSteps(pendingRotationStepsByPath.get(normalized) ?? 0) > 0) {
     schedulePendingRotationSave(normalized);
@@ -1610,7 +2375,13 @@ previewRoot?.addEventListener("wheel", (event) => {
 }, { passive: false });
 
 previewRoot?.addEventListener("pointerdown", (event) => {
-  if (markModeActive || measureModeActive) return;
+  const calibrationHandleHit = findCalibrationHandleHit(event.clientX, event.clientY);
+  if (calibrationHandleHit) {
+    event.preventDefault();
+    startCalibrationHandleDrag(calibrationHandleHit, event.pointerId);
+    return;
+  }
+  if (markModeActive || measureModeActive || calibrationState.manualMode) return;
   if (event.target instanceof Element && event.target.closest(".preview-nav")) return;
   if (event.target instanceof Element && event.target.closest(".preview-toolbar")) return;
 
@@ -1645,7 +2416,15 @@ previewRoot?.addEventListener("pointerdown", (event) => {
 });
 
 previewRoot?.addEventListener("pointermove", (event) => {
-  if (markModeActive || measureModeActive) return;
+  if (activeCalibrationHandle) {
+    const point = getImagePointFromClient(event.clientX, event.clientY);
+    if (!point) return;
+    activeCalibrationDragPoint = point;
+    redrawDrawCanvas();
+    updateCalibrationMarkerHandles();
+    return;
+  }
+  if (markModeActive || measureModeActive || calibrationState.manualMode) return;
   if (event.pointerType === "touch") {
     if (!activeTouchPoints.has(event.pointerId)) return;
     activeTouchPoints.set(event.pointerId, { x: event.clientX, y: event.clientY });
@@ -1713,6 +2492,7 @@ function stopMousePan(pointerId) {
 }
 
 previewRoot?.addEventListener("pointerup", (event) => {
+  stopCalibrationHandleDrag(event.pointerId);
   if (event.pointerType === "mouse") {
     stopMousePan(event.pointerId);
   }
@@ -1720,6 +2500,7 @@ previewRoot?.addEventListener("pointerup", (event) => {
 });
 
 previewRoot?.addEventListener("pointercancel", (event) => {
+  stopCalibrationHandleDrag(event.pointerId);
   if (event.pointerType === "mouse") {
     stopMousePan(event.pointerId);
   }
@@ -1739,6 +2520,16 @@ window.addEventListener("resize", () => {
   translateY = 0;
   updateBaseImageSize();
   applyTransform();
+});
+
+window.addEventListener("storage", (event) => {
+  if (event.key === DEBUG_PREF_KEY) {
+    syncDebugVisibilityFromStorage();
+  }
+});
+
+window.addEventListener("focus", () => {
+  syncDebugVisibilityFromStorage();
 });
 
 window.addEventListener("pointerdown", (event) => {
@@ -1768,6 +2559,7 @@ window.addEventListener("pointerdown", (event) => {
 
 previewRoot?.addEventListener("click", (event) => {
   if (!(event.target instanceof Element)) return;
+  if (shouldKeepToolbarVisible()) return;
   if (event.target.closest(".draw-canvas")) return;
   if (event.target.closest(".preview-nav")) return;
   if (event.target.closest(".preview-toolbar")) return;
@@ -1776,6 +2568,9 @@ previewRoot?.addEventListener("click", (event) => {
 });
 
 rotateRightBtn?.addEventListener("click", () => {
+  if (hasCancelableCalibrationFlow()) {
+    cancelCalibrationFlow();
+  }
   if (!currentPreviewPath) return;
   const path = currentPreviewPath;
   addPendingRotationStep(path);
@@ -1793,11 +2588,31 @@ rotateRightBtn?.addEventListener("click", () => {
   schedulePendingRotationSave(path);
 });
 
+alignMarkersBtn?.addEventListener("click", () => {
+  if (hasCancelableCalibrationFlow()) {
+    cancelCalibrationFlow();
+    return;
+  }
+  if (markModeActive) {
+    setMarkModeActive(false);
+  }
+  if (measureModeActive) {
+    setMeasureModeActive(false);
+  }
+  void runAlignAndCalibrateMarkers();
+});
+
 markBtn?.addEventListener("click", () => {
+  if (hasCancelableCalibrationFlow()) {
+    cancelCalibrationFlow();
+  }
   setMarkModeActive(!markModeActive);
 });
 
 measureBtn?.addEventListener("click", () => {
+  if (hasCancelableCalibrationFlow()) {
+    cancelCalibrationFlow();
+  }
   setMeasureModeActive(!measureModeActive);
 });
 
@@ -2000,6 +2815,9 @@ drawSaveBtn?.addEventListener("click", () => {
         measurements: committedMeasurements,
         previewWidth,
         previewHeight,
+        calibrationTransform: calibrationState.metadata.calibrationStatus === "success"
+          ? { rotationAngleDeg: Number(calibrationState.metadata.rotationAngleDeg) || 0 }
+          : null,
       });
       const result = await invoke("start_import_files", {
         workspaceDir: previewWorkspaceDir,
@@ -2039,6 +2857,24 @@ drawSaveBtn?.addEventListener("click", () => {
 });
 
 drawCanvas?.addEventListener("pointerdown", (event) => {
+  if (calibrationState.manualMode) {
+    if (event.button !== undefined && event.button !== 0) return;
+    const point = getImagePointFromClient(event.clientX, event.clientY);
+    if (!point) return;
+    const index = calibrationState.manualStep < 1 ? 0 : 1;
+    calibrationState.manualPoints[index] = point;
+    calibrationState.manualStep = Math.min(2, calibrationState.manualPoints.length);
+    activeCalibrationHandle = index === 0 ? "left" : "right";
+    activeCalibrationDragPoint = point;
+    const handle = activeCalibrationHandle === "left" ? calibrationMarkerLeft : calibrationMarkerRight;
+    handle?.classList.add("dragging");
+    drawCanvas?.setPointerCapture?.(event.pointerId);
+    updateCalibrationDebugPanel();
+    updateCalibrationInstructionPanel();
+    redrawDrawCanvas();
+    updateCalibrationMarkerHandles();
+    return;
+  }
   if (!markModeActive && !measureModeActive) return;
   if (measureModeActive && event.button === 2) {
     event.preventDefault();
@@ -2126,6 +2962,16 @@ drawCanvas?.addEventListener("pointerdown", (event) => {
 });
 
 drawCanvas?.addEventListener("pointermove", (event) => {
+  if (calibrationState.manualMode) {
+    if (activeCalibrationHandle) {
+      const point = getImagePointFromClient(event.clientX, event.clientY);
+      if (!point) return;
+      activeCalibrationDragPoint = point;
+      redrawDrawCanvas();
+      updateCalibrationMarkerHandles();
+    }
+    return;
+  }
   if (measureModeActive) {
     if (activeMeasurementLabelDrag) {
       const segment = measurementSegments[activeMeasurementLabelDrag.index];
@@ -2160,6 +3006,9 @@ function stopDrawing(pointerId = null) {
 }
 
 drawCanvas?.addEventListener("pointerup", (event) => {
+  if (calibrationState.manualMode && activeCalibrationHandle) {
+    drawCanvas?.releasePointerCapture?.(event.pointerId);
+  }
   if (activeMeasurementLabelDrag) {
     activeMeasurementLabelDrag = null;
     setMeasurementLabelDragging(false);
@@ -2171,6 +3020,9 @@ drawCanvas?.addEventListener("pointerup", (event) => {
 });
 
 drawCanvas?.addEventListener("pointercancel", (event) => {
+  if (calibrationState.manualMode && activeCalibrationHandle) {
+    drawCanvas?.releasePointerCapture?.(event.pointerId);
+  }
   activeMeasurementLabelDrag = null;
   setMeasurementLabelDragging(false);
   setMeasurementLabelHover(false);
@@ -2205,6 +3057,7 @@ void listen(previewEventName, (event) => {
   setSaveDropdownOpen(false);
   if (drawSaveSuggestionsList) drawSaveSuggestionsList.innerHTML = "";
   updateCalibrationDisplay();
+  updateCalibrationDebugPanel();
   if (!path) {
     setNavigationPaths(paths);
     updateNavigationButtons();
@@ -2233,7 +3086,10 @@ void (async () => {
     resizeDrawCanvas();
     applyInitialDrawPalette();
     setSelectedDrawColor(drawColorToCss("white"));
+    syncDebugVisibilityFromStorage();
     updateCalibrationDisplay();
+    updateCalibrationDebugPanel();
+    updateCalibrationInstructionPanel();
     setCalibrationEditing(false);
     setControlsVisible(false);
     const navStart = performance.now();

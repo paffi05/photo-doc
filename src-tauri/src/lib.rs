@@ -50,6 +50,64 @@ struct AnnotatedMeasurement {
     label_height: f32,
 }
 
+#[derive(Deserialize, Clone, Default)]
+struct CalibrationExportTransform {
+    rotation_angle_deg: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct MarkerPoint {
+    x: f32,
+    y: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct MarkerDetectionCandidate {
+    center: MarkerPoint,
+    radius: f32,
+    score: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct MarkerFaceBounds {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default)]
+struct MarkerDetectionResult {
+    success: bool,
+    calibration_status: String,
+    detection_confidence: f32,
+    left_marker_center: Option<MarkerPoint>,
+    right_marker_center: Option<MarkerPoint>,
+    rotation_angle_deg: Option<f32>,
+    marker_distance_px: Option<f32>,
+    px_per_mm: Option<f32>,
+    mm_per_px: Option<f32>,
+    face_bounds: Option<MarkerFaceBounds>,
+    candidates: Vec<MarkerDetectionCandidate>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PythonMarkerDetectionResult {
+    success: bool,
+    calibration_status: String,
+    detection_confidence: f32,
+    left_marker_center: Option<MarkerPoint>,
+    right_marker_center: Option<MarkerPoint>,
+    rotation_angle_deg: Option<f32>,
+    marker_distance_px: Option<f32>,
+    px_per_mm: Option<f32>,
+    mm_per_px: Option<f32>,
+    face_bounds: Option<MarkerFaceBounds>,
+    candidates: Vec<MarkerDetectionCandidate>,
+    error: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 #[serde(default)]
 struct Settings {
@@ -508,6 +566,7 @@ struct PatientSearchRow {
     patient_id: String,
     keywords: Vec<String>,
     matched_keywords: Vec<String>,
+    matched_folders: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -5338,6 +5397,8 @@ fn open_image_preview_window(
         window.show().map_err(|e| e.to_string())?;
         preview_trace("image-open", "window.show() returned");
     }
+    let _ = window.unminimize();
+    let _ = window.set_focus();
     preview_trace("image-open", "calling window.emit(image-preview-file)");
     window
         .emit(
@@ -5358,6 +5419,17 @@ fn open_image_preview_window(
             started.elapsed().as_millis()
         ),
     );
+    Ok(true)
+}
+
+#[tauri::command]
+fn focus_image_preview_window(app_handle: tauri::AppHandle) -> Result<bool, String> {
+    let Some(window) = app_handle.get_webview_window("image_preview") else {
+        return Ok(false);
+    };
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
     Ok(true)
 }
 
@@ -5561,6 +5633,116 @@ fn draw_annotated_stroke(
     }
 }
 
+fn path_is_same_or_inside_dir(path: &Path, dir: &Path) -> bool {
+    if let (Ok(path_canon), Ok(dir_canon)) = (path.canonicalize(), dir.canonicalize()) {
+        return path_canon == dir_canon || path_canon.starts_with(dir_canon);
+    }
+    path == dir || path.starts_with(dir)
+}
+
+fn validate_workspace_item_paths(workspace_dir: &str, paths: &[String]) -> Result<Vec<PathBuf>, String> {
+    let workspace = PathBuf::from(workspace_dir.trim());
+    if !workspace.exists() || !workspace.is_dir() {
+        return Err("workspace directory does not exist".to_string());
+    }
+    let workspace_canon = workspace.canonicalize().map_err(|e| e.to_string())?;
+    let mut normalized = Vec::new();
+    for raw in paths {
+        let candidate = PathBuf::from(raw.trim());
+        if !candidate.exists() {
+          return Err("selected item does not exist".to_string());
+        }
+        let canonical = candidate.canonicalize().map_err(|e| e.to_string())?;
+        if !canonical.starts_with(&workspace_canon) {
+            return Err("selected item is outside the workspace".to_string());
+        }
+        normalized.push(canonical);
+    }
+    Ok(normalized)
+}
+
+fn copy_path_to_destination(source: &Path, destination_root: &Path) -> Result<String, String> {
+    if source.is_dir() {
+        let folder_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| "source folder name is invalid".to_string())?;
+        let destination = non_conflicting_folder_path(destination_root, &folder_name);
+        if path_is_same_or_inside_dir(destination_root, source) {
+            return Err("destination cannot be inside the selected folder".to_string());
+        }
+        copy_dir_recursive(source, &destination)?;
+        return Ok(destination.to_string_lossy().to_string());
+    }
+    if source.is_file() {
+        let file_name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .ok_or_else(|| "source file name is invalid".to_string())?;
+        let destination = non_conflicting_file_path(destination_root, &file_name);
+        fs::copy(source, &destination).map_err(|e| e.to_string())?;
+        return Ok(destination.to_string_lossy().to_string());
+    }
+    Err("selected item is neither a file nor a folder".to_string())
+}
+
+#[tauri::command]
+fn copy_explorer_items_to_destination(
+    workspace_dir: String,
+    paths: Vec<String>,
+    destination_dir: String,
+) -> Result<Vec<String>, String> {
+    let destination_root = PathBuf::from(destination_dir.trim());
+    if !destination_root.exists() || !destination_root.is_dir() {
+        return Err("destination directory does not exist".to_string());
+    }
+    let sources = validate_workspace_item_paths(&workspace_dir, &paths)?;
+    let mut copied = Vec::new();
+    for source in sources {
+        copied.push(copy_path_to_destination(&source, &destination_root)?);
+    }
+    Ok(copied)
+}
+
+#[tauri::command]
+fn move_explorer_items_to_destination(
+    workspace_dir: String,
+    paths: Vec<String>,
+    destination_dir: String,
+) -> Result<Vec<String>, String> {
+    let destination_root = PathBuf::from(destination_dir.trim());
+    if !destination_root.exists() || !destination_root.is_dir() {
+        return Err("destination directory does not exist".to_string());
+    }
+    let sources = validate_workspace_item_paths(&workspace_dir, &paths)?;
+    let mut moved = Vec::new();
+    for source in sources {
+        let target = copy_path_to_destination(&source, &destination_root)?;
+        if source.is_dir() {
+            fs::remove_dir_all(&source).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_file(&source).map_err(|e| e.to_string())?;
+        }
+        moved.push(target);
+    }
+    Ok(moved)
+}
+
+#[tauri::command]
+fn delete_explorer_items(workspace_dir: String, paths: Vec<String>) -> Result<(), String> {
+    let sources = validate_workspace_item_paths(&workspace_dir, &paths)?;
+    for source in sources {
+        if source.is_dir() {
+            fs::remove_dir_all(&source).map_err(|e| e.to_string())?;
+        } else if source.is_file() {
+            fs::remove_file(&source).map_err(|e| e.to_string())?;
+        } else {
+            return Err("selected item is neither a file nor a folder".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn draw_measurement_cross(
     image: &mut image::RgbaImage,
     center_x: f32,
@@ -5568,7 +5750,7 @@ fn draw_measurement_cross(
     size: f32,
     color: image::Rgba<u8>,
 ) {
-    let radius = (size * 0.12).max(0.8);
+    let radius = (size * 0.07).max(0.45);
     let steps = (size.ceil() as usize).max(1);
     for step in 0..=steps {
         let t = step as f32 / steps as f32;
@@ -5576,6 +5758,13 @@ fn draw_measurement_cross(
         stamp_circle(image, center_x + offset, center_y, radius, color);
         stamp_circle(image, center_x, center_y + offset, radius, color);
     }
+    stamp_circle(
+        image,
+        center_x,
+        center_y,
+        (size * 0.12).max(0.8),
+        image::Rgba([0, 0, 0, 255]),
+    );
 }
 
 fn draw_measurement_line(
@@ -5755,8 +5944,8 @@ fn draw_annotated_measurement(
     let bx = measurement.end.x * scale_x;
     let by = measurement.end.y * scale_y;
     let base_scale = scale_x.max(scale_y).max(1.0);
-    let line_radius = (0.8 * base_scale).max(0.8);
-    let marker_size = (5.5 * base_scale).max(6.0);
+    let line_radius = (0.5 * base_scale).max(0.5);
+    let marker_size = (3.1 * base_scale).max(3.5);
     let has_custom_label_position = measurement.label_x.is_finite()
         && measurement.label_y.is_finite()
         && measurement.label_x > 0.0
@@ -5798,7 +5987,7 @@ fn draw_annotated_measurement(
         anchor_y,
         label_x,
         label_y,
-        (0.45 * base_scale).max(0.45),
+        (0.28 * base_scale).max(0.28),
         leader_color,
     );
     if !measurement.label_data_url.trim().is_empty() {
@@ -5825,6 +6014,370 @@ fn draw_annotated_measurement(
     }
 }
 
+fn grayscale_at(image: &image::GrayImage, x: i32, y: i32) -> u8 {
+    let width = image.width() as i32;
+    let height = image.height() as i32;
+    let clamped_x = x.clamp(0, width.saturating_sub(1));
+    let clamped_y = y.clamp(0, height.saturating_sub(1));
+    image.get_pixel(clamped_x as u32, clamped_y as u32)[0]
+}
+
+fn refine_marker_center(gray: &image::GrayImage, rough_center_x: f32, rough_center_y: f32, radius: f32) -> MarkerPoint {
+    let _ = (gray, radius);
+    MarkerPoint {
+        x: rough_center_x,
+        y: rough_center_y,
+    }
+}
+
+fn detect_glasses_markers_with_rust(path: &str) -> Result<MarkerDetectionResult, String> {
+    const TARGET_MARKER_DISTANCE_MM: f32 = 140.0;
+    let source = PathBuf::from(path.trim());
+    if !source.exists() || !source.is_file() {
+        return Err("source image does not exist".to_string());
+    }
+    if !is_supported_preview_image(&source) {
+        return Err("unsupported image format".to_string());
+    }
+    let decoded = image::ImageReader::open(&source)
+        .map_err(|e| e.to_string())?
+        .decode()
+        .map_err(|e| e.to_string())?;
+    let original_width = decoded.width().max(1);
+    let original_height = decoded.height().max(1);
+    let max_dim = original_width.max(original_height) as f32;
+    let downscale = if max_dim > 1600.0 { 1600.0 / max_dim } else { 1.0 };
+    let work = if downscale < 0.999 {
+        decoded.resize(
+            ((original_width as f32 * downscale).round().max(1.0)) as u32,
+            ((original_height as f32 * downscale).round().max(1.0)) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        decoded
+    };
+    let gray = work.to_luma8();
+    let width = gray.width() as i32;
+    let height = gray.height() as i32;
+    let area = (width * height).max(1) as f32;
+    let min_area = (area * 0.00002).max(18.0);
+    let max_area = (area * 0.008).max(min_area + 1.0);
+    let mut visited = vec![false; (width * height).max(1) as usize];
+    let mut candidates: Vec<MarkerDetectionCandidate> = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = (y * width + x) as usize;
+            if visited[idx] || gray.get_pixel(x as u32, y as u32)[0] > 90 {
+                continue;
+            }
+            let mut queue = VecDeque::new();
+            let mut pixels: Vec<(i32, i32)> = Vec::new();
+            visited[idx] = true;
+            queue.push_back((x, y));
+            let mut min_x = x;
+            let mut max_x = x;
+            let mut min_y = y;
+            let mut max_y = y;
+            while let Some((cx, cy)) = queue.pop_front() {
+                pixels.push((cx, cy));
+                min_x = min_x.min(cx);
+                max_x = max_x.max(cx);
+                min_y = min_y.min(cy);
+                max_y = max_y.max(cy);
+                for (nx, ny) in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)] {
+                    if nx < 0 || ny < 0 || nx >= width || ny >= height {
+                        continue;
+                    }
+                    let nidx = (ny * width + nx) as usize;
+                    if visited[nidx] || gray.get_pixel(nx as u32, ny as u32)[0] > 90 {
+                        continue;
+                    }
+                    visited[nidx] = true;
+                    queue.push_back((nx, ny));
+                }
+            }
+
+            let component_area = pixels.len() as f32;
+            if component_area < min_area || component_area > max_area {
+                continue;
+            }
+            let bbox_w = (max_x - min_x + 1) as f32;
+            let bbox_h = (max_y - min_y + 1) as f32;
+            let aspect = bbox_w / bbox_h.max(1.0);
+            if !(0.6..=1.45).contains(&aspect) {
+                continue;
+            }
+            let fill_ratio = component_area / (bbox_w * bbox_h).max(1.0);
+            if fill_ratio < 0.18 || fill_ratio > 0.85 {
+                continue;
+            }
+            let center_x = (min_x + max_x) as f32 * 0.5;
+            let center_y = (min_y + max_y) as f32 * 0.5;
+            let radius = ((bbox_w + bbox_h) * 0.25).max(2.0);
+            let sample_radius = (radius * 2.0).ceil() as i32;
+            let mut center_sum = 0.0_f32;
+            let mut center_count = 0.0_f32;
+            let mut ring_sum = 0.0_f32;
+            let mut ring_count = 0.0_f32;
+            let mut outer_sum = 0.0_f32;
+            let mut outer_count = 0.0_f32;
+            for sy in -sample_radius..=sample_radius {
+                for sx in -sample_radius..=sample_radius {
+                    let dist = ((sx * sx + sy * sy) as f32).sqrt();
+                    let value =
+                        grayscale_at(&gray, center_x.round() as i32 + sx, center_y.round() as i32 + sy) as f32;
+                    if dist <= radius * 0.55 {
+                        center_sum += value;
+                        center_count += 1.0;
+                    } else if dist <= radius * 1.15 {
+                        ring_sum += value;
+                        ring_count += 1.0;
+                    } else if dist <= radius * 1.8 {
+                        outer_sum += value;
+                        outer_count += 1.0;
+                    }
+                }
+            }
+            if center_count < 1.0 || ring_count < 1.0 || outer_count < 1.0 {
+                continue;
+            }
+            let center_mean = center_sum / center_count;
+            let ring_mean = ring_sum / ring_count;
+            let outer_mean = outer_sum / outer_count;
+            let ring_contrast = ((ring_mean - center_mean) / 255.0).clamp(0.0, 1.0);
+            let outer_contrast = ((ring_mean - outer_mean).abs() / 255.0).clamp(0.0, 1.0);
+            let circularity = 1.0 - ((bbox_w - bbox_h).abs() / bbox_w.max(bbox_h).max(1.0));
+            let score = (ring_contrast * 0.62) + (circularity * 0.24) + ((1.0 - outer_contrast) * 0.14);
+            if score < 0.38 {
+                continue;
+            }
+            let refined_center = refine_marker_center(&gray, center_x, center_y, radius);
+            candidates.push(MarkerDetectionCandidate {
+                center: MarkerPoint {
+                    x: refined_center.x / downscale,
+                    y: refined_center.y / downscale,
+                },
+                radius: radius / downscale,
+                score,
+            });
+        }
+    }
+
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    if candidates.len() < 2 {
+        return Ok(MarkerDetectionResult {
+            success: false,
+            calibration_status: "failed".to_string(),
+            detection_confidence: candidates.first().map(|c| c.score).unwrap_or(0.0),
+            candidates,
+            error: Some("Unable to find two reliable marker candidates.".to_string()),
+            ..MarkerDetectionResult::default()
+        });
+    }
+
+    let mut best_pair: Option<(MarkerDetectionCandidate, MarkerDetectionCandidate, f32)> = None;
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let a = &candidates[i];
+            let b = &candidates[j];
+            let dx = b.center.x - a.center.x;
+            let dy = b.center.y - a.center.y;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance < (original_width.min(original_height) as f32 * 0.08) {
+                continue;
+            }
+            let radius_similarity = 1.0 - ((a.radius - b.radius).abs() / a.radius.max(b.radius).max(1.0));
+            let pair_score = (a.score + b.score) * 0.5 * 0.75 + radius_similarity.clamp(0.0, 1.0) * 0.25;
+            match &best_pair {
+                Some((_, _, current)) if *current >= pair_score => {}
+                _ => best_pair = Some((a.clone(), b.clone(), pair_score)),
+            }
+        }
+    }
+    let Some((first, second, pair_score)) = best_pair else {
+        return Ok(MarkerDetectionResult {
+            success: false,
+            calibration_status: "failed".to_string(),
+            detection_confidence: 0.0,
+            candidates,
+            error: Some("Unable to build a valid marker pair.".to_string()),
+            ..MarkerDetectionResult::default()
+        });
+    };
+    let (left, right) = if first.center.x <= second.center.x {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let dx = right.center.x - left.center.x;
+    let dy = right.center.y - left.center.y;
+    let marker_distance_px = (dx * dx + dy * dy).sqrt();
+    let rotation_angle_deg = -(dy.atan2(dx).to_degrees());
+    let detection_confidence = pair_score.clamp(0.0, 1.0);
+    Ok(MarkerDetectionResult {
+        success: detection_confidence >= 0.55,
+        calibration_status: if detection_confidence >= 0.55 {
+            "success".to_string()
+        } else {
+            "failed".to_string()
+        },
+        detection_confidence,
+        left_marker_center: Some(left.center),
+        right_marker_center: Some(right.center),
+        rotation_angle_deg: Some(rotation_angle_deg),
+        marker_distance_px: Some(marker_distance_px),
+        px_per_mm: Some(marker_distance_px / TARGET_MARKER_DISTANCE_MM),
+        mm_per_px: Some(TARGET_MARKER_DISTANCE_MM / marker_distance_px.max(1e-6)),
+        face_bounds: None,
+        candidates,
+        error: None,
+    })
+}
+
+fn write_python_marker_script() -> Result<PathBuf, String> {
+    static SCRIPT_PATH: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(path) = SCRIPT_PATH.get() {
+        return Ok(path.clone());
+    }
+    let source_script_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join("detect_glasses_markers.py");
+    let source_template_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join("templates")
+        .join("marker-template.png");
+    let mut base_dir = std::env::temp_dir();
+    base_dir.push("photo_doc_opencv_marker_detector");
+    fs::create_dir_all(base_dir.join("templates")).map_err(|e| e.to_string())?;
+    let path = base_dir.join("detect_glasses_markers.py");
+    let script_contents = fs::read_to_string(&source_script_path)
+        .unwrap_or_else(|_| include_str!("../python/detect_glasses_markers.py").to_string());
+    fs::write(&path, script_contents).map_err(|e| e.to_string())?;
+    let template_bytes = fs::read(&source_template_path)
+        .unwrap_or_else(|_| include_bytes!("../python/templates/marker-template.png").to_vec());
+    fs::write(base_dir.join("templates").join("marker-template.png"), template_bytes)
+        .map_err(|e| e.to_string())?;
+    let _ = SCRIPT_PATH.set(path.clone());
+    Ok(path)
+}
+
+fn run_python_marker_detection(path: &str) -> Result<MarkerDetectionResult, String> {
+    let script_path = write_python_marker_script()?;
+    let python_commands: [(&str, &[&str]); 3] = [
+        ("python", &[]),
+        ("py", &["-3"]),
+        ("python3", &[]),
+    ];
+    let mut last_error = String::new();
+    for (program, args) in python_commands {
+        let mut command = Command::new(program);
+        command.args(args);
+        command.arg(&script_path);
+        command.arg(path);
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(err) => {
+                last_error = format!("{program}: {err}");
+                continue;
+            }
+        };
+        if output.stdout.is_empty() && !output.status.success() {
+            last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            continue;
+        }
+        let parsed: PythonMarkerDetectionResult = serde_json::from_slice(&output.stdout)
+            .map_err(|e| format!("OpenCV detector returned invalid JSON: {e}"))?;
+        return Ok(MarkerDetectionResult {
+            success: parsed.success,
+            calibration_status: parsed.calibration_status,
+            detection_confidence: parsed.detection_confidence,
+            left_marker_center: parsed.left_marker_center,
+            right_marker_center: parsed.right_marker_center,
+            rotation_angle_deg: parsed.rotation_angle_deg,
+            marker_distance_px: parsed.marker_distance_px,
+            px_per_mm: parsed.px_per_mm,
+            mm_per_px: parsed.mm_per_px,
+            face_bounds: parsed.face_bounds,
+            candidates: parsed.candidates,
+            error: parsed.error,
+        });
+    }
+    Err(if last_error.is_empty() {
+        "Unable to launch Python OpenCV detector.".to_string()
+    } else {
+        format!("Unable to launch Python OpenCV detector: {last_error}")
+    })
+}
+
+fn detect_glasses_markers_impl(path: &str) -> Result<MarkerDetectionResult, String> {
+    run_python_marker_detection(path)
+}
+
+fn rotate_image_dynamic(image: image::DynamicImage, rotation_angle_deg: f32) -> image::DynamicImage {
+    if rotation_angle_deg.abs() < 0.001 {
+        return image;
+    }
+    let radians = rotation_angle_deg.to_radians();
+    let src = image.to_rgba8();
+    let width = src.width() as f32;
+    let height = src.height() as f32;
+    let cx = width * 0.5;
+    let cy = height * 0.5;
+    let cos = radians.cos();
+    let sin = radians.sin();
+    let corners = [
+        (-cx, -cy),
+        (width - cx, -cy),
+        (-cx, height - cy),
+        (width - cx, height - cy),
+    ];
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+    for (x, y) in corners {
+        let rx = x * cos - y * sin;
+        let ry = x * sin + y * cos;
+        min_x = min_x.min(rx);
+        max_x = max_x.max(rx);
+        min_y = min_y.min(ry);
+        max_y = max_y.max(ry);
+    }
+    let out_width = ((max_x - min_x).ceil().max(1.0)) as u32;
+    let out_height = ((max_y - min_y).ceil().max(1.0)) as u32;
+    let out_cx = out_width as f32 * 0.5;
+    let out_cy = out_height as f32 * 0.5;
+    let mut out = image::RgbaImage::from_pixel(out_width, out_height, image::Rgba([0, 0, 0, 0]));
+    let inv_cos = (-radians).cos();
+    let inv_sin = (-radians).sin();
+    for oy in 0..out_height {
+        for ox in 0..out_width {
+            let dx = ox as f32 - out_cx;
+            let dy = oy as f32 - out_cy;
+            let src_dx = dx * inv_cos - dy * inv_sin;
+            let src_dy = dx * inv_sin + dy * inv_cos;
+            let sx = src_dx + cx;
+            let sy = src_dy + cy;
+            if sx >= 0.0 && sy >= 0.0 && sx < width && sy < height {
+                let pixel = src.get_pixel(
+                    sx.round().clamp(0.0, width - 1.0) as u32,
+                    sy.round().clamp(0.0, height - 1.0) as u32,
+                );
+                out.put_pixel(ox, oy, *pixel);
+            }
+        }
+    }
+    image::DynamicImage::ImageRgba8(out)
+}
+
+#[tauri::command]
+async fn detect_glasses_markers(path: String) -> Result<MarkerDetectionResult, String> {
+    tauri::async_runtime::spawn_blocking(move || detect_glasses_markers_impl(&path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 #[tauri::command]
 async fn export_annotated_image_to_temp(
     path: String,
@@ -5832,13 +6385,18 @@ async fn export_annotated_image_to_temp(
     measurements: Vec<AnnotatedMeasurement>,
     preview_width: f32,
     preview_height: f32,
+    calibration_transform: Option<CalibrationExportTransform>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let path = path.trim().to_string();
+        let rotation_angle_deg = calibration_transform
+            .as_ref()
+            .map(|transform| transform.rotation_angle_deg)
+            .unwrap_or(0.0);
         if path.is_empty() {
             return Err("path is required".to_string());
         }
-        if strokes.is_empty() && measurements.is_empty() {
+        if strokes.is_empty() && measurements.is_empty() && rotation_angle_deg.abs() < 0.001 {
             return Err("annotations are required".to_string());
         }
         if preview_width <= 0.0 || preview_height <= 0.0 {
@@ -5863,11 +6421,14 @@ async fn export_annotated_image_to_temp(
             _ => return Err("unsupported image format".to_string()),
         };
 
-        let mut image = image::ImageReader::open(&source)
+        let mut decoded = image::ImageReader::open(&source)
             .map_err(|e| e.to_string())?
             .decode()
-            .map_err(|e| e.to_string())?
-            .to_rgba8();
+            .map_err(|e| e.to_string())?;
+        if rotation_angle_deg.abs() >= 0.001 {
+            decoded = rotate_image_dynamic(decoded, rotation_angle_deg);
+        }
+        let mut image = decoded.to_rgba8();
         let width = image.width().max(1) as f32;
         let height = image.height().max(1) as f32;
         let scale_x = width / preview_width.max(1.0);
@@ -6630,24 +7191,61 @@ fn search_patients_page(
     let q = query.trim().to_lowercase();
     let query_terms: Vec<String> = if q.is_empty() {
         vec![]
+    } else if q.contains(',') {
+        q.split(',')
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect()
     } else {
-        if q.contains(',') {
-            q.split(',')
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect()
-        } else {
-            let mut terms: Vec<String> = q
-                .split_whitespace()
-                .map(|part| part.trim().to_string())
-                .filter(|part| !part.is_empty())
-                .collect();
-            if terms.is_empty() {
-                terms.push(q.clone());
-            }
-            terms
+        let mut terms: Vec<String> = q
+            .split_whitespace()
+            .map(|part| part.trim().to_string())
+            .filter(|part| !part.is_empty())
+            .collect();
+        if terms.is_empty() {
+            terms.push(q.clone());
         }
+        terms
     };
+    let term_variants: Vec<Vec<String>> = query_terms
+        .iter()
+        .map(|term| {
+            let mut variants = vec![term.clone()];
+            let parts: Vec<&str> = term.split('.').collect();
+            if parts.len() == 3
+                && parts[0].len() <= 2
+                && parts[1].len() <= 2
+                && parts[2].len() == 4
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+            {
+                let day = parts[0].parse::<u32>().ok();
+                let month = parts[1].parse::<u32>().ok();
+                let year = parts[2].parse::<u32>().ok();
+                if let (Some(day), Some(month), Some(year)) = (day, month, year) {
+                    if (1..=31).contains(&day) && (1..=12).contains(&month) {
+                        variants.push(format!("{year:04}-{month:02}-{day:02}"));
+                    }
+                }
+            } else if parts.len() == 2
+                && parts[0].len() <= 2
+                && parts[1].len() == 4
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+            {
+                let month = parts[0].parse::<u32>().ok();
+                let year = parts[1].parse::<u32>().ok();
+                if let (Some(month), Some(year)) = (month, year) {
+                    if (1..=12).contains(&month) {
+                        variants.push(format!("{year:04}-{month:02}"));
+                    }
+                }
+            }
+            variants
+        })
+        .collect();
     let mut rows_out: Vec<PatientSearchRow> = Vec::new();
     let page_size = limit.clamp(1, 500);
     let fetch_limit = page_size.saturating_add(1);
@@ -6672,34 +7270,7 @@ fn search_patients_page(
                     patient_id: row.get::<_, String>(1)?,
                     keywords: vec![],
                     matched_keywords: vec![],
-                })
-            })
-            .map_err(|e| e.to_string())?;
-
-        for row in rows {
-            rows_out.push(row.map_err(|e| e.to_string())?);
-        }
-    } else if query_terms.len() == 1 {
-        let pattern = format!("%{}%", query_terms[0]);
-        let mut stmt = conn
-            .prepare(
-                "SELECT folder_name, patient_id
-                 FROM patient_index
-                 WHERE workspace_dir = ?1 AND search_text LIKE ?2
-                 ORDER BY
-                 lower(replace(replace(replace(replace(replace(replace(replace(replace(last_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss')),
-                 lower(replace(replace(replace(replace(replace(replace(replace(replace(first_name,'Ä','Ae'),'Ö','Oe'),'Ü','Ue'),'ä','ae'),'ö','oe'),'ü','ue'),'ß','ss'),'ẞ','ss'))
-                 LIMIT ?3 OFFSET ?4",
-            )
-            .map_err(|e| e.to_string())?;
-
-        let rows = stmt
-            .query_map(params![&workspace_dir, pattern, fetch_limit as i64, offset as i64], |row| {
-                Ok(PatientSearchRow {
-                    folder_name: row.get::<_, String>(0)?,
-                    patient_id: row.get::<_, String>(1)?,
-                    keywords: vec![],
-                    matched_keywords: vec![],
+                    matched_folders: vec![],
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -6709,19 +7280,42 @@ fn search_patients_page(
         }
     } else {
         let mut sql = String::from(
-            "SELECT folder_name, patient_id
-             FROM patient_index
-             WHERE workspace_dir = ?1",
+            "SELECT p.folder_name, p.patient_id
+             FROM patient_index p
+             WHERE p.workspace_dir = ?1",
         );
         let mut bind_values: Vec<rusqlite::types::Value> = Vec::new();
         bind_values.push(rusqlite::types::Value::Text(workspace_dir.clone()));
-        for (idx, term) in query_terms.iter().enumerate() {
-            let bind_idx = idx + 2;
-            sql.push_str(&format!(" AND search_text LIKE ?{}", bind_idx));
-            bind_values.push(rusqlite::types::Value::Text(format!("%{}%", term)));
+        let mut bind_idx = 2;
+        for variants in &term_variants {
+            sql.push_str(" AND (");
+            let mut first_variant = true;
+            for variant in variants {
+                if !first_variant {
+                    sql.push_str(" OR ");
+                }
+                first_variant = false;
+                sql.push_str(&format!(
+                    "p.search_text LIKE ?{idx} OR EXISTS (
+                        SELECT 1
+                        FROM patient_treatment_index t
+                        WHERE t.workspace_dir = p.workspace_dir
+                          AND t.patient_folder = p.folder_name
+                          AND (
+                            lower(t.folder_name) LIKE ?{idx}
+                            OR lower(t.folder_date) LIKE ?{idx}
+                            OR lower(t.treatment_name) LIKE ?{idx}
+                          )
+                    )",
+                    idx = bind_idx
+                ));
+                bind_values.push(rusqlite::types::Value::Text(format!("%{}%", variant)));
+                bind_idx += 1;
+            }
+            sql.push(')');
         }
-        let limit_idx = query_terms.len() + 2;
-        let offset_idx = query_terms.len() + 3;
+        let limit_idx = bind_idx;
+        let offset_idx = bind_idx + 1;
         sql.push_str(&format!(
             " ORDER BY {}, {}
               LIMIT ?{} OFFSET ?{}",
@@ -6738,6 +7332,7 @@ fn search_patients_page(
                     patient_id: row.get::<_, String>(1)?,
                     keywords: vec![],
                     matched_keywords: vec![],
+                    matched_folders: vec![],
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -6758,21 +7353,66 @@ fn search_patients_page(
         if keywords.is_empty() {
             row.keywords = vec![];
             row.matched_keywords = vec![];
-            continue;
-        }
-        row.keywords = keywords.clone();
-        if query_terms.is_empty() {
-            row.matched_keywords = vec![];
-            continue;
-        }
-        let mut matches = Vec::new();
-        for keyword in keywords {
-            let lowered = keyword.to_lowercase();
-            if query_terms.iter().any(|term| lowered.contains(term)) {
-                matches.push(keyword);
+        } else {
+            row.keywords = keywords.clone();
+            if query_terms.is_empty() {
+                row.matched_keywords = vec![];
+            } else {
+                let mut matches = Vec::new();
+                for keyword in keywords {
+                    let lowered = keyword.to_lowercase();
+                    if term_variants
+                        .iter()
+                        .flat_map(|variants| variants.iter())
+                        .any(|term| lowered.contains(term))
+                    {
+                        matches.push(keyword);
+                    }
+                }
+                row.matched_keywords = matches;
             }
         }
-        row.matched_keywords = matches;
+
+        if query_terms.is_empty() {
+            row.matched_folders = vec![];
+            continue;
+        }
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT folder_name, folder_date, treatment_name
+                 FROM patient_treatment_index
+                 WHERE workspace_dir = ?1 AND patient_folder = ?2
+                 ORDER BY folder_date COLLATE NOCASE, folder_name COLLATE NOCASE",
+            )
+            .map_err(|e| e.to_string())?;
+        let treatment_rows = stmt
+            .query_map(params![&workspace_dir, &row.folder_name], |t_row| {
+                Ok((
+                    t_row.get::<_, String>(0)?,
+                    t_row.get::<_, String>(1)?,
+                    t_row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut matched_folders = Vec::new();
+        for treatment_row in treatment_rows {
+            let (folder_name, folder_date, treatment_name) = treatment_row.map_err(|e| e.to_string())?;
+            let folder_name_lc = folder_name.to_lowercase();
+            let folder_date_lc = folder_date.to_lowercase();
+            let treatment_name_lc = treatment_name.to_lowercase();
+            let matches = term_variants.iter().all(|variants| {
+                variants.iter().any(|variant| {
+                    folder_name_lc.contains(variant)
+                        || folder_date_lc.contains(variant)
+                        || treatment_name_lc.contains(variant)
+                })
+            });
+            if matches {
+                matched_folders.push(folder_name);
+            }
+        }
+        row.matched_folders = matched_folders;
     }
 
     Ok(PatientSearchPageRow { rows: rows_out, has_more })
@@ -8510,6 +9150,9 @@ pub fn run() {
             open_path_with_default,
             copy_treatment_folder_to_destination,
             copy_file_to_destination,
+            copy_explorer_items_to_destination,
+            move_explorer_items_to_destination,
+            delete_explorer_items,
             rotate_image_right_in_place,
             copy_patient_folder_to_destination,
             list_treatment_image_paths,
@@ -8520,9 +9163,11 @@ pub fn run() {
             clear_import_wizard_preview_cache,
             open_import_wizard_preview_window,
             open_image_preview_window,
+            focus_image_preview_window,
             get_import_wizard_preview_data_url,
             get_import_wizard_quick_preview_data_url,
             save_import_wizard_preview_data_url_to_temp,
+            detect_glasses_markers,
             export_annotated_image_to_temp,
             get_import_wizard_preview_src_path,
             preview_trace_client,

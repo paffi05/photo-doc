@@ -195,11 +195,39 @@
             data-i18n-placeholder="patients.search_placeholder"
             autocomplete="off"
           />
+          <div id="patientSearchResultCount" class="patient-search-result-count settings-category">0 results</div>
           <div class="patient-list-wrap">
             <ul id="patientList" class="patient-list"></ul>
           </div>
         </aside>
         <section class="main-canvas"></section>
+      </div>
+
+      <div class="explorer-selection-actions" id="explorerSelectionActions" hidden>
+        <button type="button" class="icon-btn explorer-action-btn" id="explorerDeleteAction" aria-label="Delete selected item" title="Delete">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M5 7H19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M9 7V5.8C9 5.36 9.36 5 9.8 5H14.2C14.64 5 15 5.36 15 5.8V7" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M8 9.5V17.2C8 17.64 8.36 18 8.8 18H15.2C15.64 18 16 17.64 16 17.2V9.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M10.5 11V15.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M13.5 11V15.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button type="button" class="icon-btn explorer-action-btn" id="explorerCopyAction" aria-label="Copy selected item" title="Copy">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <rect x="8" y="8" width="10" height="10" rx="2" stroke="currentColor" stroke-width="2"/>
+            <path d="M6.5 15.5H6C4.9 15.5 4 14.6 4 13.5V6C4 4.9 4.9 4 6 4H13.5C14.6 4 15.5 4.9 15.5 6V6.5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button type="button" class="icon-btn explorer-action-btn" id="explorerCutAction" aria-label="Move selected item" title="Cut">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <circle cx="6.7" cy="17.2" r="2.2" stroke="currentColor" stroke-width="2"/>
+            <circle cx="6.7" cy="6.8" r="2.2" stroke="currentColor" stroke-width="2"/>
+            <path d="M8.6 8.4L18.2 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            <path d="M14.4 6L18.2 6L18.2 9.8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <path d="M8.6 15.6L12.1 12.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
       </div>
 
       <button class="icon-btn import-wizard-btn" id="openImportWizard" aria-label="Open import wizard" title="Import wizard" hidden data-i18n-aria-label="settings.import_wizard" data-i18n-title="settings.import_wizard">

@@ -11,10 +11,14 @@
     <main class="preview-root">
       <div id="previewToolbar" class="preview-toolbar" aria-hidden="true">
         <button id="rotateRightBtn" class="preview-toolbar-btn" type="button" aria-label="Rotate right 90 degrees" data-i18n-aria-label="preview.rotate_right">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/>
-            <polyline points="21 3 21 8 16 8"/>
+          <svg viewBox="0 0 28 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="6" width="13" height="13" rx="1.5"/>
+            <path d="M16.8 2A6 6 0 0 1 22.8 8"/>
+            <path d="M22.8 11L19.5 7M22.8 11L26 7.2"/>
           </svg>
+        </button>
+        <button id="alignMarkersBtn" class="preview-toolbar-btn preview-toolbar-btn-ai" type="button" aria-label="Align and calibrate glasses markers" data-i18n-aria-label="preview.align_calibrate_markers">
+          <span id="alignMarkersBtnContent" class="preview-toolbar-btn-content"></span>
         </button>
         <button id="markBtn" class="preview-toolbar-btn preview-toolbar-btn-accent" type="button" aria-label="Mark edit mode" data-i18n-aria-label="preview.mark_edit_mode">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -67,6 +71,12 @@
       </button>
       <img id="previewImage" alt="Live preview" draggable="false" />
       <canvas id="drawCanvas" class="draw-canvas" aria-hidden="true"></canvas>
+      <div id="calibrationFaceBounds" class="calibration-face-bounds" hidden aria-hidden="true"></div>
+      <div id="calibrationMarkerLeft" class="calibration-marker-handle" hidden aria-hidden="true"></div>
+      <div id="calibrationMarkerRight" class="calibration-marker-handle" hidden aria-hidden="true"></div>
+      <div id="calibrationAiBadge" class="calibration-ai-badge" hidden aria-hidden="true"></div>
+      <div id="calibrationInstructionPanel" class="calibration-floating-panel calibration-instruction-panel" hidden></div>
+      <div id="calibrationDebugPanel" class="calibration-floating-panel calibration-debug-panel" hidden></div>
       <div id="previewLoading" class="preview-loading" aria-hidden="true">
         <div class="preview-spinner" aria-label="Loading image" data-i18n-aria-label="preview.loading_image"></div>
       </div>
